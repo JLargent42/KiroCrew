@@ -61,11 +61,13 @@ def _stub_resolvers(
     kiro="/usr/local/bin/kiro-cli",
     adapter=(["node", "/n/acp.js"], "/usr/bin"),
     claude_cli="/usr/local/bin/claude",
+    codex=(None, "/usr/bin"),
     opencode=("/usr/local/bin/opencode", "/usr/bin"),
     pi_acp=(["node", "/n/pi-acp.js"], "/usr/bin"),
     pi_cli=("/usr/local/bin/pi", "/usr/bin"),
+    deepseek=("/usr/local/bin/dsh", "/usr/bin"),
 ):
-    """Patch the four spawn resolvers on the module the driver imports from.
+    """Patch the spawn resolvers on the module the driver imports from.
 
     Patched on ``kiro_crew.acp.client`` -- the DEFINING module -- because the
     driver imports them function-locally at call time, so that is the namespace
@@ -85,6 +87,11 @@ def _stub_resolvers(
     # on the recording host.
     monkeypatch.setattr(client, "_resolve_pi_acp_bin", lambda: pi_acp)
     monkeypatch.setattr(client, "_resolve_pi_bin", lambda: pi_cli)
+    # Stubbed for the same sharper reason as the line above: either harness may be
+    # installed on the host running the suite, so a payload assertion that reached
+    # the real resolver would read ``installed`` there and ``missing`` in CI.
+    monkeypatch.setattr(client, "_resolve_codex_acp_bin", lambda: codex)
+    monkeypatch.setattr(client, "_resolve_deepseek_bin", lambda: deepseek)
 
 
 # ── The opencode driver seams ──
@@ -745,6 +752,7 @@ class TestEndpointPayloadShape:
         assert [r["policy_id"] for r in rows] == [
             "claude",
             "codex",
+            "deepseek",
             "kas",
             "kiro",
             "opencode",
