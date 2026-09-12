@@ -17,7 +17,7 @@ import json
 import re
 from typing import Any, Callable, Optional
 
-from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+from kiro_crew.dashboard.chat_utils import dashboard_slot_key, refuse_app_owned_rebind
 from kiro_crew.dashboard.state import DashboardState, append_and_surface, row_mid
 from kiro_crew.history import append_if_absent_off_loop
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -152,6 +152,15 @@ def inject_workflow_result(
             getter = getattr(state, "get_slot", None)
             if getter is not None:
                 slot = getter(target_slot_key)
+            if slot is not None and refuse_app_owned_rebind(slot, "workflow_slot_inject"):
+                # The originating slot's KEY is now held by an app-scoped
+                # session: the launching chat closed mid-run and an app
+                # re-minted the name. Injecting here would hand the app the
+                # run's private result -- the same exposure the fallback
+                # path's guard below refuses. Treat the originating chat as
+                # gone and route to the dedicated ``workflow-<id>`` slot,
+                # which carries its own copy of the guard.
+                slot = None
         # The originating chat is live iff we found its slot above; the auto-turn
         # only makes sense there (the fallback slot has no agent watching it).
         is_originating = slot is not None
@@ -159,6 +168,10 @@ def inject_workflow_result(
         # 2. Fall back to a dedicated workflow slot only if the chat is gone.
         if slot is None:
             slot = state.get_or_create_slot(name=f"workflow-{run_id}")
+            if refuse_app_owned_rebind(slot, "workflow_slot_bind"):
+                # An app pre-minted the fallback slot's name: neither bind nor
+                # surface the result there (see ``refuse_app_owned_rebind``).
+                return False
             if not getattr(slot, "linked_session_key", ""):
                 slot.linked_session_key = session_key
             slot.title = f"Workflow: {snapshot.get('name') or run_id}"
