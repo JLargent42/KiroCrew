@@ -7550,6 +7550,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 models={filteredModels}
                 activeModel={shownModel}
                 onSelectModel={name => switchModel(name)}
+                modelsLoading={remoteCrew.modelsPending}
+                modelsFailed={remoteCrew.failed}
+                retryingModels={remoteCrew.retrying}
+                onRetryModels={() => remoteCrew.refetch()}
                 filter={modelFilter}
                 setFilter={setModelFilter}
                 onClose={() => setModelDropdown(false)}
