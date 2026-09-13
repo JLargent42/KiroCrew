@@ -419,12 +419,12 @@ class TestLessonStoreScope:
 
 
 class TestLessonStoreRemoveScope:
-    """``LessonStore.remove`` honours ``(rule, repo_scope)`` identity (#9137).
+    """``LessonStore.remove`` honours ``(rule, repo_scope)`` identity.
 
-    Substring matching on the rule is deliberate and kept -- ``test_learn`` pins
-    it -- so the fix makes scope a DISCRIMINATOR, not the match exact. The bug was
-    that the same rule scoped to a repo and stored globally could not be removed
-    independently: deleting either took both.
+    Substring matching on the rule is deliberate -- ``test_learn`` pins it --
+    so scope is a DISCRIMINATOR, not an exact-match switch: the same rule
+    scoped to a repo and stored globally are two distinct rows, and a selector
+    picks which of them a delete reaches.
     """
 
     def _store(self, tmp_path):
@@ -479,6 +479,40 @@ class TestLessonStoreRemoveScope:
         store.save(Lesson(ts="t", rule="always run the gate first", category="tool"))
         assert store.remove("run the gate", "src/pkg")
         assert [le.repo_scope for le in store.load_all()] == [None]
+
+    def test_a_selector_naming_no_usable_scope_is_refused(self, tmp_path):
+        # "/" names nothing; "/src/pkg" is the absolute spelling the write
+        # surface refuses, and canonical folding would land it on the stored
+        # "src/pkg" rows -- rows the caller never admissibly named. Both are
+        # refused outright and no row is touched.
+        store = self._two_rows(tmp_path)
+        with pytest.raises(ValueError):
+            store.remove("run the gate", "/")
+        with pytest.raises(ValueError):
+            store.remove("run the gate", "/src/pkg")
+        assert len(store.load_all()) == 2
+
+    def test_a_broken_stored_scope_is_not_claimed_by_the_global_selector(self, tmp_path):
+        # The write path canonicalises a scope before storing it, so a stored
+        # "/" can only arrive from an imported or hand-edited file -- seeded
+        # here as a raw JSONL line. That row is scoped-but-broken, not global:
+        # the injection gate withholds it, so the explicit-global selector
+        # must not fold it to None and tombstone it. Only the unselective
+        # (absent) path reaches it.
+        store = self._store(tmp_path)
+        store.save(Lesson(ts="t", rule="run the gate", category="tool"))
+        with store._path.open("a") as fh:
+            fh.write(
+                json.dumps(
+                    {"ts": "t", "rule": "run the gate", "category": "tool", "repo_scope": "/"}
+                )
+                + "\n"
+            )
+        assert store.remove("run the gate", "")
+        left = store.load_all()
+        assert [le.repo_scope for le in left] == ["/"]
+        assert store.remove("run the gate")
+        assert store.load_all() == []
 
 
 class TestVectorStoreLessonScope:
@@ -837,12 +871,12 @@ class TestVectorStoreLessonScope:
 
 
 class TestVectorStoreDeleteScope:
-    """``VectorMemoryStore.delete_lesson`` honours ``(rule, repo_scope)`` (#9137).
+    """``VectorMemoryStore.delete_lesson`` honours ``(rule, repo_scope)``.
 
-    The vector store is the PRIMARY path, so the same-rule-in-two-scopes rows it
-    already keeps distinct (``test_the_same_rule_in_two_scopes_is_two_rows``) must
-    be deletable independently. Substring matching is preserved; scope is the
-    discriminator.
+    The vector store is the PRIMARY path, so the same-rule-in-two-scopes rows
+    it keeps distinct (``test_the_same_rule_in_two_scopes_is_two_rows``) are
+    deletable independently. Substring matching on the rule stays; scope is
+    the discriminator.
     """
 
     def _store(self, tmp_path):
@@ -901,5 +935,45 @@ class TestVectorStoreDeleteScope:
             self._two_rows(store)
             assert store.delete_lesson("run the gate", "src\\pkg/")
             assert self._scopes(store) == {None}
+        finally:
+            store.close()
+
+    def test_a_selector_naming_no_usable_scope_is_refused(self, tmp_path):
+        # "/" names nothing; "/src/pkg" is the absolute spelling the write
+        # surface refuses, and canonical folding would land it on the stored
+        # "src/pkg" rows -- rows the caller never admissibly named. Both are
+        # refused outright and no row is touched.
+        store = self._store(tmp_path)
+        try:
+            self._two_rows(store)
+            with pytest.raises(ValueError):
+                store.delete_lesson("run the gate", "/")
+            with pytest.raises(ValueError):
+                store.delete_lesson("run the gate", "/src/pkg")
+            assert len(store.get_lessons()) == 2
+        finally:
+            store.close()
+
+    def test_a_broken_stored_scope_is_not_claimed_by_the_global_selector(self, tmp_path):
+        # set_semantic validates size, not scope admissibility, so a lesson
+        # row can carry a stored scope the gate refuses ("/"). That row is
+        # scoped-but-broken, not global: the injection gate withholds it
+        # (_lesson_scope_unusable), so the explicit-global selector must not
+        # fold it to None and tombstone it. The unselective (absent) path is
+        # what removes it.
+        store = self._store(tmp_path)
+        try:
+            assert store.write_lesson("run the gate", "tool")
+            store.set_semantic(
+                "lesson.broken",
+                {"rule": "run the gate", "category": "tool", "repo_scope": "/"},
+                1.0,
+                "test",
+            )
+            assert store.delete_lesson("run the gate", "")
+            left = [json.loads(r["value_json"]).get("repo_scope") for r in store.get_lessons()]
+            assert left == ["/"]
+            assert store.delete_lesson("run the gate")
+            assert store.get_lessons() == []
         finally:
             store.close()

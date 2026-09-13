@@ -2500,7 +2500,7 @@ Examples:
         dest="repo_scope",
         default=None,
         help=(
-            "Only remove lessons carrying this repo scope. Since #4556 a lesson's "
+            "Only remove lessons carrying this repo scope. A lesson's "
             "identity is (rule, repo_scope), so a scoped and a global lesson can "
             "share rule text; without this flag a matching substring removes both. "
             "Omit to match every scope (the default). Pass an empty string to "

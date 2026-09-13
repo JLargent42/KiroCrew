@@ -70,6 +70,7 @@ from kiro_crew.project_scope import (
     canonical_scope,
     project_scope_satisfied,
     scope_is_admissible,
+    scope_selector_is_inadmissible,
 )
 from kiro_crew.security import redact_and_truncate
 from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES, normalize_lesson_category
@@ -5269,16 +5270,26 @@ class VectorMemoryStore:
     def delete_lesson(self, rule_substring: str, repo_scope: str | None = None) -> bool:
         """Delete lessons whose value contains rule_substring.
 
-        Substring matching is preserved. Since #4556 a lesson's identity is the
-        pair ``(rule, repo_scope)`` -- the scope is folded into the semantic key so
-        a scoped and a global lesson sharing rule text are two distinct rows. This
-        method ignored scope, so deleting either took both. When *repo_scope* is
-        None (the default) scope stays out of the match and every substring hit is
-        deleted, exactly as before. When it is given, a row is deleted only when it
-        ALSO carries that scope -- compared canonically on both sides, so the two
-        never disagree over trailing-slash / backslash forms and the canonical form
-        of an empty selector targets the unscoped (global) rows specifically.
+        Substring matching on the rule text is deliberate: a user targets a
+        lesson by a fragment of its rule rather than retyping the whole thing.
+        A lesson's identity is the pair ``(rule, repo_scope)`` -- the scope is
+        folded into the semantic key so a scoped and a global lesson sharing
+        rule text are two distinct rows, and the selector decides which of
+        them a delete reaches. When *repo_scope* is None (the default) scope
+        stays out of the match and every substring hit is deleted. When it is
+        given, a row is deleted only when it ALSO carries that scope --
+        compared canonically on both sides, so the two never disagree over
+        trailing-slash / backslash forms and the canonical form of an empty
+        selector targets the unscoped (global) rows specifically. A nonempty
+        selector the write surface would refuse -- a bare ``/``, an absolute
+        path, a dot segment -- is refused with :class:`ValueError` rather than
+        canonically folded onto rows the caller never named. A STORED scope
+        that is present but unusable marks a scoped-but-broken row, which the
+        injection gate withholds; a scope-selective delete never claims such a
+        row, and the unselective (absent) path is what removes it.
         """
+        if repo_scope is not None and scope_selector_is_inadmissible(repo_scope):
+            raise ValueError(f"repo_scope does not name a usable scope: {repo_scope!r}")
         deleted = False
         scope_selective = repo_scope is not None
         wanted_scope = canonical_scope(repo_scope) if scope_selective else None
@@ -5295,8 +5306,19 @@ class VectorMemoryStore:
             # string row (which cannot carry one) to None -- the same reader the
             # injection gate uses, so delete and inject agree on what a row's scope
             # is. Canonicalise it before comparing so the two sides fold identically.
-            if scope_selective and canonical_scope(_lesson_scope(val)) != wanted_scope:
-                continue
+            #
+            # A row whose stored scope is PRESENT but unusable (an imported "/",
+            # a non-string) is scoped-but-broken, not global: the injection gate
+            # withholds it via the same classifier, so a scope-selective delete
+            # never claims it -- an all-slash stored scope would otherwise fold
+            # to None and be tombstoned by the explicit-global selector. Such a
+            # row stays reachable through the unselective (absent) path, which
+            # is how junk rows stay deletable.
+            if scope_selective:
+                if _lesson_scope_unusable(val):
+                    continue
+                if canonical_scope(_lesson_scope(val)) != wanted_scope:
+                    continue
             self.delete_semantic(e["key"], "user_explicit")
             deleted = True
         return deleted

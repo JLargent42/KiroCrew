@@ -372,15 +372,17 @@ def learn_list(name: str, args: dict[str, Any]) -> str:
 def learn_remove(name: str, args: dict[str, Any]) -> str:
     query = args["query"]
     payload: dict[str, Any] = {"rule": query}
-    # #9137: forward the scope discriminator only when the caller supplied the
-    # key. An absent key leaves scope out of the match (delete every scope, the
-    # historical behaviour); a present key -- INCLUDING an empty string, which
-    # targets the unscoped/global rows -- makes the delete scope-selective. The
-    # route distinguishes the two the same way, so a bare rule still deletes across
-    # scopes and no existing caller changes.
-    if "repo_scope" in args:
-        rs = args["repo_scope"]
-        payload["repo_scope"] = rs if isinstance(rs, str) else ""
+    # Forward the scope discriminator only when the caller supplied a string.
+    # An absent key leaves scope out of the match (delete every scope); a
+    # present string -- INCLUDING an empty one, which targets the unscoped/
+    # global rows -- makes the delete scope-selective. A JSON null arrives here
+    # as None after schema validation and is treated as absent rather than
+    # coerced: coercing it to "" would silently turn "no selector" into
+    # "delete the global rows". The route distinguishes presence the same way,
+    # so a bare rule still deletes across scopes and no existing caller changes.
+    rs = args.get("repo_scope")
+    if isinstance(rs, str):
+        payload["repo_scope"] = rs
     d = mcp_core._delete("/api/lessons", payload)
     err_val = d.get("error")
     if err_val:
