@@ -2457,6 +2457,15 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 # ── Local token bootstrap (Electron / local apps) ─────────────────────
 
 
+def _unix_peer_is_self(request: web.Request) -> bool:
+    """True iff the request's Unix peer is this process's own principal."""
+    from kiro_crew.dashboard.token_auth import _unix_request_socket
+    from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
+
+    sock = _unix_request_socket(request)
+    return sock is not None and check_peer_is_self(sock) is PeerCredResult.MATCH
+
+
 async def api_token_local(request: web.Request) -> web.Response:
     """GET /api/token/local — issue a token for local apps.
 
@@ -2464,10 +2473,15 @@ async def api_token_local(request: web.Request) -> web.Response:
     gateway startup. Only processes on the same machine can read the file.
     Secret passed via ``X-Local-Secret`` header (not query string, to avoid
     leaking in logs).
+
+    Reachable over loopback TCP or the dashboard's ``AF_UNIX`` socket; unix
+    peers are admitted only on a positive kernel same-principal check
+    (``_unix_peer_is_self``), which is stronger locality evidence than a
+    loopback address. The secret is required on both transports.
     """
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
-    if not _h.is_loopback(request.remote or ""):
+    if not _h.is_loopback(request.remote or "") and not _unix_peer_is_self(request):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="token.local",
