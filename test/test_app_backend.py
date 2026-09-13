@@ -1161,6 +1161,65 @@ class TestBackendLifecycle:
             bmod._processes.clear()
             bmod._allocated_ports.clear()
 
+    def test_concurrent_starts_single_flight_one_activation_vet(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        import threading
+
+        import kiro_crew.apps.backend as bmod
+
+        src = _make_app_with_backend(tmp_path)
+        install_app(src)
+
+        vet_calls: list[str] = []
+        spawn_calls: list[str] = []
+        gate = threading.Event()
+
+        def _vet(app_name, _action):
+            vet_calls.append(app_name)
+            return bmod.ActivationVerdict()
+
+        def _fake_body(app_name, _manifest):
+            spawn_calls.append(app_name)
+            gate.wait(timeout=5)
+            ap = AppProcess(
+                app_name=app_name,
+                port=9137,
+                pid=4242,
+                healthy=True,
+                started_at=0.0,
+            )
+            with bmod._lock:
+                bmod._processes[app_name] = ap
+                bmod._allocated_ports[app_name] = 9137
+            return ap
+
+        monkeypatch.setattr(bmod, "_activation_denied", _vet)
+        monkeypatch.setattr(bmod, "_start_app_backend_body", _fake_body)
+
+        results: list[AppProcess | None] = []
+        barrier = threading.Barrier(2)
+
+        def _go():
+            barrier.wait()
+            results.append(start_app_backend("backend-app"))
+
+        threads = [threading.Thread(target=_go) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.3)
+        gate.set()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert vet_calls == ["backend-app"]
+        assert spawn_calls == ["backend-app"]
+        assert len(results) == 2
+        assert all(result is not None and result.port == 9137 for result in results)
+        with bmod._lock:
+            bmod._processes.clear()
+            bmod._allocated_ports.clear()
+
     def test_await_inflight_spawn_timeout_clears_stale_placeholder(self, app_env):
         # If a spawn body hangs without raising (so the owner's None/exception cleanup
         # never fires), an awaiting caller hits the deadline with the placeholder still
@@ -1388,6 +1447,11 @@ class TestBootAdmissionRevet:
             "manifest": {"backend": {"entryPoint": "server.py"}},
         }]
         monkeypatch.setattr(bmod, "list_apps", lambda: apps)
+        monkeypatch.setattr(
+            bmod,
+            "_read_installed",
+            lambda _name: SimpleNamespace(origin="builtin"),
+        )
         bmod.start_enabled_app_backends()
         # Builtin is exempt from the gate — start_app_backend was invoked for it.
         assert "core-builtin" in started
@@ -2767,14 +2831,24 @@ class TestHealthProbeSecurity:
         import kiro_crew.apps.backend as bmod
 
         url = bmod._health_probe_url(9101, path)
-        assert url == f"http://127.0.0.1:9101{path}"
+        assert url == "http://127.0.0.1:9101" + path
         assert urllib.parse.urlsplit(url).hostname == "127.0.0.1"
 
     @pytest.mark.parametrize(
         "path",
         [
-            "@example.com/", "health", "", "/a@b", "/x\ny", "/x\ty",
-            "/x\ry", "/x y", "http://example.com/", "/#frag", "/a\\b", "/[::1]",
+            "@example.com/",
+            "health",
+            "",
+            "/a@b",
+            "/x\ny",
+            "/x\ty",
+            "/x\ry",
+            "/x y",
+            "http://example.com/",
+            "/#frag",
+            "/a\\b",
+            "/[::1]",
         ],
     )
     def test_authority_smuggling_and_ambiguous_paths_are_refused(self, path):
