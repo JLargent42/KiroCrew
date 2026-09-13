@@ -10175,6 +10175,8 @@
       "session_dropped_into_itself": "কোনো সেশন তার নিজের মধ্যেই ছাড়া যায় না… নিজের মধ্যেই… নিজের মধ্যেই…",
       "session_failed_to_switch_one": "{{count}}টি সেশন পাল্টানো যায়নি",
       "session_failed_to_switch_other": "{{count}}টি সেশন পাল্টানো যায়নি",
+      "remote_session_kept_model_one": "{{count}}টি সেশন অন্য মেশিন থেকে উত্তর দেওয়া হয় এবং তার মডেল বজায় রেখেছে",
+      "remote_session_kept_model_other": "{{count}}টি সেশন অন্য মেশিন থেকে উত্তর দেওয়া হয় এবং তাদের মডেল বজায় রেখেছে",
       "session_one": "{{count}}টি সেশন",
       "session_other": "{{count}}টি সেশন",
       "session_source": "সেশন",

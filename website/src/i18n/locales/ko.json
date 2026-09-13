@@ -10026,6 +10026,7 @@
       "search_sessions": "세션 검색…",
       "session_dropped_into_itself": "세션을 자기 자신에 놓을 수는 없습니다… 자기 자신에… 자기 자신에…",
       "session_failed_to_switch_other": "세션 {{count}}개 전환 실패",
+      "remote_session_kept_model_other": "세션 {{count}}개는 다른 컴퓨터가 응답하므로 모델을 유지했습니다",
       "session_other": "{{count}}개 세션",
       "session_source": "세션",
       "sessions": "세션",
