@@ -33,7 +33,15 @@ from kiro_crew.config.loader import (
     resolve_effective_agent,
 )
 from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_NO_BUDGET,
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    DENY_CAUSE_APPROVAL_UNDELIVERABLE,
+    DENY_CAUSE_BATCH_CASCADE,
+    DENY_CAUSE_HOOK_ERROR,
+    DENY_CAUSE_INVALID_NAME,
+    DENY_CAUSE_POLICY,
     OPTIONS_RE_LINE,
+    STEER_NOTICE_BOUND_SECS,
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
 )
@@ -2978,19 +2986,15 @@ def build_refusal_recovery_prompt(
 
 
 #: Why a tool call was denied, for the in-band notice's cause-specific wording.
-#: The notice's INVARIANT half — that this was not a user action, the generic
-#: string it is correcting, and the instruction to decide inside this turn — is
-#: identical for every cause; only the clause naming the cause and the guidance
-#: about what to do next differ. Kept as data rather than a near-copy of the
-#: notice per cause so the invariant half cannot drift between them, which is the
-#: half doing the actual work of overwriting the model's wrong conclusion.
-DENY_CAUSE_POLICY = "policy"
-DENY_CAUSE_INVALID_NAME = "invalid_name"
-DENY_CAUSE_HOOK_ERROR = "hook_error"
-DENY_CAUSE_BATCH_CASCADE = "batch_cascade"
-DENY_CAUSE_APPROVAL_TIMEOUT = "approval_timeout"
-DENY_CAUSE_APPROVAL_NO_BUDGET = "approval_no_budget"
-DENY_CAUSE_APPROVAL_UNDELIVERABLE = "approval_undeliverable"
+#: The DENY_CAUSE_* names themselves live in ``kiro_crew.constants`` (imported
+#: above and re-exported here) so the messaging core can name a cause without
+#: importing this module. The notice's INVARIANT half — that this was not a user
+#: action, the generic string it is correcting, and the instruction to decide
+#: inside this turn — is identical for every cause; only the clause naming the
+#: cause and the guidance about what to do next differ. Kept as data rather than
+#: a near-copy of the notice per cause so the invariant half cannot drift between
+#: them, which is the half doing the actual work of overwriting the model's wrong
+#: conclusion.
 
 #: cause → (clause completing "The tool call you just made …", what to do next).
 _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
@@ -3117,6 +3121,54 @@ def build_refusal_steer_notice(
         "Do not apologise for a cancellation and do not ask the user whether to "
         f"retry. Decide and continue in this same turn: {guidance}{tail}"
     )
+
+
+async def steer_refusal_notice(
+    provider: Any,
+    title: str,
+    reason: str,
+    *,
+    cause: str,
+    bound_secs: float = STEER_NOTICE_BOUND_SECS,
+) -> str:
+    """Steer a deny notice into the RUNNING turn, best-effort and bounded.
+
+    The one spelling of "probe the capability, redact, build, send within a
+    bound" shared by the deny sites that have no dashboard slot to render into:
+    the native Slack handler's approval-timeout arm and the messaging
+    ``TurnDriver``'s. (``chat_runner._steer_policy_notice`` adds the dashboard's
+    display row and credential hint on top of the same steps.)
+
+    Must be awaited while the ``session/request_permission`` is still
+    unanswered — see :func:`build_refusal_steer_notice` for why that ordering is
+    what makes the notice race-free. Opt-in by positive capability
+    (``provider.supports_steer``), never by harness identity; ``getattr`` because
+    the reject paths also run against minimal test doubles. *title* is redacted
+    here (it is provider-authored text); *reason* is the caller's own wording.
+
+    Returns the notice that was written, or ``""`` when nothing was sent: no
+    capability, nothing to say, a steer failure, or the bound expiring. Every
+    ``Exception`` is swallowed at debug — the caller's reject must still run —
+    while ``CancelledError`` propagates, because the caller is the one that
+    knows how to answer the wire while it unwinds.
+    """
+    if not getattr(provider, "supports_steer", False):
+        return ""
+    try:
+        title_safe, _ = redact_exfiltration_urls(title or "")
+        title_safe, _ = redact_credentials(title_safe)
+        notice = build_refusal_steer_notice(title_safe, reason, cause=cause)
+        if not notice:
+            return ""
+        sent = await asyncio.wait_for(provider.steer(notice), timeout=bound_secs)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("deny-cause steer notice failed; the reject still runs", exc_info=True)
+        return ""
+    # A provider that answers False did not write the notice; report that
+    # honestly rather than claim an explanation the model never received.
+    return notice if sent is not False else ""
 
 
 def build_stale_recovery_prompt() -> str:
