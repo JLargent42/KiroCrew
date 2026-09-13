@@ -792,6 +792,32 @@ class HistoryConsolidator:
         outcome = await self._consolidate(key, include_history=True)
         return outcome is not _CONSOLIDATION_REFUSED
 
+    def _is_remote_transcript(self, key: str) -> bool:
+        """True when *key*'s transcript was produced on a remote peer.
+
+        Reads the slot-owned ``executor`` metadata header. ``executor`` is in
+        :data:`kiro_crew.history.SLOT_OWNED_META_KEYS`, so an unbind clears it
+        and a stale value is never carried forward -- the header answers for
+        the transcript as it stands now.
+
+        Normalization deliberately splits absence from unreadability. An absent
+        or unrecognized value reads as LOCAL, matching the convention
+        :func:`kiro_crew.history.is_incognito_transcript` documents: the header
+        is only written for bound slots, so failing closed on absence would
+        refuse every ordinary local session. An unreadable metadata header, or
+        an exception before its readability can be established, means the
+        executor is unknown rather than local, so it fails closed and the caller
+        skips. Skipping a consolidation is recoverable (a later pass retries);
+        consolidating peer content is not.
+        """
+        try:
+            meta, readable = self._log.get_metadata_status(key)
+        except Exception:
+            return True
+        if not readable:
+            return True
+        return str(meta.get("executor") or "").lower() == "remote"
+
     async def _consolidate(
         self, key: str, include_history: bool = True
     ) -> _ConsolidationRefusedSentinel | None:
@@ -802,6 +828,28 @@ class HistoryConsolidator:
         other completion returns ``None``. A changed source remains pending
         rather than consuming the failure/abandon budget of a different span.
         """
+        # Privacy choke point: a transcript produced on a remote peer must never
+        # be summarised into LOCAL memory. Peer content is present on this
+        # machine because the relay mirrors frames through ordinary local
+        # ``slot.append`` calls -- that is what makes the local transcript a
+        # true mirror, and it also lands peer-authored conversation in local
+        # history. Consolidating it would distil another machine's content
+        # (possibly another person's) into local semantic memory, re-inject it
+        # into unrelated local sessions, carry it into ``kirocrew snapshot``,
+        # and surface it in local full-text search.
+        #
+        # Enforced HERE, for exactly the reason the retry-eligibility gate below
+        # is: every entry point funnels through this function, so a caller
+        # carrying no check of its own still cannot leak. That is not
+        # hypothetical -- ``kirocrew consolidate --all`` globs every transcript
+        # on disk with no executor filter, and the session-expiry consolidator
+        # has no restricted-session check at all. Their absent checks stop
+        # mattering once the enforcement lives at the choke point. Reading the
+        # executor metadata can hit blocking file I/O on a cache miss, so offload
+        # it from the gateway event loop like the sibling transcript I/O below.
+        if await asyncio.to_thread(self._is_remote_transcript, key):
+            self._logger.info("consolidation skipped for %s: remote transcript", key)
+            return None
         # Capture the gateway loop so the thread-offloaded _process_auto_skills
         # can schedule the async dedupe judge back onto it.
         self._event_loop = asyncio.get_running_loop()
