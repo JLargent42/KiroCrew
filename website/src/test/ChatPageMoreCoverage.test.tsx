@@ -27,12 +27,23 @@
  * faked: grouping, the render dispatch and the handlers run for real.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, act, waitFor, fireEvent, within } from '@testing-library/react'
+import { render, screen, act, waitFor, fireEvent, within, renderHook } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
+import { RUN_IN_TERMINAL_READY_DEADLINE_MS } from '../utils/fenceShell'
+import { useBottomTerminal, __resetBottomTerminal, removeTab } from '../hooks/useBottomTerminal'
+import { registerTerminalWs, unregisterTerminalWs } from '../utils/terminalRegistry'
+
+// The run-in-terminal rollback consults the popout probe to avoid tearing a
+// session out of a popped-out panel; the flag lets each test pick the state.
+let mockTerminalPopoutOpen = false
+vi.mock('../utils/terminalPopout', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/terminalPopout')>()),
+  isPopoutOpen: () => mockTerminalPopoutOpen,
+}))
 import { ThemeProvider } from '../hooks/useTheme'
 import { store as appStore } from '../store'
 import { setVoicePlaying, switchSlot } from '../store/chatSlice'
@@ -715,15 +726,166 @@ describe('ChatPage window-event listeners', () => {
       // "Run in terminal" now routes to the app-wide dock panel
       // (useBottomTerminal), not the chat-scoped activity panel, so
       // `chat.activityOpen` is intentionally untouched. The handler races the
-      // PTY against a ~6 s cap; either leg answers, and the `settled` latch is
-      // what guarantees the code-block button is told once and only once.
-      await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
+      // PTY against RUN_IN_TERMINAL_READY_DEADLINE_MS; either leg answers, and
+      // the `settled` latch is what guarantees the code-block button is told
+      // once and only once.
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
       await waitFor(() => expect(results.length).toBe(1), { timeout: 5_000 })
     } finally {
       window.removeEventListener('mc:run-in-terminal-result', onResult)
     }
     expect(results[0].reqId).toBe('r2')
     expect(typeof results[0].ok).toBe('boolean')
+  })
+})
+
+describe('ChatPage run-in-terminal dispatch rollback (#10822)', () => {
+  const collect = () => {
+    const results: { reqId?: string; ok?: boolean }[] = []
+    const onResult = (e: Event) => { results.push((e as CustomEvent).detail) }
+    window.addEventListener('mc:run-in-terminal-result', onResult)
+    return { results, stop: () => window.removeEventListener('mc:run-in-terminal-result', onResult) }
+  }
+
+  beforeEach(() => { __resetBottomTerminal(); mockTerminalPopoutOpen = false })
+
+  it('leaves a tab the user already closed alone — no second PTY delete, no store write', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb3' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+
+      // The user closes the tab before the shell ever reports ready. The
+      // close path owns the teardown (including its own DELETE).
+      act(() => { removeTab(sessionId) })
+      expect(dock.result.current.tabs.length).toBe(0)
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb3', ok: false })
+      // The dispatch must not issue a second DELETE for a tab it no longer owns.
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('leaves the session alone when the panel was popped out before ready', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb4' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+
+      // The user pops the terminal panel out: the popout window now owns the
+      // session's connection, and the tab stays in the shared store.
+      mockTerminalPopoutOpen = true
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb4', ok: false })
+      // Deleting the PTY here would tear the live shell out of the popout.
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(dock.result.current.tabs.length).toBe(1)
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('rolls back the minted dock tab and its PTY when the shell never becomes ready', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb1' },
+        }))
+      })
+      // The dispatch minted a persisted dock tab for this command.
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+
+      // No `ready` ever arrives: past the deadline the dispatch must clean up
+      // after itself instead of leaving a zombie tab in the persisted store.
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb1', ok: false })
+      expect(dock.result.current.tabs.length).toBe(0)
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, { method: 'DELETE', keepalive: true },
+      )
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps the tab when the shell becomes ready and the command is sent', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    const sent: Uint8Array[] = []
+    let sessionId = ''
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb2' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      sessionId = dock.result.current.tabs[0].id
+
+      // The PTY reports ready: registering the socket drains the ready
+      // listener synchronously and the command goes out on it.
+      const ws = { readyState: WebSocket.OPEN, send: (d: Uint8Array) => { sent.push(d) } } as unknown as WebSocket
+      act(() => { registerTerminalWs(sessionId, ws) })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb2', ok: true })
+      expect(new TextDecoder().decode(sent[0])).toBe('npm test\n')
+
+      // The deadline passing afterwards must not tear down a live shell.
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+      expect(dock.result.current.tabs.length).toBe(1)
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+    } finally {
+      stop()
+      if (sessionId) unregisterTerminalWs(sessionId)
+      vi.unstubAllGlobals()
+    }
   })
 })
 

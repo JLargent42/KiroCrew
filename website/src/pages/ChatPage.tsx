@@ -51,8 +51,10 @@ import { sendTurn } from '../chat-core/transport/sendTurn'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import { onTerminalReady, sendToTerminalSession, getTerminalShell, getTerminalFenceShells } from '../utils/terminalRegistry'
-import { runInTerminalText } from '../utils/fenceShell'
-import { addTab as addDockTerminal } from '../hooks/useBottomTerminal'
+import { runInTerminalText, RUN_IN_TERMINAL_READY_DEADLINE_MS } from '../utils/fenceShell'
+import { addTab as addDockTerminal, removeTab as removeDockTerminal, hasTab as hasDockTerminal } from '../hooks/useBottomTerminal'
+import { isPopoutOpen as isTerminalPopoutOpen } from '../utils/terminalPopout'
+import { disposeTerminalSession, useDeleteTerminalSession } from '../components/CliPanel'
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
 import { sseSlotTitle, triggerRefresh, updateSlot, slotIsRemoteBound } from '../store/dashboardSlice'
 import { performSlotSwitch } from '../lib/slotSwitch'
@@ -486,6 +488,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const location = useLocation()
   const queryClient = useQueryClient()
   const provider = useProvider()
+  // Kills a Run-in-terminal tab's backend PTY when the dispatch rolls back
+  // (see the mc:run-in-terminal handler). Routed through the same mutation the
+  // tab-close paths use (per the use-react-query guideline); read through a
+  // ref because that handler's effect deliberately registers once ([] deps).
+  const deleteTerminalSession = useDeleteTerminalSession()
+  const deleteTerminalSessionRef = useRef(deleteTerminalSession)
+  deleteTerminalSessionRef.current = deleteTerminalSession
   const [searchParams, setSearchParams] = useSearchParams()
   // Declared with the other top-of-component hooks because the ?sid= URL-sync
   // effect reads it (mobile replaces rather than pushes a session switch), and
@@ -3459,8 +3468,36 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         )
         emit(sendToTerminalSession(sessionId, text))
       })
-      // Give the PTY time to connect; if it never does, report failure.
-      setTimeout(() => { unsub(); emit(false) }, 6000)
+      // Give the PTY time to connect. If it never reports ready, report
+      // failure AND roll back the artifact this dispatch minted: the tab was
+      // created for this command, the command will never run in it, and the
+      // store persists tabs — so without the rollback every failed dispatch
+      // leaves a permanent zombie tab, ratcheting toward MAX_TERMINALS where
+      // addTab refuses and every later dispatch silently fails (#10822).
+      // `settled` distinguishes the cases: once ready has fired, the result
+      // (sent, or a failed send into a live shell) is already emitted and the
+      // shell is real — a tab the user may already be using stays.
+      setTimeout(() => {
+        if (settled) return
+        unsub()
+        // Roll back only while this dispatch still owns the tab it minted.
+        // Two external events transfer that ownership before the deadline:
+        // the user closed the tab (it is gone from the store, and its own
+        // close path already deleted the PTY — a second DELETE here would
+        // 404 and raise a false "close failed" notice), or the panel was
+        // popped out (the popout window now holds the live connection, and
+        // deleting the session would tear a shell out from under the user).
+        // In both cases the dispatch just reports failure and touches nothing.
+        if (hasDockTerminal(sessionId) && !isTerminalPopoutOpen()) {
+          // Same teardown, same order, as the tab-close paths: end the backend
+          // PTY (best-effort; the orphan reaper backstops it), drop the local
+          // WS + cached xterm, then remove the store entry.
+          deleteTerminalSessionRef.current.mutate(sessionId)
+          disposeTerminalSession(sessionId)
+          removeDockTerminal(sessionId)
+        }
+        emit(false)
+      }, RUN_IN_TERMINAL_READY_DEADLINE_MS)
     }
     window.addEventListener('mc:run-in-terminal', handler)
     return () => window.removeEventListener('mc:run-in-terminal', handler)
