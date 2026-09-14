@@ -94,7 +94,7 @@ long-lived instance that overhead amortises. For fan-out it does not.
   section 4.
 - **Changing how a remote crew is reached, addressed, or relayed.** Those surfaces
   stay as they are.
-- **Crew as a service.** Section 10 says what carries over and what does not.
+- **Crew as a service.** Section 12 says what carries over and what does not.
 
 ## 4. The case this exists for: fan-out
 
@@ -137,8 +137,22 @@ tools a crew needs are baked at build time. The image is versioned and reference
 by digest, so what a launch runs is exactly what was published.
 
 **A task definition per crew shape.** It names the image digest, the CPU and
-memory the owner asked for, the task role, and the log configuration. Registering
-one is an API call, not a deployment.
+memory the owner asked for, the task role, the log configuration, and the
+container's secret-valued environment. Registering one is an API call, not a
+deployment.
+
+The secret-valued half is load-bearing, because the container refuses to boot
+without it. `KIRO_API_KEY` is the model credential, checked for presence at
+startup by `require_api_key` in
+`src/kiro_crew/apps/builtins/aws_control/crew/runtime/container/supervisor/backend.py`;
+`SMC_CONTROL_SECRET` is what separates the owner's control surface from a
+customer turn, and a task started without it answers no control route at all.
+Neither is baked into the image. Both arrive as container secrets whose
+`valueFrom` names a Secrets Manager secret or a Parameter Store parameter, which
+is also what the execution role needs read permission on. Presence is all the
+startup check proves: an invalid `KIRO_API_KEY` produces a task that answers its
+port and fails every turn, so only a real turn establishes that the credential
+works.
 
 **A task per remote crew.** `RunTask` starts it, `StopTask` ends it, and nothing
 persists between the two except what the crew was told to write elsewhere.
@@ -194,7 +208,7 @@ Per method, what changes and what does not:
 | --- | --- | --- |
 | `preflight` | Credentials, region, image availability | Same shape |
 | `provision` | Register a task definition, `RunTask`, return the task identity | Minutes of bootstrap become an image pull |
-| `begin_signin` | Sign in inside the task | Same flow, different channel into the container |
+| `begin_signin` | Nothing to drive: the task is handed a model credential and refuses to boot without one | The device-code scrape has no counterpart |
 | `register` | Into the existing instances registry | Unchanged |
 | `teardown` | `StopTask` | Stack deletion becomes an API call |
 
@@ -234,7 +248,7 @@ failure of the RFC's main purpose. It is stated as a change rather than softened
 because it is one.
 
 A Fargate-backed crew is reached through its own front process in the task (see
-section 4), not through the relay surfaces an EC2-backed crew uses. The trade:
+section 5), not through the relay surfaces an EC2-backed crew uses. The trade:
 the product this backend exists to deliver is "deploy a crew and chat with it",
 one endpoint satisfies that, and the front process is where further endpoints are
 added. Reusing the relay surfaces instead would mean making them work against a
@@ -281,21 +295,19 @@ still only one party.
 Each phase is independently shippable and independently abandonable. Exit criteria
 are written as assertions someone else can check.
 
-### Phase 0: establish the channel into a task
+### Phase 0: establish the channel into a task -- answered
 
-**Blocked on:** the first open question in section 9. Phase 1 cannot commit to a
-transport before this is answered, so this phase exists to answer it and nothing
-else. No product code.
+**Not a gate on phase 1.** Section 5 records the verdict: the channel is a front
+process in the task, listening on port 8080 and forwarding a turn to the crew's
+own gateway over loopback. That decision is made, so this phase no longer holds
+anything back and carries no exit criteria.
 
-Exit criteria:
-
-- A Fargate task in a private subnet is reachable from a developer machine, and the
-  method is written down with the exact target format and the task-role permissions
-  it required.
-- If it is not reachable, the verdict says so and names what was tried. A negative
-  result ends this phase successfully and redirects phase 1 to an IAM-authorised
-  endpoint.
-- The verdict is recorded in this document, not only in a pull request.
+What was originally asked here was whether a task in a private subnet can be
+reached by port-forward with no listener at all, the way an EC2 remote instance
+is. That question is still open and is no longer on this path: it needs a Fargate
+target format and task-role messaging permissions established first, and section
+5 keeps it available as a second channel rather than a prerequisite. Phase 1
+commits to the front process.
 
 ### Phase 1: the backend
 
@@ -359,8 +371,10 @@ after it and the reverse holds too.
 repository are already present. This removes most of the launch cost without a new
 backend. It does not address sizing granularity, it does not make a host the right
 unit for a container, and it adds an AMI build and its per-region distribution to
-the release process. Worth revisiting if phase 0 finds no workable channel into a
-task, because it is the cheapest way to improve the current backend in place.
+the release process. It is the cheapest way to improve the current backend in
+place, and it stays worth revisiting on that basis rather than as a fallback: the
+channel into a task is settled, so nothing about this backend now depends on the
+port-forward question.
 
 **A warm pool of EC2 instances.** Keep N started and hand them out. This makes
 acquisition fast at the cost of paying for idle capacity and of a pool to operate.
@@ -379,10 +393,6 @@ the problem, and a turn is not reliably short enough to fit the execution limit.
 the thing this RFC is trying to remove.
 
 ## 11. Open questions
-
-**Sign-in inside a task.** The EC2 flow runs an interactive login on the host and
-scrapes the device-code prompt. The equivalent inside a task needs to be
-established, and it is the one method of the five with no direct translation.
 
 **Session lifetime against task lifetime.** A disposable task that lives minutes
 is a good fit for a short session. A fan-out worker that runs for hours is less
