@@ -40,12 +40,15 @@ a code-execution input:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
 import sys
+import uuid
 from pathlib import Path
 
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, replace_with_retry
 from kiro_crew.config import loader
 
 #: Set in the environment of the exec'd image. Its presence means "this process
@@ -128,6 +131,24 @@ def _reject(message: str) -> Path:
     raise InvalidTarget(message)
 
 
+#: The document that means "no live target" WITHOUT the file being absent.
+#:
+#: The sandbox masks this pointer from agent subprocesses, and on Linux a mask is a
+#: ``mount(2)`` that cannot target a path which does not exist — so an ABSENT pointer is
+#: an UNMASKED pointer, and a namespace spawned while it was absent can write one after
+#: Dev Fleet creates it, choosing the code the gateway execs into at its next start.
+#: ``sandbox._materialize_live_target_mask_target`` closes that by publishing this
+#: document before the spawn, which requires a spelling that every reader treats exactly
+#: as it treats absence: :func:`read_target_reason` returns ``(None, None)`` for it, so
+#: the boot path stays on the installed build and logs nothing, and the dashboard reports
+#: no pinned target rather than an unusable one.
+#:
+#: An explicit ``null`` rather than an empty object, so a MISSING ``checkout`` key keeps
+#: its existing complaint: ``{}`` is what a hand-edit produces and ``{"chekout": ...}`` is
+#: what a typo produces, and neither should pass silently as "nothing pinned".
+NO_TARGET_DOCUMENT: str = json.dumps({"checkout": None}, indent=2) + "\n"
+
+
 def read_target() -> Path | None:
     """The stored live target, or ``None`` when there is none to honour.
 
@@ -175,6 +196,12 @@ def read_target_reason() -> tuple[Path | None, str | None]:
     if data is None:
         return None, reason
     raw = data.get("checkout")
+    if raw is None and "checkout" in data:
+        # The mask's absent-equivalent document (:data:`NO_TARGET_DOCUMENT`), or an
+        # operator clearing the pin without deleting the file. Indistinguishable from
+        # absence BY DESIGN — same ``(None, None)``, so no caller can tell the
+        # materialised stub from a host that never pinned anything.
+        return None, None
     if not isinstance(raw, str):
         return None, f"the live-target pointer has no 'checkout' string: {pointer_path()}"
     try:
@@ -222,19 +249,68 @@ def write_target(
     if previous is not None and previous != resolved:
         data["previous_checkout"] = str(previous)
     payload = json.dumps(data, indent=2) + "\n"
-    path = pointer_path()
-    # ``restrict_to_owner=True`` locks the temp file down BEFORE the payload
-    # reaches it: the pointer is a code-execution input read at every startup,
-    # so it must never be readable by another account, not even for the width
-    # of the write window — locking down only after the rename would leave it
-    # inheriting the directory's ACL on Windows until then. It implies the
-    # owner-only POSIX mode, so the pointer is owner-only on every platform,
-    # and a lockdown failure refuses the write before the final path is
-    # touched. ``atomic_write`` also creates the parent directory itself,
-    # AFTER its planted-link check — a caller-side mkdir would walk through a
-    # pre-planted link before that check could see it.
-    atomic_write(path, payload, restrict_to_owner=True)
+    _publish_pointer(payload)
     return resolved
+
+
+#: Directory (a direct child of the crew data home) the pointer's temp file is staged
+#: in. Spelled here rather than imported from ``kiro_crew.sandbox`` to keep this module
+#: off that import chain; ``test_sandbox_dev_fleet_live_target.py`` pins the two equal.
+#: The sandbox launcher masks this directory in every agent namespace.
+_STAGING_LEAF = "live-target-staging"
+
+
+def _publish_pointer(payload: str) -> None:
+    """Atomically replace the pointer with *payload*, staged where no sandbox can see it.
+
+    A plain ``atomic_write`` stages its temp file BESIDE the target — in the data-home
+    root, which every sandbox can see and, being same-uid, ``link(2)``. A hard link
+    taken on the temp before the rename is a second name for the inode the gateway
+    ``execve``s from after the rename, outside the mask on the pointer's own name. So
+    the temp lives in ``_STAGING_LEAF``, a masked directory on the same filesystem,
+    written by ``atomic_write`` with the same owner-only hardening (POSIX mode and the
+    Windows ACL lockdown before the payload lands), and the published inode is then
+    checked: a regular file with exactly one link, or the pointer is removed again
+    and the write refused — an absent pointer boots the gateway's own image, which is
+    the safe default.
+    """
+    path = pointer_path()
+    staging = path.parent / _STAGING_LEAF
+    # Refuse to stage through a name an agent could have planted: the directory must be
+    # a real directory (not a symlink), owner-only where modes exist.
+    try:
+        st = os.lstat(staging)
+    except FileNotFoundError:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # exist_ok: the sandbox materialiser creates the same directory concurrently.
+        staging.mkdir(mode=0o700, exist_ok=True)
+        st = os.lstat(staging)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(
+            errno.ENOTDIR,
+            f"{staging} is not a directory; refusing to stage the live-target pointer through it",
+        )
+    staged = staging / f"pointer-{os.getpid()}-{uuid.uuid4().hex}.json"
+    atomic_write(staged, payload, restrict_to_owner=True)
+    try:
+        replace_with_retry(staged, path)
+    except OSError:
+        staged.unlink(missing_ok=True)
+        raise
+    try:
+        final = os.lstat(path)
+    except FileNotFoundError:
+        # Replaced from under us before we could look: someone else owns the pointer
+        # now, and nothing of ours is published. Nothing to verify.
+        return
+    if not stat.S_ISREG(final.st_mode) or final.st_nlink != 1:
+        path.unlink(missing_ok=True)
+        raise OSError(
+            errno.EMLINK,
+            f"refusing to publish {path}: the written pointer has {final.st_nlink} hard "
+            "link(s), so a second name would reach the checkout the gateway starts next "
+            "outside the sandbox mask; the pointer was removed",
+        )
 
 
 def snapshot() -> str | None:
@@ -263,18 +339,11 @@ def restore(prior: str | None) -> bool:
         if prior is None:
             path.unlink(missing_ok=True)
         else:
-            # Harden the restored file for the same reason write_target does:
-            # the pointer is a code-execution input read at every startup, and
-            # a rollback must not be the step that widens access to it.
-            # ``restrict_to_owner=True`` locks the temp file down before the
-            # content reaches it, so the restored pointer never inherits the
-            # directory's ACL on Windows even for the width of the write
-            # window, and a lockdown failure surfaces as the OSError this
-            # except already maps to ``False`` — before the final path is
-            # touched, so a failed rollback never publishes an unprotected
-            # pointer. The parent mkdir lives inside ``atomic_write``, after
-            # its planted-link check.
-            atomic_write(path, prior, restrict_to_owner=True)
+            # The same publisher as write_target: a rollback must not be the step
+            # that widens access to the pointer, nor the step that stages it where
+            # a sandbox can link it. A failure surfaces as the OSError this except
+            # maps to ``False`` — with nothing unprotected left published.
+            _publish_pointer(prior)
         return True
     except OSError:
         return False
