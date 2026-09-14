@@ -216,9 +216,11 @@ from kiro_crew.llm_helpers import (
     advance_fallback_candidate,
     configured_fallback_chain,
     fallback_rewound_transient_budget,
+    first_advertised_fallback,
     probe_fallback_restore,
     provider_active_model,
     record_interaction_event,
+    resolve_substitute_set_model,
     run_bg_oneliner,
     transient_retry_delay,
     usage_has_billing,
@@ -6833,6 +6835,17 @@ async def _run_chat(
     # this reset is a no-op for them and a later real turn can still recover.
     if message not in _SYNTHETIC_RECOVERY_MSGS:
         slot._posttoken_retry_used = False
+        # Same one-shot discipline for the reactive model-access swap. Its
+        # recovery replays the user's ORIGINAL message (their words, so it is
+        # NOT a synthetic marker and would reset the flag here like any fresh
+        # turn), which would re-open the swap on a still-unentitled candidate.
+        # The swap sets _model_access_recovery_pending when it enqueues that
+        # replay; preserve the True flag for exactly that turn and consume the
+        # latch, so a genuine later user turn can still earn one swap.
+        if slot._model_access_recovery_pending:
+            slot._model_access_recovery_pending = False
+        else:
+            slot._model_access_fallback_used = False
     # tool_call_id -> DISPLAY TITLE (LLM-authored prose for shell tools; used
     # only for PostToolUse hook name-matching — NOT trustworthy for security).
     _pending_tools: dict[str, str] = {}
@@ -13089,6 +13102,127 @@ async def _run_chat(
             # (_prompt_depth != 0) — do NOT requeue; partial + notice already
             # shown, so the streamed answer survives in the transcript. The
             # allowance is left UNconsumed so a later turn can still recover once.
+        elif (
+            not _turn_emitted
+            and not slot._model_access_fallback_used
+            and _prompt_depth == 0
+            and not _should_suppress_requeue(slot)
+            and isinstance((_rejected_id := getattr(exc, "rejected_model", None)), str)
+            and _rejected_id.strip()
+            and model_is_unusable(_rejected_id, getattr(exc, "advertised", None))
+            and (
+                _access_fb_candidate := first_advertised_fallback(
+                    getattr(exc, "advertised", None), _rejected_id
+                )
+            )
+            is not None
+        ):
+            # ── Reactive model-access-denial fallback ──
+            # A new conversation starts on the configured model (commonly the
+            # "auto" sentinel), and this account is not ENTITLED to it — a
+            # different failure from a throttle/capacity blip on an advertised
+            # model. The raise-time classifier tags exactly this case: a named
+            # model that is ABSENT from the session's advertised list
+            # (``exc.rejected_model`` + ``model_is_unusable`` — the same
+            # discriminator ``_model_is_unentitled`` uses to WORD the terminal
+            # error, so the trigger and the prose cannot disagree). Because the
+            # error is entitlement, not throttle, it is classified terminal and
+            # the two throttle-gated fallback branches above
+            # (``acp_error_is_transient``) do not fire, so the first reply just
+            # fails. This is the same reactive swap the unattended surfaces
+            # run (``stream_and_collect`` Case 2.5 / ``run_bg_oneliner``),
+            # on the interactive path.
+            #
+            # THREE properties the shared candidate selector already guarantees,
+            # so this stays a fix and not a new hazard:
+            #   - never the failed model: ``first_advertised_fallback`` skips
+            #     ``exc.rejected_model`` AND the ``"auto"`` sentinel, so the
+            #     default ``agent.fallback_model`` chain of ``("auto",)`` — whose
+            #     only entry is the very model that just failed — can never be
+            #     the target;
+            #   - bounded: one attempt (``_model_access_fallback_used`` one-shot).
+            #     An account entitled to NOTHING yields no candidate, the elif
+            #     goes false, and the terminal branch below surfaces the
+            #     entitlement error whose prose already names the served list;
+            #   - not a catch-all: the guard fires ONLY on a named model absent
+            #     from the advertised set. An unrelated provider error carries no
+            #     ``rejected_model`` and stays terminal, so a real fault is never
+            #     masked as a model switch.
+            slot.purge_chunks()
+            _rejected_safe, _ = redact_exfiltration_urls(str(_rejected_id))
+            _rejected_safe, _ = redact_credentials(_rejected_safe)
+            _cand_safe, _ = redact_exfiltration_urls(str(_access_fb_candidate))
+            _cand_safe, _ = redact_credentials(_cand_safe)
+            # Move the live session onto the accessible model through the shared
+            # substitute set_model seam (the same one the throttle walk uses);
+            # candidates are pre-filtered against the advertised list, so the
+            # explicit-pick guard inside set_model does not fire for them.
+            _set_model_fn = resolve_substitute_set_model(client)
+            if _set_model_fn is None:
+                # No set_model seam on this provider — nothing to swap onto; let
+                # the terminal branch surface the entitlement error unchanged.
+                logger.info(
+                    "model access fallback: slot %s provider exposes no set_model; "
+                    "surfacing entitlement error for %r",
+                    slot.key,
+                    _rejected_id,
+                )
+                raise
+            try:
+                await _set_model_fn(_access_fb_candidate)
+            except Exception:
+                logger.debug(
+                    "model access fallback: set_model(%r) failed; surfacing " "entitlement error",
+                    _access_fb_candidate,
+                    exc_info=True,
+                )
+                raise
+            slot._model_access_fallback_used = True
+            _sync_served_model(slot, client)
+            # Persisted notice card (never silent: the account, not the user,
+            # forced the model change, so it must be said out loud and survive a
+            # reload the way the throttle notice does).
+            slot.append(
+                "notice",
+                f"⚠️ Your account cannot use model '{_rejected_safe}' — "
+                f"running on '{_cand_safe}' instead.",
+                "msg msg-info",
+            )
+            logger.warning(
+                "model access fallback: slot %s model %r not entitled; " "re-prompting on %r",
+                slot.key,
+                _rejected_id,
+                _access_fb_candidate,
+            )
+            # Re-queue through _queue_recovery like every other retry: a direct
+            # queue_insert carries no admission stamp, so the drain's fail-closed
+            # re-check would destroy this retry in a channel-linked session.
+            #
+            # The set_model above is a provider RPC that yields the event loop,
+            # so a Stop (or a user follow-up) can land between the elif's entry
+            # guard and here. Re-check the same live-stop signals every sibling
+            # requeue site checks right before enqueue: a message the user has
+            # since stopped or replaced must not replay ahead of it. The model is
+            # already swapped and the notice already shown, which is harmless; we
+            # simply abandon the replay and let the turn end.
+            if (
+                not _should_suppress_requeue(slot)
+                and not slot._stopping
+                and getattr(slot, "_stop_generation", _stop_gen_turn_start) == _stop_gen_turn_start
+                and not bool(getattr(slot, "_pending_steers", None))
+                and not _has_user_queued_followup(slot)
+            ):
+                # The replay is the user's ORIGINAL message, so the reset at turn
+                # start cannot tell it from a fresh turn; this latch tells it to
+                # preserve the one-shot flag for that replay alone.
+                slot._model_access_recovery_pending = True
+                _queue_recovery(
+                    0,
+                    message,
+                    kind=SYNTHETIC_RECOVERY_KIND,
+                    # Verbatim replay, same rule as the transient/throttle retries.
+                    payload=payload_for_replay(_is_synthetic),
+                )
         else:
             if assistant_text:
                 _safe, _ = redact_exfiltration_urls(assistant_text)
