@@ -2317,3 +2317,24 @@ When `agent.model` is `"auto"` (default):
 - Missing file → defaults
 - Invalid JSON → defaults (warning logged)
 - Missing fields → individual defaults
+
+## Recovery library configuration boundary
+
+The recovery primitives accept an already-loaded config-shaped snapshot through
+`RecoveryPolicy.from_config` and `initialize_default_ladder`. The process owner
+must initialize once before consumers run; failure paths never load config.
+Repeated initialization returns the existing policy and cumulative attempts.
+Missing or invalid numeric values select library defaults, and L4's 1s/60s
+schedule is pinned. See [session.md](session.md#process-initialization-contract).
+
+`agent.recovery_backoff_base_secs` and `agent.recovery_backoff_max_secs` are not
+exposed in `AgentConfig`, the loader or the settings schema without their runtime
+consumers. Their names are the snapshot API contract, not currently available
+user settings. Consumer integration must add the complete fields, loader clamps
+and baseline entries together, retaining `restart=True`: base 2s clamped to
+0.1..60s, cap 120s clamped to 1..3600s, effective cap never below base.
+
+`agent.workflow_run_timeout_secs`'s declared `60..21600` bound (the dynamic-workflow
+run ceiling, unrelated to the recovery ladder) is now enforced at its loader call
+site: a later layer's workflow behavior work must not reintroduce an unclamped
+read or duplicate the clamp.

@@ -29,6 +29,22 @@ def emit_counter(name: str, attrs: dict[str, str | int | bool | float]) -> None:
         logger.debug("counter emit failed for %s", name, exc_info=True)
 
 
+def emit_histogram(
+    name: str,
+    value: float,
+    attrs: dict[str, str | int | bool | float],
+    *,
+    unit: str = "1",
+) -> None:
+    """Record one observation; telemetry failures never affect the caller."""
+    try:
+        from kiro_crew.metrics.provider import get_recorder
+
+        get_recorder().histogram(name, value, unit=unit, attrs=attrs)
+    except Exception:  # telemetry must never break the caller
+        logger.debug("histogram emit failed for %s", name, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Hang-resilience series (see docs in the emitting call sites)
 # ---------------------------------------------------------------------------
@@ -117,3 +133,23 @@ MCP_RECONNECTS = "kirocrew.mcp.reconnects"
 #: exactly as they are: they measure a specific hang-resilience fix on the
 #: child-permission path, and their population is not this one's.
 APPROVAL_DECISIONS = "kirocrew.approval.decisions"
+
+
+# Overload/recovery metric vocabulary. Declarations register no samplers.
+# Attributes are closed state/layer/lane/reason/process enums, never unit IDs.
+TASKQ_DEPTH = "kirocrew.taskq.depth"
+TASKQ_OLDEST_WAIT_SECS = "kirocrew.taskq.oldest_wait_secs"
+TASKQ_COMPLETIONS = "kirocrew.taskq.completions"
+TASKQ_EFFECTIVE_CAP = "kirocrew.taskq.effective_cap"
+TASKQ_PRESSURE_REASON = "kirocrew.taskq.pressure_reason"
+HOST_PROCS_PEAK = "kirocrew.host.procs_peak"
+HOST_FDS_PEAK = "kirocrew.host.fds_peak"
+HOST_RSS_PEAK_MB = "kirocrew.host.rss_peak_mb"
+LOOP_LAG_MS = "kirocrew.loop.lag_ms"
+# RecoveryLadder emits these only when explicitly driven by a caller.
+RECOVERY_DURATION_SECS = "kirocrew.recovery.duration_secs"
+RECOVERY_ATTEMPTS = "kirocrew.recovery.attempts"
+RECOVERY_ESCALATIONS = "kirocrew.recovery.escalations"
+RESTARTS_TOTAL = "kirocrew.recovery.restarts"
+# Closed controller action enum; no controller or sampler is registered here.
+ADAPTIVE_DECISIONS = "kirocrew.adaptive.decisions"

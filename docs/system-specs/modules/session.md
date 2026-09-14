@@ -1962,3 +1962,90 @@ pops by object identity — if a racing cold-start already replaced the
 entry, only the old session object is shut down; the fresh replacement
 and its session_map entry survive (the old provider is still reaped so
 its process never leaks).
+
+## Recovery primitives (`recovery/policy.py`, `recovery/ladder.py`)
+
+The explicit recovery library starts no services and does not change existing
+session, MCP or task dispatch retry consumers. `RecoveryLadder` decides; the
+caller owns independent failure probes, sleeping, cleanup and executing actions.
+Pressure alone is not evidence that a unit is dead.
+
+`RecoveryPolicy` provides capped exponential backoff (`base * 2**(attempt-1)`),
+with default base 2s and cap 120s. Equal jitter draws from `[raw/2, raw]`.
+A positive server `retry_after_secs` is a floor, applied before the hard cap.
+`RecoveryTracker` counts consecutive failures per unit, resets on success or
+600s without failure, and bounds remembered units to 1024 with LRU eviction.
+
+| Layer | Trigger supplied by caller | Cleanup budget | Failures to escalation | Destination |
+|---|---|---|---|---|
+| L1 tool call | Classified infrastructure error, not ordinary tool failure | None | 3 | L2 |
+| L2 backend | Backend gone, initialize timeout, breaker open | `POOL_SHUTDOWN_SECS` | 2 | L3 |
+| L3 ACP runtime | Runtime dead, stall, abandoned session start | `TOTAL_SHUTDOWN_BUDGET_SECS` | 2 | L4 |
+| L4 gateway daemon | Failed liveness probes AND absent self-report AND no progress | `TOTAL_SHUTDOWN_BUDGET_SECS` | Second failure within 600s | L5 |
+| L5 gateway | Human escalation only | None | Never automatic | Notify once per incident |
+
+L4's 1s/60s schedule is pinned to the stub reconnect budget; shared overrides
+cannot alter its backoff, jitter or cooldown. `SESSION_RECOVERY_MAX_ATTEMPTS=3`
+is the separate in-place session continuation budget, not L3 rebuild attempts.
+The library itself never restarts a process or issues a session continuation.
+
+### Process initialization contract
+
+Before any production recovery consumer is admitted, its process owner must call
+`initialize_default_ladder(cfg)` with the already-loaded startup configuration.
+The first call snapshots `RecoveryPolicy.from_config(cfg)` under a process lock;
+all subsequent calls return the same instance without reading the argument.
+`default_ladder()` only returns that instance. Before initialization it raises
+`RuntimeError`, rather than accidentally freezing a static default schedule.
+Failures perform no configuration reads. Reinitialization does not reset attempts,
+change the schedule or clear escalation notices. Configuration changes require a
+process restart. Explicit standalone users may construct `RecoveryLadder(policy)`.
+
+These APIs are available without user-facing recovery settings or production
+consumer initialization. The production startup owner must attach them together
+with the restart-required fields; this library is not a claim that every existing
+retry path uses the ladder. No task store or adaptive controller is imported.
+
+`classify_infra_error` recognises capacity JSON-RPC errors (`-32001`,
+`class=capacity`, optional `retry_after_secs`) and a closed set of infrastructure
+markers. Mapping and serialized forms use the same outcome-owner dispatch:
+
+- An RPC `result` is authoritative, even beside error-looking metadata. Only a
+  result mapping with `isError: true` authorizes scanning its `content[].text`.
+- A bare MCP result (`isError` or `content` present) follows the same rule.
+  Absent/false `isError` never authorizes code/message/content heuristics.
+- An `error` envelope authorizes only a mapping-valued `error`, never sibling
+  metadata. Null/non-mapping `error` or RPC envelopes without an outcome return
+  no classification. Ordinary RPC and MCP failures remain non-infrastructure.
+- A bare RPC error object with a negative integer `code` or `data.class=capacity`
+  is accepted for compatibility; a message-only mapping does not establish
+  failure. Callers passing bare error objects must already know they represent
+  failures.
+
+Raw failure text and exception text retain the closed-marker compatibility
+path; callers MUST already know the operation failed. Arbitrary output or a
+successful document quoting a marker is not valid raw input. Raw text longer
+than 2000 characters is rejected. Classification grants no permission to replay
+provider requests or automatically retry operations with unknown side effects.
+
+Explicit ladder calls emit `kirocrew.recovery.{attempts,escalations,duration_secs,restarts}`
+through the consent-gated metric facade. The optional event sink receives
+`(task_id, decision_data)` only when a task ID is supplied; it does not open a
+store. A sink/notifier failure cannot break recovery. L5 only notifies once per
+failure run; success re-arms that notification.
+
+Notification deduplication belongs to the failure episode in the originating
+layer's tracker, not to the destination layer or a union of unit names. Claiming
+one notification is atomic with recording the failure under the ladder lock;
+callbacks execute outside that lock. A failed callback is still a claimed attempt
+and is not retried within that episode. Concurrent/reentrant failures cannot
+notify twice. An already-claimed callback may complete after its episode ends.
+
+Success, `forget(layer, unit)`, LRU eviction, or a gap of at least the layer's
+cooldown since its LAST failure ends the episode together with its notice state.
+Cooldown expiry is applied lazily by tracker reads or the next failure; continuous
+failures less than a cooldown apart keep one episode even across many cooldown
+periods. A later episode of the same name can notify again, while ending an
+unrelated layer's same-named episode neither suppresses nor re-arms this one.
+There is one boolean per tracked unit, bounded by the existing per-layer 1024-unit
+LRU; no separate notification registry or cleanup sweep exists.

@@ -1845,3 +1845,20 @@ needed because a same-day backfill's 23:59 is in the future and
 only fail verification. Because `_ensure_downloaded()` returns early when
 `model_ready()`, a CDN request is a **first-install** signal, not a DAU signal —
 the dashboard shows it as "downloads", deliberately separate from DAI.
+
+## Recovery metric primitives
+
+`events.emit_histogram(name, value, attrs, unit="1")` records an explicit
+observation through the same lazy, consent-gated recorder as `emit_counter`.
+Importing the facade registers no sampler or exporter. Provider/recorder errors
+are debug-logged and never propagated to the instrumented path.
+
+The explicit `RecoveryLadder` emits counters `kirocrew.recovery.attempts`
+(`layer`, `action`), `kirocrew.recovery.escalations` (`from_layer`, `to_layer`),
+and `kirocrew.recovery.restarts` (`layer`). Successful recovery observes elapsed
+seconds in `kirocrew.recovery.duration_secs` (`layer`, unit `s`). No unit, task,
+backend or session ID is a metric attribute. Telemetry remains default OFF.
+
+`events.py` also declares the task queue, host peak, loop lag and adaptive
+instrument names for consumers. Those declarations alone produce no samples,
+create no durable task store and install no health/adaptive sampler.
