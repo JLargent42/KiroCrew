@@ -642,10 +642,20 @@ def _floor_monkeypatch():
     test and the floor's value is what gets put back first, then the original.
     """
     mp = pytest.MonkeyPatch()
+    # In-process CLI calls clear these markers as part of startup hardening.
+    # Preserve the test worker's outer sandbox identity for subsequent tests.
+    sandbox_markers = {
+        name: os.environ.get(name) for name in ("KIROCREW_SANDBOX_ACTIVE", "KIROCREW_SANDBOX_LEVEL")
+    }
     try:
         yield mp
     finally:
         mp.undo()
+        for name, value in sandbox_markers.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @pytest.fixture

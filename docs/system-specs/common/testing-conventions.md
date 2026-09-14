@@ -334,6 +334,12 @@ which testpath asked for the workers.
   invoking an unprotected filesystem or process operation.
 
 - Tests MUST NOT spawn real kiro-cli processes
+- In-process calls to `cli.main()` clear the inherited sandbox-active and tier
+  markers as part of CLI startup hardening. The root isolation floor snapshots
+  `KIROCREW_SANDBOX_ACTIVE` and `KIROCREW_SANDBOX_LEVEL` and restores their exact
+  prior values (including absence) after the test's monkeypatches are undone, so
+  a help-text test cannot remove the next test's outer-sandbox identity. The CLI
+  still clears the markers during the call; tests must not disable that guard.
 - Tests MUST NOT depend on `~/.kiro/crew/` existing
 - Tests MUST NOT write into the operator's real data dir. `KIROCREW_HOME` is pinned
   per test by the rootdir conftest, which is what makes `config_dir()` safe — and it

@@ -2050,3 +2050,51 @@ class TestTheWorkerBudgetIsMemoryBounded:
         monkeypatch.setattr("builtins.open", _fake_cgroup)
 
         assert budget._cgroup_limit_mib() == 8 * 1024
+
+
+class TestSandboxProcessMarkersAreRestored:
+    """CLI startup may clear its own environment, not the next test's identity."""
+
+    @pytest.mark.parametrize("initial", [None, ("1", "strict"), ("", "")])
+    def test_cli_scrubs_markers_and_the_floor_restores_the_original_state(
+        self, initial, monkeypatch, tmp_path, capsys
+    ):
+        names = ("KIROCREW_SANDBOX_ACTIVE", "KIROCREW_SANDBOX_LEVEL")
+        for index, name in enumerate(names):
+            if initial is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, initial[index])
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "--help"])
+        definition = _root._floor_monkeypatch
+        cycle = getattr(definition, "__wrapped__", definition)()
+        next(cycle)
+        try:
+            with pytest.raises(SystemExit) as exit_info:
+                cli.main()
+            assert exit_info.value.code == 0
+            # Startup hardening still runs inside the fixture; no bypass is added.
+            assert all(name not in os.environ for name in names)
+        finally:
+            cycle.close()
+        capsys.readouterr()
+        for index, name in enumerate(names):
+            if initial is None:
+                assert name not in os.environ
+            else:
+                assert os.environ[name] == initial[index]
+
+    def test_the_floor_removes_markers_that_were_originally_absent(self, monkeypatch):
+        names = ("KIROCREW_SANDBOX_ACTIVE", "KIROCREW_SANDBOX_LEVEL")
+        for name in names:
+            monkeypatch.delenv(name, raising=False)
+        definition = _root._floor_monkeypatch
+        cycle = getattr(definition, "__wrapped__", definition)()
+        next(cycle)
+        try:
+            os.environ[names[0]] = "1"
+            os.environ[names[1]] = "strict"
+        finally:
+            cycle.close()
+        assert all(name not in os.environ for name in names)
