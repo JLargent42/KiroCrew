@@ -1173,9 +1173,13 @@ class SshTunnelManager:
         # down and replaced while it is in flight; `instance_id in self._tunnels` is
         # then true again and cannot tell the generations apart. The stamp can:
         # a token is stored only if the tunnel it belongs to is still the current
-        # one. This covers every mint path, including the request-driven
-        # `refresh_token()` the embedded dashboard calls, which is not a task in
-        # `_refresh_tasks` and so cannot be cancelled by name.
+        # one. Coverage, mint path by mint path: connect() mints inside its
+        # critical section, so nothing can replace the tunnel mid-mint and it
+        # needs no stamp; _refresh_token_once — and refresh_token(), the
+        # request-driven path the embedded dashboard calls, which delegates to
+        # it and is not a task in `_refresh_tasks`, so it cannot be cancelled by
+        # name — compares the stamp under the lock before its store; the
+        # self-heal tier-2 re-mint does the same before its store.
         self._tunnel_epoch: dict[str, int] = {}
         # Proactive token refresh: per-instance refresh task + the mint timestamp
         # / ttl so the TTL-remaining can be surfaced (Stage 6).
@@ -1890,6 +1894,16 @@ class SshTunnelManager:
         # has already removed. Ordered after the stop for the same reason as the
         # token itself — a rejected edit must leave the live tunnel intact.
         await self._cancel_token_refresh_and_wait(instance_id)
+        # A parked self-heal is deliberately NOT drained here, although it has
+        # the same shape of hazard. Draining would await _cancel_recovery under
+        # the lock we hold, and unlike the refresh loop a recovery's
+        # cancellation can be swallowed — _SshTunnel.stop() suppresses
+        # CancelledError around its child-task awaits — after which the
+        # survivor parks on THIS lock and the gather never returns. The
+        # surviving mint is harmless instead: tier 2's store compares
+        # _tunnel_epoch and refuses a token minted for a generation that is no
+        # longer current, and its membership check refuses one for an instance
+        # no longer tracked at all.
         # Clear the lazy-reconnect hint AND the recorded local port together
         # (one atomic write). local_port must return to the unallocated
         # sentinel so the now-free port is not treated as reserved forever,
@@ -2194,6 +2208,11 @@ class SshTunnelManager:
                 return
 
             local_port = current.status.local_port or inst.local_port
+            # Which tunnel generation this recovery found. There is no await
+            # between this block and tier 1's rebuild, so tier 2 can bind its
+            # store to the ONE bump that a failed tier-1 rebuild is guaranteed
+            # to make (see the store below).
+            epoch = self._tunnel_epoch.get(instance_id, 0)
 
         # Phase 2 — slow remote I/O WITHOUT the lock.
         # Tier 1 — rebuild tunnel, reuse existing token.
@@ -2213,6 +2232,23 @@ class SshTunnelManager:
         async with self._lock:
             if instance_id not in self._tunnels:
                 return  # disconnected while minting — discard
+            if self._tunnel_epoch.get(instance_id, 0) != epoch + 1:
+                # This mint ran for the generation tier 1 installed, which is
+                # exactly ONE bump past the Phase 1 stamp: a failed tier-1
+                # rebuild always installs (and bumps for) its replacement
+                # before start() reports failure, and every path that raises
+                # instead never reaches this store. Any other value means a
+                # tunnel this recovery never saw was installed meanwhile (the
+                # operator disconnected and reconnected while the slow remote
+                # I/O was in flight) — membership alone cannot see that, the
+                # NEW generation satisfies it. Storing the result would hand
+                # the embedded dashboard a credential the current remote never
+                # issued, and the rebuild below would replace the current
+                # tunnel using this recovery's stale record. Same stamp check
+                # as _refresh_token_once's store; the +1 is tier 2's own
+                # install sitting between the capture and the compare.
+                logger.info("Discarding a superseded self-heal mint for %s", instance_id)
+                return
             self._store_token(instance_id, token, inst.ttl)
             self._schedule_token_refresh(instance_id)
         if await self._rebuild(inst, params, local_port):
