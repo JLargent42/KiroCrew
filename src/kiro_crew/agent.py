@@ -5827,7 +5827,6 @@ acting on a goal. The user can message you at any time: apply goal changes at th
 round boundary, except a message that invalidates an in-flight item, which you
 handle immediately.
 
-{{VERBOSITY_BLOCK}}
 """
 
 
@@ -6868,7 +6867,6 @@ it before acting on a pipeline. The user can message you at any time: a
 steering message is a MODE CHANGE — fold it into the standing patrol
 instruction with `monitor_update` so every later cycle honors it.
 
-{{VERBOSITY_BLOCK}}
 """
 
 
@@ -6968,7 +6966,6 @@ You have every tool the default agent has: write files, run builds, drive git,
 open pull requests. Nothing is withheld, because anything withheld would be
 something some work item needs.
 
-{{VERBOSITY_BLOCK}}
 """
 
 
@@ -7790,7 +7787,6 @@ conditions. Read it before acting on an audit. The user can message you at any
 time: a steering message is a MODE CHANGE — fold it into the standing patrol
 instruction with `monitor_update` so every later cycle honors it.
 
-{{VERBOSITY_BLOCK}}
 """
 
 
