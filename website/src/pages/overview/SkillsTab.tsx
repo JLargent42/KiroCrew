@@ -2,8 +2,9 @@ import { useState, useMemo, useEffect, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Download, Loader2, RefreshCw, Sparkles } from 'lucide-react'
-import { api, ApiError } from '../../api/client'
+import { api, ApiError, type SkillScriptValidation } from '../../api/client'
 import ProjectSkillsTrustList from '../../components/ProjectSkillsTrustList'
+import ErrorNotice from '../../components/ErrorNotice'
 import { Card, Btn, SearchInput, EmptyState, Toggle } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import Modal from '../../components/Modal'
@@ -480,6 +481,9 @@ interface PendingSkill {
   /** For updates: the live skill this proposes to change (e.g. 'auto/deploy'). */
   target?: string | null
   base_version?: number | null
+  /** Server-computed verdict for the bundled scripts (issue #10861): lets the
+   *  card warn BEFORE the click that Approve cannot succeed as-is. */
+  script_validation?: SkillScriptValidation
 }
 interface PendingDetail {
   name: string
@@ -493,12 +497,42 @@ interface PendingDetail {
   to_version?: number | null
   /** True when the live skill advanced past the version this was merged from. */
   stale_base?: boolean
+  script_validation?: SkillScriptValidation
 }
 
-function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
+/** A refused approve, parsed from the ApiError body (code + findings report). */
+interface ApproveRefusal {
+  code?: string
+  reason?: string
+  message: string
+  report: Record<string, string[]>
+}
+
+/** Per-file validator findings, shared by the pre-approval warning and the
+ *  post-click refusal so both show the same evidence. */
+function ValidationFindings({ report }: { report: Record<string, string[]> }) {
+  const files = Object.keys(report)
+  if (files.length === 0) return null
+  return (
+    <ul className="mt-1 space-y-1">
+      {files.map(fn => (
+        <li key={fn} className="text-[11px]">
+          <span className="font-semibold">{fn}</span>
+          <ul className="list-disc ml-4">
+            {report[fn].map((f, i) => <li key={i}>{f}</li>)}
+          </ul>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function PendingCandidateRow({ p, autoOpen, approveRefusal, onApprove, onDismiss }: {
   p: PendingSkill
   /** True when a notification deep-linked at THIS candidate (?review=<slug>). */
   autoOpen?: boolean
+  /** Why the last Approve click on THIS row was refused, when it was. */
+  approveRefusal?: ApproveRefusal
   onApprove: (slug: string) => void
   onDismiss: (slug: string) => void
 }) {
@@ -541,6 +575,11 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
                  fourth control in the row (AUTOSDE max-two-buttons-per-row). */
               <span className="ml-2 text-[10px] px-1.5 py-[1px] rounded-full bg-warn-subtle text-warn font-bold">{i18nT('pages.overview.skillsTab.script')}</span>
             )}
+            {p.script_validation?.ok === false && (
+              /* The server will refuse Approve for this candidate as-is; warn
+                 BEFORE the click. The findings render in the expanded panel. */
+              <span className="ml-2 text-[10px] px-1.5 py-[1px] rounded-full bg-danger-subtle text-danger font-bold">{i18nT('pages.overview.skillsTab.fails_validation')}</span>
+            )}
           </div>
           <div className="text-[12px] text-muted truncate">
             {isUpdate && p.target
@@ -556,8 +595,30 @@ function PendingCandidateRow({ p, autoOpen, onApprove, onDismiss }: {
         <Btn primary disabled={!open || !detail || (isUpdate && (!detail.diff || !!detail.stale_base))} onClick={() => onApprove(p.slug)}>{i18nT('pages.overview.skillsTab.approve')}</Btn>
         <Btn danger onClick={() => { if (confirm(i18nT('pages.overview.skillsTab.dismiss_confirm', { name: p.name }))) onDismiss(p.slug) }}>{i18nT('pages.overview.skillsTab.dismiss')}</Btn>
       </div>
+      {approveRefusal && (
+        <div className="mt-2">
+          {/* Rendered OUTSIDE the expand gate: the refused click must explain
+              itself even on a collapsed row — a silent no-op is the bug this
+              exists to fix (issue #10861). */}
+          <ErrorNotice message={approveRefusal.message} askAgent />
+          <ValidationFindings report={approveRefusal.report} />
+        </div>
+      )}
       {open && detail && (
         <div className="mt-2 space-y-2">
+          {(detail.script_validation?.ok === false || p.script_validation?.ok === false) && (
+            /* Pre-approval warning: the server WILL refuse this candidate
+               as-is. Approve stays clickable — the server is the authority —
+               but the user learns before the click, with the findings. */
+            <details className="text-[11px] p-2 rounded bg-danger-subtle text-danger border border-border">
+              <summary className="cursor-pointer font-semibold">
+                {i18nT('pages.overview.skillsTab.scripts_fail_validation_warning')}
+              </summary>
+              <ValidationFindings
+                report={(detail.script_validation ?? p.script_validation)?.report ?? {}}
+              />
+            </details>
+          )}
           {p.has_scripts && (
             /* Scripts are a hard security boundary: a script-bearing candidate
                stages for manual review even with skills.approval_required off.
@@ -642,9 +703,66 @@ function PendingSkillsPanel() {
     refetchOnMount: 'always',
   })
   const pending: PendingSkill[] = data?.pending ?? []
+  // Why the last Approve click was refused, per slug. Server prose stays out of
+  // the UI: the coded body picks a catalog message, and the findings report
+  // renders next to the card so the user learns WHAT was flagged (issue #10861).
+  const [approveRefusals, setApproveRefusals] = useState<Record<string, ApproveRefusal>>({})
   const approve = useMutation({
     mutationFn: (slug: string) => api.approvePendingSkill(slug),
+    onMutate: (slug: string) => {
+      // A retry starts clean; a stale refusal must not outlive the click that
+      // supersedes it.
+      setApproveRefusals(prev => {
+        if (!(slug in prev)) return prev
+        const next = { ...prev }
+        delete next[slug]
+        return next
+      })
+    },
+    onError: (err, slug) => {
+      let code: string | undefined
+      let reason: string | undefined
+      const report: Record<string, string[]> = {}
+      // Duck-typed on `body` rather than `instanceof ApiError`, matching the
+      // convention documented in api/apiError.ts: the suites mock api/client
+      // wholesale, and a class check against a mocked module cannot match.
+      const body = (err as { body?: unknown }).body
+      if (typeof body === 'string' && body) {
+        code = parseErrorCode(body)
+        try {
+          const parsed = JSON.parse(body) as { reason?: unknown; report?: unknown }
+          if (typeof parsed.reason === 'string') reason = parsed.reason
+          if (parsed.report && typeof parsed.report === 'object') {
+            for (const [fn, findings] of Object.entries(parsed.report as Record<string, unknown>)) {
+              if (Array.isArray(findings)) report[fn] = findings.map(String)
+            }
+          }
+        } catch { /* non-JSON body: fall through to the generic message */ }
+      }
+      const message =
+        code === 'script_validation_failed'
+          ? i18nT('pages.overview.skillsTab.approve_failed_script_validation')
+          : code === 'live_skill_exists'
+            ? i18nT('pages.overview.skillsTab.approve_failed_live_exists')
+            : code === 'pending_skill_not_found'
+              ? i18nT('pages.overview.skillsTab.approve_failed_not_found')
+              : i18nT('pages.overview.skillsTab.approve_failed_generic', {
+                  reason: reason || code || (err instanceof Error ? err.message : String(err)),
+                })
+      setApproveRefusals(prev => ({ ...prev, [slug]: { code, reason, message, report } }))
+      // A refused approve can mean the queue moved under us (approved/dismissed
+      // elsewhere) — refetch so a not-found card disappears instead of lingering.
+      if (code === 'pending_skill_not_found') {
+        qc.invalidateQueries({ queryKey: ['skills-pending'] })
+      }
+    },
     onSuccess: (_data, slug) => {
+      setApproveRefusals(prev => {
+        if (!(slug in prev)) return prev
+        const next = { ...prev }
+        delete next[slug]
+        return next
+      })
       // Drop the deep-link latch when the user acts on the linked candidate
       // THEMSELVES. Without this, approving the row you arrived at makes the
       // refetch omit it, which flips reviewMissing and reports "no longer
@@ -729,6 +847,7 @@ function PendingSkillsPanel() {
                 key={p.slug}
                 p={p}
                 autoOpen={p.slug === reviewSlug}
+                approveRefusal={approveRefusals[p.slug]}
                 onApprove={s => approve.mutate(s)}
                 onDismiss={s => dismiss.mutate(s)}
               />

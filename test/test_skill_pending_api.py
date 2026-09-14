@@ -116,9 +116,11 @@ async def test_approve_promotes(loader):
 
 
 @pytest.mark.asyncio
-async def test_approve_missing_returns_409(loader):
+async def test_approve_missing_returns_404_coded(loader):
     resp = await H.api_skill_pending_approve(_Req(loader, match={"slug": "nope"}))
-    assert resp.status == 409
+    assert resp.status == 404
+    data = _payload(resp)
+    assert data["code"] == "pending_skill_not_found"
 
 
 @pytest.mark.asyncio
@@ -287,8 +289,8 @@ async def test_approve_routes_update_to_approve_pending_update(loader, monkeypat
         called["new"] = slug
         return "auto/should-not-run"
 
-    monkeypatch.setattr(loader, "approve_pending_update", _upd, raising=False)
-    monkeypatch.setattr(loader, "approve_pending_skill", _new)
+    monkeypatch.setattr(loader, "approve_pending_update_checked", _upd, raising=False)
+    monkeypatch.setattr(loader, "approve_pending_skill_checked", _new)
     monkeypatch.setattr(loader, "run_skill_lifecycle", lambda **k: None)
     resp = await H.api_skill_pending_approve(
         _Req(loader, match={"slug": "deploy-helper-update"})
@@ -308,8 +310,8 @@ async def test_approve_routes_new_to_approve_pending_skill(loader, monkeypatch):
         called["update"] = slug
         return "auto/should-not-run"
 
-    monkeypatch.setattr(loader, "approve_pending_update", _upd, raising=False)
-    # get_pending_skill + approve_pending_skill remain the real (part-A) impls.
+    monkeypatch.setattr(loader, "approve_pending_update_checked", _upd, raising=False)
+    # get_pending_skill + approve_pending_skill_checked remain the real impls.
     resp = await H.api_skill_pending_approve(_Req(loader, match={"slug": "deploy-helper"}))
     assert resp.status == 200
     assert _payload(resp)["approved"] == "auto/deploy-helper"
@@ -332,3 +334,96 @@ async def test_dismiss_routes_update_candidate_by_slug(loader, monkeypatch):
     )
     assert resp.status == 200
     assert seen["slug"] == "deploy-helper-update"
+
+
+# ── Issue #10861: approve refusals carry a machine-readable reason ──────────
+# A candidate whose bundled script fails static validation used to collapse
+# into the same code-less 409 as "not found" and "live skill exists", so the
+# dashboard's Approve click looked like a no-op. These pin the distinct coded
+# responses, the pre-approval verdict on the pending payloads, and the SEL
+# outcome accuracy.
+
+_EVIL_SCRIPT = "x = eval('1+1')\n"  # trips the validator's dynamic-exec rule
+
+
+@pytest.fixture()
+def flagged_loader(tmp_path):
+    """A loader with one candidate whose script fails validation."""
+    ld = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+    ld.stage_skill_candidate(
+        "evil-helper",
+        description="does bad things",
+        triggers="evil",
+        procedure_md="## Steps\n1. go\n",
+        provenance=AutoSkillProvenance(session_key="s", created_at=AutoSkillProvenance.now_iso()),
+        scripts=[{"filename": "evil.py", "content": _EVIL_SCRIPT}],
+    )
+    return ld
+
+
+@pytest.mark.asyncio
+async def test_approve_validation_failure_returns_coded_422_with_report(flagged_loader):
+    resp = await H.api_skill_pending_approve(_Req(flagged_loader, match={"slug": "evil-helper"}))
+    assert resp.status == 422
+    data = _payload(resp)
+    assert data["code"] == "script_validation_failed"
+    assert "evil.py" in data["report"]
+    assert any("eval" in f for f in data["report"]["evil.py"])
+    # The refusal left the candidate reviewable in the queue.
+    assert [p["slug"] for p in flagged_loader.list_pending_skills()] == ["evil-helper"]
+
+
+@pytest.mark.asyncio
+async def test_approve_live_exists_returns_coded_409(loader):
+    live = loader._dir / "auto" / "deploy-helper"
+    live.mkdir(parents=True)
+    (live / "SKILL.md").write_text("---\nname: auto/deploy-helper\n---\nbody\n", encoding="utf-8")
+    resp = await H.api_skill_pending_approve(_Req(loader, match={"slug": "deploy-helper"}))
+    assert resp.status == 409
+    assert _payload(resp)["code"] == "live_skill_exists"
+
+
+@pytest.mark.asyncio
+async def test_approve_validation_refusal_audits_rejected_not_not_found(
+    flagged_loader, monkeypatch
+):
+    events: list[dict] = []
+    monkeypatch.setattr(
+        H,
+        "_sel",
+        lambda: SimpleNamespace(log_tool_invocation=lambda **kw: events.append(kw)),
+    )
+    resp = await H.api_skill_pending_approve(_Req(flagged_loader, match={"slug": "evil-helper"}))
+    assert resp.status == 422
+    assert events, "refusal must be SEL-audited"
+    assert events[-1]["outcome"] == "rejected"
+    assert events[-1]["metadata"]["reason"] == "script_validation_failed"
+
+
+@pytest.mark.asyncio
+async def test_pending_detail_carries_script_validation_verdict(loader, flagged_loader):
+    clean = await H.api_skill_pending_detail(_Req(loader, match={"slug": "deploy-helper"}))
+    clean_sv = _payload(clean)["script_validation"]
+    assert clean_sv == {"ok": True, "report": {}}
+    flagged = await H.api_skill_pending_detail(_Req(flagged_loader, match={"slug": "evil-helper"}))
+    flagged_sv = _payload(flagged)["script_validation"]
+    assert flagged_sv["ok"] is False
+    assert any("eval" in f for f in flagged_sv["report"]["evil.py"])
+
+
+@pytest.mark.asyncio
+async def test_pending_list_carries_script_validation_verdict(flagged_loader):
+    resp = await H.api_skills_pending(_Req(flagged_loader))
+    (entry,) = _payload(resp)["pending"]
+    assert entry["script_validation"]["ok"] is False
+    assert "evil.py" in entry["script_validation"]["report"]
+
+
+def test_none_wrapper_contract_preserved(flagged_loader):
+    """Existing callers of the un-checked approve still get None, no raise."""
+    assert flagged_loader.approve_pending_skill("evil-helper") is None
+    assert flagged_loader.approve_pending_skill("does-not-exist") is None
+    assert flagged_loader.approve_pending_update("does-not-exist") is None
+    # The candidate is still pending and its script bytes are untouched.
+    pdir = flagged_loader._pending_root() / "evil-helper"
+    assert (pdir / "scripts" / "evil.py").read_text(encoding="utf-8") == _EVIL_SCRIPT
