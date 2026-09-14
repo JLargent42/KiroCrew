@@ -340,6 +340,9 @@ which testpath asked for the workers.
   prior values (including absence) after the test's monkeypatches are undone, so
   a help-text test cannot remove the next test's outer-sandbox identity. The CLI
   still clears the markers during the call; tests must not disable that guard.
+  Tests of this marker restoration stub `cli.platform_compat.ensure_utf8_console`:
+  unrelated console initialization mutates `PYTHONUTF8` and `PYTHONIOENCODING` on
+  every platform, and those keys are not restored by the sandbox-marker floor.
 - Tests MUST NOT depend on `~/.kiro/crew/` existing
 - Tests MUST NOT write into the operator's real data dir. `KIROCREW_HOME` is pinned
   per test by the rootdir conftest, which is what makes `config_dir()` safe — and it

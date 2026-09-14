@@ -2056,9 +2056,24 @@ class TestSandboxProcessMarkersAreRestored:
     """CLI startup may clear its own environment, not the next test's identity."""
 
     @pytest.mark.parametrize("initial", [None, ("1", "strict"), ("", "")])
+    @pytest.mark.parametrize("encoding_initial", [None, ("0", "latin-1:strict")])
     def test_cli_scrubs_markers_and_the_floor_restores_the_original_state(
-        self, initial, monkeypatch, tmp_path, capsys
+        self, initial, encoding_initial, monkeypatch, tmp_path, capsys
     ):
+        encoding_names = ("PYTHONUTF8", "PYTHONIOENCODING")
+        for index, name in enumerate(encoding_names):
+            # Record an undo even for absent keys, so a failing regression cannot leak.
+            monkeypatch.setenv(name, "0" if encoding_initial is None else encoding_initial[index])
+            if encoding_initial is None:
+                monkeypatch.delenv(name)
+        encoding_before = {name: os.environ.get(name) for name in encoding_names}
+        monkeypatch.setattr(
+            cli.platform_compat,
+            "_ensure_utf8_process_environment",
+            lambda: pytest.fail("unrelated encoding initializer ran in the sandbox-marker test"),
+        )
+        # Console setup is unrelated and mutates process state on every platform.
+        monkeypatch.setattr(cli.platform_compat, "ensure_utf8_console", lambda: None)
         names = ("KIROCREW_SANDBOX_ACTIVE", "KIROCREW_SANDBOX_LEVEL")
         for index, name in enumerate(names):
             if initial is None:
@@ -2076,9 +2091,11 @@ class TestSandboxProcessMarkersAreRestored:
             assert exit_info.value.code == 0
             # Startup hardening still runs inside the fixture; no bypass is added.
             assert all(name not in os.environ for name in names)
+            assert {name: os.environ.get(name) for name in encoding_names} == encoding_before
         finally:
             cycle.close()
         capsys.readouterr()
+        assert {name: os.environ.get(name) for name in encoding_names} == encoding_before
         for index, name in enumerate(names):
             if initial is None:
                 assert name not in os.environ
