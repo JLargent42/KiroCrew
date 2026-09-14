@@ -432,8 +432,7 @@ class TestCheckoutFilter:
 
     def test_worktree_probe_failure_on_absent_file_is_clean(self, git, monkeypatch):
         """Extension on, config.worktree never created: the probe fails, the
-        classifier confirms the empty scope, and the repo reads filter-free —
-        the #10332 fix at this guard."""
+        classifier confirms the empty scope, and the repo reads filter-free."""
         monkeypatch.setattr(wt, "_worktree_extension_on", lambda root: True)
         monkeypatch.setattr(
             wt, "_worktree_probe_failure_is_empty_scope", lambda root: True

@@ -842,12 +842,11 @@ class TestCheckoutFilters:
         """For a LINKED worktree, `config.worktree` lives under
         `$GIT_DIR` (`<common>/worktrees/<id>`), not under the common dir.
 
-        Probing the common dir therefore missed a filter declared in a linked
-        worktree's own config — the `--worktree` probe resolved the wrong
-        directory and the driver executed during checkout (verified
-        empirically before this fix). Probe-first: with the extension on the
-        scope is always listed, and the classifier resolves `$GIT_DIR`, not
-        the common dir.
+        A common-dir probe cannot see a filter declared in a linked
+        worktree's own config, so the guard resolves `--absolute-git-dir`:
+        with the extension on the scope is always listed, and the failure
+        classifier stats `$GIT_DIR`, never the common dir. A driver in the
+        linked worktree's file must refuse the checkout.
         """
         _git("config", "extensions.worktreeConfig", "true", cwd=repo)
         linked = tmp_path / "linked"
