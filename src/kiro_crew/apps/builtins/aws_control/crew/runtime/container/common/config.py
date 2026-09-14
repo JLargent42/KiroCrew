@@ -32,17 +32,17 @@ from pathlib import Path
 # Not configurable. See the module docstring.
 BACKEND_HOST = "127.0.0.1"
 
-# The header the owner's control plane sends to reach a control route. What keeps a
+# The header a control-route request must carry. What keeps a
 # customer off those routes is the VALUE, not the header: the front compares it against
 # `SMC_CONTROL_SECRET` in constant time and refuses when no secret is configured, so a
 # caller who sends this header without holding the secret is denied like any other.
 # Nothing strips or rewrites the header on the way in.
 #
-# Pinned here rather than in the front process because the string has more than one
-# consumer: the front process that checks it, the owner's control plane that sends it, and
-# the deploy template that will supply the secret when that track lands. That last one is
-# not Python, so a constant private to the front process is a name another system copies by
-# hand.
+# Pinned here rather than in the front process because the string will have more
+# than one consumer. The front process that checks it is the only one in this tree
+# today; the sender and the deploy template that supplies the secret both belong to
+# the deploy track. That track is not Python, so a constant private to the front
+# process would be a name another system copies by hand.
 CONTROL_SECRET_HEADER = "X-SMC-Control-Secret"
 
 

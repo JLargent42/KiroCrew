@@ -82,7 +82,8 @@ long-lived instance that overhead amortises. For fan-out it does not.
 - Let the owner ask for CPU and memory rather than choose from three instance
   shapes.
 - Keep a Fargate-backed remote crew visible and usable everywhere an EC2-backed
-  one is.
+  one is. This is the end state, not phase 1: section 5 explains why the registry
+  cannot hold a task today and section 6 records what is deferred with it.
 
 ## 3. Non-goals
 
@@ -141,18 +142,19 @@ memory the owner asked for, the task role, the log configuration, and the
 container's secret-valued environment. Registering one is an API call, not a
 deployment.
 
-The secret-valued half is load-bearing, because the container refuses to boot
-without it. `KIRO_API_KEY` is the model credential, checked for presence at
-startup by `require_api_key` in
-`src/kiro_crew/apps/builtins/aws_control/crew/runtime/container/supervisor/backend.py`;
-`SMC_CONTROL_SECRET` is what separates the owner's control surface from a
-customer turn, and a task started without it answers no control route at all.
-Neither is baked into the image. Both arrive as container secrets whose
-`valueFrom` names a Secrets Manager secret or a Parameter Store parameter, which
-is also what the execution role needs read permission on. Presence is all the
-startup check proves: an invalid `KIRO_API_KEY` produces a task that answers its
-port and fails every turn, so only a real turn establishes that the credential
-works.
+The secret-valued half is load-bearing, and the two secrets are load-bearing
+differently. `KIRO_API_KEY` is the model credential and the container refuses to
+boot without it: `require_api_key` in
+`src/kiro_crew/apps/builtins/aws_control/crew/runtime/container/supervisor/backend.py`
+checks it for presence at startup. `SMC_CONTROL_SECRET` separates the owner's
+control surface from a customer turn and is NOT a boot requirement -- a task
+started without it boots and then refuses every control route, because the check
+fails closed on an unset secret. Neither is baked into the image. Both arrive as
+container secrets whose `valueFrom` names a Secrets Manager secret or a Parameter
+Store parameter, which is also what the execution role needs read permission on.
+Presence is all the startup check proves: an invalid `KIRO_API_KEY` produces a
+task that answers its port and fails every turn, so only a real turn establishes
+that the credential works.
 
 **A task per remote crew.** `RunTask` starts it, `StopTask` ends it, and nothing
 persists between the two except what the crew was told to write elsewhere.
@@ -199,8 +201,19 @@ The EC2 implementation is `RealLaunchEngine` in `src/kiro_crew/cloud/launch_engi
 field named `cloud_launch_engine` in `src/kiro_crew/dashboard/state.py`, today set
 only by tests. A Fargate backend is a second
 implementation of these five methods. Everything above the seam, which is the
-launch job machinery, the registry, the tunnel manager and the relay surfaces,
-does not learn that a second backend exists.
+launch job machinery, the tunnel manager and the relay surfaces, does not learn
+that a second backend exists.
+
+The registry is the exception, and the reason is a hard one rather than a
+preference. `src/kiro_crew/instances/registry.py` closes its transport set:
+`CONNECTION_METHODS` is `("ssh", "ssm")` and a record naming anything else is
+refused with `InvalidInstanceError`. The identity fields are equally closed --
+`ssm_target` is validated against `^(i|mi)-[a-f0-9]{8,17}$`, an EC2 instance id or
+an SSM managed-instance id -- and a task identity is neither. So a Fargate-backed
+crew cannot be registered without changing registry code, which is why section 6
+defers registry visibility with the tunnel and the relay rather than only those
+two. Whether phase 1 should spend a third transport to close that is open; see
+section 11.
 
 Per method, what changes and what does not:
 
@@ -209,7 +222,7 @@ Per method, what changes and what does not:
 | `preflight` | Credentials, region, image availability | Same shape |
 | `provision` | Register a task definition, `RunTask`, return the task identity | Minutes of bootstrap become an image pull |
 | `begin_signin` | Nothing to drive: the task is handed a model credential and refuses to boot without one | The device-code scrape has no counterpart |
-| `register` | Into the existing instances registry | Unchanged |
+| `register` | Deferred: no transport in `CONNECTION_METHODS` names a task | The one method of the five phase 1 does not deliver |
 | `teardown` | `StopTask` | Stack deletion becomes an API call |
 
 ### Sizing
@@ -316,14 +329,20 @@ image publication to ECR.
 
 Exit criteria:
 
-- `provision` returns an identity that `register` accepts, and the launched crew
-  appears in the instances registry with no change to registry code.
-- One remote crew launches on Fargate and serves a turn, reached the same way an
-  EC2-backed one is.
+- `provision` returns a task identity, and `teardown` stops that task from the
+  launch tag alone -- the protocol's `teardown(tag, profile, region)` never sees
+  what `provision` returned, and `run_launch` passes `job.tag`. Registration is
+  NOT part of this phase: the registry refuses a transport outside
+  `CONNECTION_METHODS`, so there is no record to assert (section 5). Which means
+  the Fargate engine has to be able to find its own task from the tag.
+- One remote crew launches on Fargate and serves a turn, reached through the
+  task's own front process. Not through the tunnel or the relay: section 6 defers
+  those, so a criterion demanding parity of reach would contradict it.
 - `teardown` leaves no task, no task definition revision in use, and no ECR
   reference held by a stopped task.
 - Nothing above `LaunchEngine` branches on backend. Asserted by a test that runs
-  the launch job against both engines and compares the resulting registry state.
+  the launch job against both engines and compares what each one returns from
+  `provision` and `teardown`, since only the EC2 engine produces a registry record.
 - A crew with no Fargate configuration still launches on EC2 with byte-identical
   behaviour.
 
@@ -361,9 +380,11 @@ Existing size keys keep working. `size_key` is the protocol's parameter and the
 Fargate backend maps the same three keys to CPU and memory pairs, so a launch that
 does not name a backend behaves as it does today.
 
-No stored state changes shape. A Fargate-backed remote crew registers through the
-same call with the same fields, so a registry written before this work is readable
-after it and the reverse holds too.
+No stored state changes shape, and in this phase no new state is written at all. A
+Fargate-backed crew is not registered, so nothing is added to the registry file and
+no existing record is reinterpreted: a registry written before this work is readable
+after it and the reverse holds too. Registry parity would need a third transport,
+and adding one is where that compatibility question would actually be decided.
 
 ## 10. Alternatives considered
 
@@ -393,6 +414,16 @@ the problem, and a turn is not reliably short enough to fit the execution limit.
 the thing this RFC is trying to remove.
 
 ## 11. Open questions
+
+**Whether phase 1 buys registry parity.** A Fargate-backed crew cannot be
+registered as things stand: `CONNECTION_METHODS` is closed to `ssh` and `ssm` and
+the identity fields accept only an instance id (section 5). Closing that means a
+third transport in `src/kiro_crew/instances/registry.py` and a tunnel manager that
+knows what to do with a task, which is the largest single piece of work this RFC
+could add and is not needed for "deploy a crew and chat with it". Deferring it is
+what section 6 records. The question is whether the deferral holds through phase 2,
+because ten unregistered fan-out workers are ten things the owner cannot see in the
+one place they look.
 
 **Session lifetime against task lifetime.** A disposable task that lives minutes
 is a good fit for a short session. A fan-out worker that runs for hours is less
