@@ -4124,6 +4124,7 @@ def register_app_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/{name}/manifest", handle_get_manifest)
     app.router.add_get("/api/apps/{name}/config", handle_app_config)
     app.router.add_put("/api/apps/{name}/config", handle_app_config)
+    app.router.add_get("/api/apps/{name}/uninstall/preview", handle_uninstall_preview)
     app.router.add_post("/api/apps/{name}/uninstall", handle_uninstall_app)
     app.router.add_post("/api/apps/{name}/update", handle_update_app)
     app.router.add_post("/api/apps/{name}/enable", handle_enable_app)
