@@ -506,6 +506,87 @@ async def api_cloud_launch_signin(request: web.Request) -> web.Response:
     return web.json_response({"signin": job.signin.to_dict()})
 
 
+async def api_cloud_launch_signin_refresh(request: web.Request) -> web.Response:
+    """POST /api/cloud/launch/{id}/signin/refresh — restart the device-code flow.
+
+    The device code issued by kiro-cli has a short lifetime (~10 minutes).  When
+    it expires the user is stuck: the code shown in the dashboard no longer works
+    and there was previously no way to get a fresh one without cancelling and
+    re-launching the whole instance.
+
+    This endpoint restarts ``kiro-cli login --use-device-flow`` on the already-
+    provisioned EC2 instance (via SSM) and returns the new URL+code.  It is safe
+    to call on a job that has completed (``done``) but whose sign-in was not
+    confirmed — the instance is running and already registered, so a fresh login
+    attempt does not affect the CloudFormation stack.
+
+    Returns 409 when the job has no instance yet (cannot run SSM) or has been
+    cancelled/never reached provisioning.
+    """
+    denied = _guard(request, "launch_signin_refresh")
+    if denied is not None:
+        return denied
+
+    from kiro_crew.cloud import login  # local import — cloud module is optional
+
+    store = await _astore(request.app["state"])
+    job = await _in_executor(store.get, request.match_info["id"])
+    if job is None:
+        return web.json_response({"error": "not found", "code": "launch_job_not_found"}, status=404)
+
+    # We need the instance to already exist to run SSM commands on it.
+    if not job.instance_id or job.status in (lj.CANCELLED, lj.PENDING):
+        return web.json_response(
+            {
+                "error": "instance not ready for sign-in refresh",
+                "code": "instance_not_ready",
+            },
+            status=409,
+        )
+
+    try:
+        # start_device_login kills any stale background kiro-cli login process
+        # (replace_existing=True is the default) before starting a fresh one, so
+        # calling this a second time is safe and idempotent.
+        prompt = await _in_executor(
+            login.start_device_login,
+            job.instance_id,
+            job.profile or "",
+            job.region or "",
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as a 502, not a 500
+        logger.warning("signin refresh failed for job %s: %s", job.id, exc)
+        return web.json_response(
+            {"error": str(exc)[:400], "code": "signin_refresh_failed"},
+            status=502,
+        )
+
+    if prompt.already_logged_in:
+        # Race: the user approved the old code between the click and the SSM run.
+        _audit("launch_signin_refresh", "already_logged_in", request_id=job.id)
+        return web.json_response({"already_logged_in": True})
+
+    if not prompt.url or not prompt.code:
+        logger.warning(
+            "signin refresh for job %s returned no device-code URL (social-login path?)", job.id
+        )
+        return web.json_response(
+            {"error": "no device-code URL returned — try signing in from the instance terminal", "code": "no_device_code"},
+            status=502,
+        )
+
+    new_signin = lj.SigninPrompt(
+        url=prompt.url, code=prompt.code, ports=list(prompt.ports or [])
+    )
+    job.signin = new_signin
+    # Reset signin_detected so the UI re-arms the unconfirmed-prompt path.
+    job.signin_detected = False
+    await _in_executor(store.save, job)
+
+    _audit("launch_signin_refresh", "success", request_id=job.id)
+    return web.json_response({"signin": new_signin.to_dict()})
+
+
 def _teardown_after_delete(tag: str, profile: str, region: str, instance_id: str) -> None:
     """Drop local state for *tag*, but only once AWS confirms the stack is gone.
 
