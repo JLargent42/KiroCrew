@@ -2053,6 +2053,7 @@ export function useWebSocket() {
             break
           case 'chat_done': {
             let completionNeedsAttention = false
+            let completionNeedsInput = false
             let questionPending = false
             flushChunks()
             if (data.slot) chunkBufRef.current.delete(data.slot)
@@ -2086,11 +2087,15 @@ export function useWebSocket() {
                 || selectSidebarAutomationRunningKeys(soundState).includes(dashboardAutomationSlotKey(data.slot))
               )
               questionPending = !!soundState.chat.pendingQuestions?.[data.slot]
+              // An authoritative frame hint (explicit question, manual Go) or a
+              // live question card both mean the conversation paused for the
+              // user rather than finished; the toast wording reads this too.
+              completionNeedsInput = data.needs_input === true || questionPending
               completionNeedsAttention = shouldChimeOnTurnDone({
                 slot: data.slot,
                 reconnecting: reconnectingRef.current,
                 continuing,
-                needsInput: data.needs_input === true || questionPending,
+                needsInput: completionNeedsInput,
               })
               // A live question card already requested audio. Keep its named
               // desktop toast eligible, but do not request a second chime.
@@ -2105,11 +2110,17 @@ export function useWebSocket() {
               const doneSlot = data.slot as string
               const doneTitle = store.getState().dashboard.slots
                 .find(s => s.key === doneSlot)?.title || doneSlot
+              // A toast that reads "Response ready" while the agent is waiting
+              // on the user misdescribes the handoff; two literal keys keep the
+              // reference statically checkable (see check-i18n-keys.mjs).
+              const doneBody = completionNeedsInput
+                ? i18nT('hooks.useWebSocket.waiting_for_input')
+                : i18nT('hooks.useWebSocket.response_ready')
               // Android Chrome throws "Illegal constructor" for page-context
               // Notification; an uncaught throw here kills the whole message
               // handler, so the native toast is best-effort (same as approval).
               try {
-                new Notification(doneTitle, { body: i18nT('hooks.useWebSocket.response_ready'), tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
+                new Notification(doneTitle, { body: doneBody, tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
               } catch {
                 /* unsupported platform */
               }

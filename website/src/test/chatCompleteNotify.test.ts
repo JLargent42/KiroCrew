@@ -260,6 +260,10 @@ describe('useWebSocket chat_done native toast', () => {
       expect(kinds).toEqual(['approval'])
       expect(CONSTRUCTED).toHaveLength(1)
       expect(CONSTRUCTED[0].title).toBe('Choose the approach')
+      // The body must say the agent is WAITING, not that a response is ready:
+      // the user is being asked to answer, and "Response ready" over a pending
+      // question card sends them looking for a finished reply.
+      expect(CONSTRUCTED[0].options?.body).toBe('Waiting for your input')
       expect(CONSTRUCTED[0].options?.tag).toBe('kirocrew-chat-done:slot-question')
       expect(CONSTRUCTED[0].options?.silent).toBe(true)
     } finally {
@@ -278,6 +282,49 @@ describe('useWebSocket chat_done native toast', () => {
     act(() => { ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-b' } }) })
 
     expect(CONSTRUCTED.map(c => c.title)).toEqual(['slot-b'])
+  })
+
+  it.each([
+    // An explicit question the server certified without a card frame.
+    { continuing: false, needs_input: true },
+    // A manual step-through pause: work remains, but the next stage needs Go.
+    { continuing: true, needs_input: true },
+  ])('reads the frame hint as waiting for input, audible once, for %j', frame => {
+    saveChatCompleteNotify(true)
+    const ws = mountOpened()
+    seedSlot('slot-input', 'Roll out the migration')
+    const kinds: (string | undefined)[] = []
+    const onSound = (event: Event) => kinds.push((event as CustomEvent<McNotificationDetail>).detail.kind)
+    window.addEventListener(MC_NOTIFICATION_EVENT, onSound)
+    try {
+      act(() => { ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-input', ...frame } }) })
+      // No question card preceded this frame, so the completion chime is the
+      // one sound — and the toast may carry the OS sound too (not silent).
+      expect(kinds).toEqual(['turn'])
+      expect(CONSTRUCTED).toHaveLength(1)
+      expect(CONSTRUCTED[0].title).toBe('Roll out the migration')
+      expect(CONSTRUCTED[0].options?.body).toBe('Waiting for your input')
+      expect(CONSTRUCTED[0].options?.silent).toBe(false)
+    } finally {
+      window.removeEventListener(MC_NOTIFICATION_EVENT, onSound)
+    }
+  })
+
+  it.each([
+    // A current frame that certifies the conversation simply finished.
+    { continuing: false, needs_input: false },
+    // An older relay frame with no activity hint at all.
+    {},
+  ])('keeps "Response ready" for an ordinary completion %j', frame => {
+    saveChatCompleteNotify(true)
+    const ws = mountOpened()
+    seedSlot('slot-done', 'Refactor the planner')
+
+    act(() => { ws.simulateMessage({ type: 'chat_done', data: { slot: 'slot-done', ...frame } }) })
+
+    expect(CONSTRUCTED).toHaveLength(1)
+    expect(CONSTRUCTED[0].options?.body).toBe('Response ready')
+    expect(CONSTRUCTED[0].options?.silent).toBe(false)
   })
 
   it('does not toast while the user has not opted in', () => {
