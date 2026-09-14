@@ -39,9 +39,13 @@ def worktree_probe_failure_is_empty_scope(gitdir: str, base: str) -> bool:
     never gate whether the probe runs — see the module docstring for why the
     probe-first order is load-bearing.
 
-    ``gitdir`` is the stdout of ``git rev-parse --absolute-git-dir`` on
+    ``gitdir`` is the RAW stdout of ``git rev-parse --absolute-git-dir`` on
     success, or ``""`` when that probe failed. ``base`` anchors a relative
-    ``gitdir``.
+    ``gitdir``. Only git's own terminating newline is removed here: a path
+    that genuinely begins or ends with whitespace must survive intact, or the
+    ``lstat`` below inspects a DIFFERENT path than git reads and a wrong
+    ``FileNotFoundError`` clears a scope that has a config file. Callers must
+    pass stdout unstripped for the same reason.
 
     Only one state reads as the empty scope: ``config.worktree`` is genuinely
     ABSENT (``lstat`` says no entry) — the state git creates the file lazily
@@ -59,7 +63,14 @@ def worktree_probe_failure_is_empty_scope(gitdir: str, base: str) -> bool:
     The ``os.lstat`` here is a blocking stat: an async caller must run this
     function off the event loop (``asyncio.to_thread``).
     """
-    path = gitdir.strip()
+    path = gitdir
+    # Exactly one line terminator, never path whitespace: .strip() would
+    # rewrite a whitespace-bearing git dir into a different path and lstat
+    # the wrong location.
+    if path.endswith("\n"):
+        path = path[:-1]
+    if path.endswith("\r"):
+        path = path[:-1]
     if not path:
         return False
     if not os.path.isabs(path):

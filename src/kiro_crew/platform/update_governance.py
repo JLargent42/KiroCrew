@@ -493,10 +493,15 @@ def repo_exec_config_reason(proj: str) -> str:
             # the empty scope git documents, not an unreadable one (the shared
             # decision in kiro_crew.git_worktree_scope). Every other failure
             # stays _EXEC_CONFIG_UNREADABLE, including an unlocatable git dir.
-            if scope == "--worktree" and worktree_probe_failure_is_empty_scope(
-                _git(proj, "rev-parse", "--absolute-git-dir"), proj
-            ):
-                continue
+            # RAW stdout (_git_probe, not _git): the classifier trims exactly
+            # git's newline, and a stripped whitespace-bearing path would
+            # lstat the wrong location.
+            if scope == "--worktree":
+                gitdir_raw = _git_probe(proj, "rev-parse", "--absolute-git-dir")
+                if worktree_probe_failure_is_empty_scope(
+                    gitdir_raw if gitdir_raw is not None else "", proj
+                ):
+                    continue
             return _EXEC_CONFIG_UNREADABLE
         for line in listing.splitlines():
             key = line.strip()

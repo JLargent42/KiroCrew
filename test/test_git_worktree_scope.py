@@ -27,6 +27,28 @@ def test_absent_file_is_the_empty_scope(tmp_path):
     assert worktree_probe_failure_is_empty_scope(str(d), str(tmp_path)) is True
 
 
+def test_trailing_newline_is_gits_terminator_not_the_path(tmp_path):
+    """Raw ``rev-parse`` stdout ends in one newline; the classifier removes
+    exactly that terminator and inspects the real path."""
+    d = _gitdir(tmp_path)
+    (d / "config.worktree").write_text("garbage [[[ not config\n")
+    assert worktree_probe_failure_is_empty_scope(f"{d}\n", str(tmp_path)) is False
+    assert worktree_probe_failure_is_empty_scope(f"{d}\r\n", str(tmp_path)) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="trailing-space dirs are POSIX-only")
+def test_whitespace_bearing_git_dir_is_not_rewritten(tmp_path):
+    """A git dir whose real name ends in a space must be lstat'ed AS IS: a
+    ``.strip()`` would inspect a different, nonexistent path and clear a
+    scope whose config file exists."""
+    d = tmp_path / "repo" / ".git "
+    d.mkdir(parents=True)
+    (d / "config.worktree").write_text("garbage [[[ not config\n")
+    assert (
+        worktree_probe_failure_is_empty_scope(f"{d}\n", str(tmp_path)) is False
+    )
+
+
 def test_present_file_keeps_the_refusal(tmp_path):
     """A probe that failed while the file EXISTS is a garbled/unreadable scope,
     never the empty one — the guard must keep refusing."""

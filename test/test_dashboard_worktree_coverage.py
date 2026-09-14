@@ -350,11 +350,19 @@ class TestWorktreeProbeFailureClassifier:
         }
         assert wt._worktree_probe_failure_is_empty_scope("/srv/repo") is False
 
-    def test_blank_git_dir_also_keeps_the_refusal(self, git):
+    def test_whitespace_only_git_dir_is_a_path_not_a_blank(self, git, tmp_path):
+        """A SUCCESSFUL rev-parse whose stdout is whitespace names a real
+        (odd) relative dir; it is resolved against the root and inspected
+        AS IS — never collapsed to the unlocatable sentinel. Present file
+        keeps the refusal; only the ``""`` failure sentinel means
+        unlocatable."""
+        weird = tmp_path / "  "
+        weird.mkdir()
+        (weird / "config.worktree").write_text("", encoding="utf-8", newline="\n")
         git.table = {
             ("rev-parse", "--absolute-git-dir"): (0, "  \n", ""),
         }
-        assert wt._worktree_probe_failure_is_empty_scope("/srv/repo") is False
+        assert wt._worktree_probe_failure_is_empty_scope(str(tmp_path)) is False
 
     def test_file_present_keeps_the_refusal(self, git, tmp_path):
         gitdir = tmp_path / "dotgit"
