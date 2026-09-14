@@ -33,7 +33,17 @@ def test_trailing_newline_is_gits_terminator_not_the_path(tmp_path):
     d = _gitdir(tmp_path)
     (d / "config.worktree").write_text("garbage [[[ not config\n")
     assert worktree_probe_failure_is_empty_scope(f"{d}\n", str(tmp_path)) is False
-    assert worktree_probe_failure_is_empty_scope(f"{d}\r\n", str(tmp_path)) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
+def test_cr_before_the_newline_is_path_content_on_posix(tmp_path):
+    """On POSIX git terminates with a bare LF, so a CR ahead of it belongs to
+    the real directory name; removing it would lstat a different path and
+    wrongly clear a scope whose config file exists."""
+    d = tmp_path / "repo" / ".git\r"
+    d.mkdir(parents=True)
+    (d / "config.worktree").write_text("garbage [[[ not config\n")
+    assert worktree_probe_failure_is_empty_scope(f"{d}\n", str(tmp_path)) is False
 
 
 @pytest.mark.skipif(os.name == "nt", reason="trailing-space dirs are POSIX-only")

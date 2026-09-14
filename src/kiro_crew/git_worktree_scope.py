@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import os
 
+from kiro_crew import platform_compat
+
 __all__ = ["worktree_probe_failure_is_empty_scope"]
 
 
@@ -66,10 +68,13 @@ def worktree_probe_failure_is_empty_scope(gitdir: str, base: str) -> bool:
     path = gitdir
     # Exactly one line terminator, never path whitespace: .strip() would
     # rewrite a whitespace-bearing git dir into a different path and lstat
-    # the wrong location.
+    # the wrong location. The CR is removed only on Windows, where a
+    # text-mode pipe delivers git's terminator as CRLF; on POSIX git ends
+    # the line with a bare LF, so a preceding CR is part of the real path
+    # and removing it would misdirect the lstat the same way .strip() did.
     if path.endswith("\n"):
         path = path[:-1]
-    if path.endswith("\r"):
+    if not platform_compat.IS_POSIX and path.endswith("\r"):
         path = path[:-1]
     if not path:
         return False
