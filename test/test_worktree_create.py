@@ -36,7 +36,8 @@ from kiro_crew.dashboard.handlers.worktree import (
     _resolve_commit,
     _run_git,
     _worktree_branches,
-    _worktree_config_active,
+    _worktree_extension_on,
+    _worktree_probe_failure_is_empty_scope,
     api_worktree_create,
 )
 from kiro_crew.validation import FOLLOWUP_BRANCH_RE, is_valid_followup_branch
@@ -64,7 +65,8 @@ _BLOCKING_GIT_HELPERS = frozenset(
         "_run_git",
         "_sandbox_exec_reason",
         "_worktree_branches",
-        "_worktree_config_active",
+        "_worktree_extension_on",
+        "_worktree_probe_failure_is_empty_scope",
         "_git_toplevel",
     }
 )
@@ -841,9 +843,11 @@ class TestCheckoutFilters:
         `$GIT_DIR` (`<common>/worktrees/<id>`), not under the common dir.
 
         Probing the common dir therefore missed a filter declared in a linked
-        worktree's own config — `_worktree_config_active` returned False, the
-        `--worktree` scope was skipped, and the driver executed during checkout
-        (verified empirically before this fix).
+        worktree's own config — the `--worktree` probe resolved the wrong
+        directory and the driver executed during checkout (verified
+        empirically before this fix). Probe-first: with the extension on the
+        scope is always listed, and the classifier resolves `$GIT_DIR`, not
+        the common dir.
         """
         _git("config", "extensions.worktreeConfig", "true", cwd=repo)
         linked = tmp_path / "linked"
@@ -858,7 +862,10 @@ class TestCheckoutFilters:
         ).stdout.strip()
         assert not os.path.isfile(os.path.join(common, "config.worktree"))
         assert os.path.isfile(os.path.join(gitdir, "config.worktree"))
-        assert await _off_loop(_worktree_config_active, str(linked))
+        assert await _off_loop(_worktree_extension_on, str(linked))
+        # Were the probe ever to fail here, the classifier must keep the
+        # refusal: the linked worktree's own file EXISTS under $GIT_DIR.
+        assert not await _off_loop(_worktree_probe_failure_is_empty_scope, str(linked))
         async with TestClient(TestServer(_make_app(str(linked)))) as client:
             resp = await client.post(
                 "/api/worktree/create", json={"repo": str(linked), "branch": "feat/linked"}
@@ -872,7 +879,10 @@ class TestCheckoutFilters:
         """The extension alone must not refuse: `--worktree --list` exits 128 when
         no `config.worktree` file exists, and that is not a filter."""
         _git("config", "extensions.worktreeConfig", "true", cwd=repo)
-        assert not await _off_loop(_worktree_config_active, str(repo))
+        assert await _off_loop(_worktree_extension_on, str(repo))
+        # The probe WILL fail (no config.worktree yet) and the classifier must
+        # clear that failure as the empty scope.
+        assert await _off_loop(_worktree_probe_failure_is_empty_scope, str(repo))
         async with TestClient(TestServer(_make_app(str(repo)))) as client:
             resp = await client.post(
                 "/api/worktree/create", json={"repo": str(repo), "branch": "feat/extonly"}
