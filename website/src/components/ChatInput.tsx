@@ -26,8 +26,10 @@ import { shallowEqual } from 'react-redux'
 import { motion, AnimatePresence } from 'framer-motion'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
+import { useComposerSpellcheck } from '../hooks/useComposerSpellcheck'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { pickToolLabel } from '../utils/toolLabel'
+import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { toApiDecision } from '../utils/approvalDecision'
 import TrustDropdown from './TrustDropdown'
 import type { AutomationRecord } from '../monitoring/automation'
@@ -143,6 +145,7 @@ import { i18nT } from '../i18n/t'
 import { fmtDateFields, fmtPercent } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
+import { activeElementIsEditable, isEditableTarget } from '../utils/editableTarget'
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
@@ -1091,6 +1094,9 @@ function ChatInput({
    *    not this session (see `approvalSource` above). */
   const approvalTrustGrantable = !!activeSlot && !approvalIsUnattended
   const simplified = useSimplifiedToolNames()
+  // Read the composer-spellcheck preference here rather than as a prop, so every
+  // render site of this component honours it and none can forget to pass it.
+  const spellCheck = useComposerSpellcheck()
   const uiLang = useLanguage().resolved
   const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
 
@@ -1105,7 +1111,21 @@ function ChatInput({
   const approvalPurpose = approvalToolEntry?.purpose || ''
   const approvalTs = approvalToolEntry?.ts || 0
 
-  const approvalLabel = pickToolLabel({ simplified, purpose: approvalPurpose, rawLabel: approvalLabelRaw, uiLang })
+  // The same label rule as the tool pill (ToolCallLine): simplified mode shows
+  // the purpose, else the argument-derived title; raw mode keeps the verbatim
+  // title unless it is a stub. The permission meta carries `tool_kind` /
+  // `is_shell` / `tool_name` / `mcp_server` for exactly this derivation, and the
+  // verbatim command stays in the ToolDetails payload below — the human vets
+  // the bytes, the title only says what they do.
+  const approvalDerived = deriveToolCallTitle({
+    title: approvalLabelRaw,
+    kind: (approvalMeta?.tool_kind as string) || '',
+    rawInput: approvalMeta?.tool_input,
+    isShell: approvalMeta?.is_shell === '1' || approvalMeta?.is_shell === true,
+    toolName: (approvalMeta?.tool_name as string) || '',
+    mcpServer: (approvalMeta?.mcp_server as string) || '',
+  })
+  const approvalLabel = pickToolLabel({ simplified, purpose: approvalPurpose, rawLabel: approvalLabelRaw, derivedTitle: approvalDerived.title, uiLang })
 
   // Subscribe to the inline pill's viewport visibility. While the pill is in
   // view, the bar collapses to just the always-visible button row; the moment
@@ -1147,7 +1167,7 @@ function ChatInput({
     setApprovalSubmitting(true)
     setApprovalNotice(null)
     const finish = () => {
-      dispatch(resolveByApprovalId({ id: approvalId, decision }))
+      dispatch(resolveByApprovalId({ id: approvalId, slot: activeSlot || undefined, decision }))
       setApprovalSubmitting(false)
       // B2: tally manual one-shot approvals per slot. Only 'approved' counts —
       // a trust grant already reduces future prompts, and a rejection is not
@@ -1172,7 +1192,7 @@ function ChatInput({
       // orphan: leaving it up makes every button look broken, so clear it and
       // say why instead of only logging to the console.
       if (err instanceof ApiError && err.status === 404) {
-        dispatch(resolveByApprovalId({ id: approvalId, decision: 'stale' }))
+        dispatch(resolveByApprovalId({ id: approvalId, slot: activeSlot || undefined, decision: 'stale' }))
         // Say WHOSE turn expired. Unattended sources deny-fast on a short
         // window (minutes), so by the time a human reads the card the job has
         // usually already been denied and moved on — "expired" alone reads as
@@ -1228,16 +1248,15 @@ function ChatInput({
     if (!a.approval_id || a.approving) return
     dispatch(markSubagentApproving({ id: a.id, approving: true }))
     api.resolveApproval(a.approval_id, action).then(() => {
-      // Terminate a rejected card here, because nothing else will. The backend's
-      // `approval_resolved` frame carries only {id, approved} — no slot — so the
-      // useWebSocket handler that would dispatch sseSubagentDone is skipped
-      // (it requires data.slot to avoid misattributing cards across sessions).
-      // An APPROVED spawn still converges: it runs and emits its own
-      // spawn/chunk/done stream, each frame carrying a slot. A REJECTED spawn
-      // never runs and emits nothing further, so without this the card stays
-      // pending+approving and the banner sticks on "Resolving…" indefinitely.
+      // Terminate a rejected card optimistically so the banner does not depend
+      // on a WebSocket round trip. The slot-scoped `approval_resolved` frame
+      // converges this state idempotently when it arrives. An approved spawn
+      // also converges through its spawn/chunk/done stream, while a rejected
+      // spawn emits no lifecycle events beyond the resolution frame. The card
+      // renders this value verbatim under its error label, so it carries the
+      // same catalog sentence the WS retire path uses, not the raw token.
       if (action === 'reject' && slotId) {
-        dispatch(sseSubagentDone({ slot: slotId, id: a.id, elapsed: 0, error: 'rejected' }))
+        dispatch(sseSubagentDone({ slot: slotId, id: a.id, elapsed: 0, error: i18nT('hooks.useWebSocket.approval_rejected') }))
       }
     }).catch(() => dispatch(markSubagentApproving({ id: a.id, approving: false })))
   }, [dispatch, slotId])
@@ -2101,8 +2120,7 @@ function ChatInput({
     const control = composerControl()
     if (!control) return
     prevAutoFocusKeyRef.current = autoFocusKey
-    const ae = document.activeElement as HTMLElement | null
-    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return
+    if (activeElementIsEditable()) return
     control.focus()
   }, [autoFocusKey, disabled, isMobile, composerControl, lexicalControlRevision])
 
@@ -2114,8 +2132,7 @@ function ChatInput({
     if (!typedCommandMenus) return
     const onSlashFocus = (e: KeyboardEvent) => {
       if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      if (isEditableTarget(e)) return
       e.preventDefault()
       // `/` is an explicit "I want to type" gesture, so it outranks the collapse
       // and brings the box back (expandComposer focuses it on the next frame).
@@ -4017,6 +4034,7 @@ function ChatInput({
                 disabled={disabled}
                 readOnly={optimizing}
                 sendOnEnter={sendOnEnter}
+                spellCheck={spellCheck}
                 className={manualHeight !== null ? 'flex-1 min-h-0' : ''}
               />
             </Suspense>
@@ -4027,6 +4045,7 @@ function ChatInput({
           ref={setTextareaRef}
           aria-label={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
           data-composer-input=""
+          spellCheck={spellCheck}
           aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
           className={/* focus-cue-ok: the cue is the composer shell's focus-within border-accent brightening; a second ring on the textarea would double-paint one control. */ `relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}

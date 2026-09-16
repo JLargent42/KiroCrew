@@ -1418,6 +1418,33 @@ def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
     return result
 
 
+def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
+    """Return the immediate next cron boundary as a UTC epoch, ignoring skip_dates.
+
+    For TIMER ARMING only. It answers "when is the next minute this expression
+    matches" with a single ``croniter.get_next`` -- O(1), no ``skip_dates``
+    traversal -- so a job with many ``skip_dates`` cannot make the on-loop
+    re-arm walk up to ``_MAX_SKIP_DATE_LOOKAHEAD`` occurrences. ``skip_dates`` is
+    still enforced at fire time by :meth:`CronService._is_due`, so a wake that
+    lands on a skipped boundary is a cheap no-op that re-arms to the following
+    boundary. Returns ``None`` for a non-cron or invalid expression, or when the
+    boundary is non-finite, so the caller falls back to the poll interval.
+    """
+    sched = job.schedule
+    if sched.kind != "cron" or sched.cron_expr is None:
+        return None
+    try:
+        tz = _job_tz(job)
+        base = datetime.fromtimestamp(now, tz=tz)
+        nxt = croniter(sched.cron_expr, base).get_next(float)
+    except Exception:
+        logger.warning("Failed to compute next cron boundary for job %s", job.id, exc_info=True)
+        return None
+    if isinstance(nxt, float) and not math.isfinite(nxt):
+        return None
+    return nxt
+
+
 def _compute_next_run_ts_raw(job: CronJob, now: float | None = None) -> float | None:
     """Unchecked next-fire-time computation; see :func:`compute_next_run_ts`."""
     try:
@@ -4515,8 +4542,22 @@ class CronService:
             elif job.schedule.kind == "at" and job.schedule.at_ts:
                 delays.append(max(0.0, job.schedule.at_ts - now))
             elif job.schedule.kind == "cron":
-                # Poll every _TIMER_POLL_SECS for cron expressions
-                delays.append(_TIMER_POLL_SECS)
+                # Wake ON the next cron boundary (as `at`/`every` do), not on a
+                # flat poll whose phase is unrelated to the schedule -- a phase
+                # gap can straddle a cron's single matching minute and drop the
+                # occurrence, most visibly on low-frequency crons. Use the
+                # skip-free boundary helper: it is O(1), so a job with many
+                # skip_dates cannot make this on-loop re-arm traverse up to
+                # _MAX_SKIP_DATE_LOOKAHEAD occurrences. skip_dates is enforced at
+                # fire time by _is_due; a wake on a skipped boundary is a no-op
+                # that re-arms to the next one. _effective_delay() still caps the
+                # armed delay at _TIMER_POLL_SECS so an externally-added job is
+                # picked up within one poll.
+                cron_next = _next_cron_boundary_ts(job, now)
+                if cron_next is not None:
+                    delays.append(max(0.0, cron_next - now))
+                else:
+                    delays.append(_TIMER_POLL_SECS)
         return min(delays) if delays else None
 
     def _effective_delay(self) -> float:
@@ -4966,7 +5007,8 @@ class CronService:
         """Return random jitter seconds based on schedule frequency.
 
         - strict_schedule=True or one-shot 'at' jobs: no jitter
-        - Sub-hourly (every < 3600s or cron with /, , or * in minute field): no jitter
+        - Sub-hourly (every < 3600s or cron whose parsed minute field fires
+          more than once per hour): no jitter
         - Hourly (every 3600–86399s or cron firing hourly): 0–5 min
         - Daily (every >= 86400s or cron firing daily): 0–59 min
         - Unrecognized cron patterns (fallback): 0–5 min
@@ -4984,11 +5026,19 @@ class CronService:
             else:
                 return 0.0  # sub-hourly jobs shouldn't be jittered
         if sched.kind == "cron" and sched.cron_expr:
+            # Ask croniter for the normalized minute set. Wildcard collapses
+            # to ["*"]; lists, ranges, steps, and their combinations expand
+            # and deduplicate, so cardinality reflects actual fires per hour.
+            try:
+                expanded, _ = croniter.expand(sched.cron_expr)
+                minute_values = expanded[0]
+            except (KeyError, TypeError, ValueError):
+                minute_values = []
+            if minute_values == ["*"] or len(minute_values) > 1:
+                return 0.0
+
             parts = sched.cron_expr.split()
             if len(parts) == 5:
-                # Sub-hourly cron (minute field has / or , or is wildcard): no jitter
-                if "/" in parts[0] or "," in parts[0] or parts[0] == "*":
-                    return 0.0
                 # Single literal hour (e.g., "0 3 * * *") = truly daily/weekly
                 if parts[1].isdigit():
                     return random.uniform(0, _JITTER_DAILY_MAX)

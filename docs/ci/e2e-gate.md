@@ -540,9 +540,14 @@ be set for an operator gateway. The strict reporter enforces the executed-test f
 
 Everything above is `ubuntu-latest`. `test/e2e/test_gateway_boot_matrix.py` is the
 one asset that boots a real gateway on **macOS and Windows too**, and `ci.yml`'s
-`e2e-boot-matrix` job is what runs it: `strategy.matrix.os` of `ubuntu-latest`,
-`macos-15` and `windows-latest`, `fail-fast: false`, `needs: [await-fast-gate]`,
-20 minutes.
+`e2e-boot-matrix` job is what runs it: `fail-fast: false`,
+`needs: [await-fast-gate]`, 20 minutes, and `strategy.matrix.os` of `ubuntu-latest`
+and `windows-latest` on a pull request, plus `macos-15` on the push-to-main path.
+The mac leg is event-conditional for the queue, not the runtime: it waited ~200
+minutes for a `macos-15` runner on every pull request and was the only leg that did,
+while on main the wait costs nobody a merge. The real-Darwin boot stays covered
+twice — that leg, and `nightly.yml`'s `pod-scenarios`, which boots a real
+service-managed pod on `macos-15`.
 
 ### Why it exists
 
@@ -590,6 +595,42 @@ omits the key, so it resolves to the shipped default, which is the tier a fresh
 install runs. The test asserts the fixture still says so, so editing either
 fixture fails there instead of quietly collapsing the matrix to one tier tested
 twice.
+
+### `READY` is not "recovery finished"
+
+The gateway binds its socket and prints `KIROCREW_READY:` **before** memory
+startup recovery ends, so HTTP answers during that window instead of hanging.
+A write issued inside it is refused: `memory_startup.require_memory_prepared()`
+raises, and callers see the one refusal through two shapes — 503 on a read, 409
+`member_memory_unavailable` on a write.
+
+`_booted` therefore hands out its client only after `_await_memory_recovery`
+polls a memory read until the gateway admits it, so a test may write on its
+first line. Every module sharing `_booted` gets that for free
+(`test_private_workflow_memory.py`, `test_real_kiro_smoke.py`); a test that boots
+`spawn_feature_gateway` directly still owns the wait itself, which is what
+`test_memory_ui_evidence.py`'s local `_await_ready` does. A store that never
+becomes ready fails in the wait, carrying the gateway's own body and
+diagnostics, rather than at whichever line happened to write first.
+
+**A restart re-enters the window.** `handle.restart()` boots a second gateway on
+the same `KIROCREW_HOME`, so a client built from the new handle is back before
+recovery — and it does not come from `_booted`, so nothing waits for it.
+`test_private_workflow_memory.py` calls `_await_memory_recovery` itself there.
+
+The refusal a caller sees names the route, not the cause, so all three shapes
+mean the same thing:
+
+| Read | Refusal during recovery | Where it comes from |
+|---|---|---|
+| a memory read | 503 | `require_memory_ready` |
+| a member write (`POST /api/agents`) | 409 `member_memory_unavailable` | `require_memory_prepared` |
+| a workflow run read | 403 `workflow_memory_unavailable` | `authorize_run` → `WorkflowScope.validate` → `require_memory_store` |
+
+Only the first is worth polling: `require_memory_ready` calls
+`require_memory_prepared` itself, so a memory read the gateway admits proves the
+other two are open. A per-store recovery *error* is terminal rather than "not
+yet", so waiting cannot mask one.
 
 Under `auto`, the turn expectation off Windows is DERIVED from the product's own
 backend probe rather than assumed. A host with a real backend (macOS seatbelt,

@@ -308,7 +308,7 @@ resolution: which layer wins".
 
 Structured files under `~/.kiro/crew/workspace/memory/`:
 - `preferences.md` — learned user preferences (V1 legacy consolidation may replace the file; V2 is owner-managed)
-- `projects.md` — active project context (V1 legacy consolidation may replace the file; V2 is owner-managed)
+- `projects.md` — active project context (V1 legacy consolidation may replace the file; V2 is owner-managed). Its `# Active Projects` header contract is owned by `memory.normalize_projects_document(content, *, today=)`, which `MemoryStore.write_projects`, `MemoryStore.write_private_profile_validated` and the dashboard's `_validate_private_profile_update` all call before writing. The three used to carry their own copy, and the dashboard one lives in a different package from the two store ones, so a change to either pair could not see the other. `today` is a parameter rather than read inside, so each write keeps its own single clock read. The two branches trim ASYMMETRICALLY, and that is the shipped contract rather than an oversight: an already-headed document is written as `content.strip() + "\n"`, while an unheaded one wraps the RAW content, so surrounding whitespace survives in exactly one of the two branches.
 - `history/{date}.md` — daily conversation summaries (append-only; heartbeat age pruning applies only to V1)
 
 ### A store's three paths, and where the index actually lives
@@ -1472,6 +1472,12 @@ fails with its name instead of silently substituting a different persona.
 Template resources cannot import Global V1 memory or another member's state;
 the owner's preferences/projects use the separately validated private reader.
 Declared globs have bounded enumeration and do not follow linked directories.
+Wildcard-matched entries classified by the existing managed-source check are
+excluded before descent or content reads. A broad `*/AGENTS.md` resource therefore
+keeps ordinary project guides without scanning the workspace's managed memory or
+lessons. Literal managed prefixes and explicitly named managed files still refuse;
+other admission and read failures are not swallowed. Directory names alone do
+not exclude an ordinary project outside the configured managed workspaces.
 Containment is judged on resolved paths on both sides: a declared root (the
 project root, or the owner's home for a resource outside it) is normalized the
 same way an admitted document is, so a root reached through a symlink -- a
@@ -2925,6 +2931,56 @@ reworded instead of presenting a rejected write as success.
 3. **Consolidation** (background): extracts corrections not already saved via `learn_add`. V1 and V2 call `write_lesson(source="consolidation")` at confidence 0.9.
 4. **Dashboard/CLI** (manual): `POST /api/lessons` → `write_lesson()`
 
+**Durable lesson volatile-fact boundary.** The primary `write_lesson()` writer and the
+JSONL `LessonStore` fallback call one shared predicate before persistence. It refuses
+exactly two classes in either the `rule` or `negative` field, in every category:
+runtime model-identity assertions recognized by `_VOLATILE_MODEL_FACT_RE`, and
+concrete-ID model-selection imperatives recognized by `_BEHAVIORAL_MODEL_PIN_RE`.
+A `running as` assertion belongs to the identity class only when its object is an
+unambiguous model noun (`model`, `model backend`, or `backend model`), a qualified
+`backend` that ends its clause, or a concrete model ID. Service-account and process
+wording such as `running as the active backend service account` stays durable.
+The imperative can start the field or follow `.`, `!`, `?`, or a newline, with optional
+`please` / `kindly`, emphatic `do`, and bounded `for ... ,` / `when ... ,` prefixes.
+It is refused only when a recognized verb directly selects a concrete model ID, with
+optional short determiners, qualifiers, and a `model`, `backend`, or `provider` noun
+around that ID. The matcher consumes the complete ID-shaped token. After an optional
+`model`, `backend`, or `provider` noun, the selected object must end its clause at the
+end of the field, a newline, punctuation (`.`, `,`, `;`, `:`, `!`, `?`, `)`, or `]`),
+or before one connector from this closed class: `for`, `when`, `whenever`, `if`,
+`unless`, `in`, `on`, `at`, `to`, `over`, `instead`, `rather`, `and`, `or`, `but`,
+`as`, `with`, `without`, `because`, `since`, `by`, `until`, `while`, `so`, `only`,
+`from`, `during`, `before`, `after`, `except`, `via`, `per`, or `not`. A following
+plain noun such as `tokenizer`, `endpoints`, `wrapper`, or `flag` makes the ID a
+qualifier of a durable tooling object rather than the selected model.
+The concrete-ID scope is deliberately limited to the registry families encoded by
+`MODEL_ID_LITERAL_PATTERN`. The trusted review workflow keeps an exact literal copy
+pinned by a test, so IDs from other backends are not lesson-refused. This grammar is
+best-effort for free-form wording. Future phrasing misses are handled by the
+`learn_add` tool-description instruction, never by new regex branches; callers must
+not disguise either refused class. A model-version literal by itself is not volatile.
+Durable compatibility, tooling, and preference text can name a version in any category or in a NOT-clause.
+The vector writer returns `outcome="refused", reason="volatile_session_fact"` before
+embedding or deduplication; the JSONL route maps the same refusal to that wire outcome
+and reason.
+Automatic JSONL callers read the returned outcome before counting, notifying, ledgering,
+or reporting an imported lesson. Onboarding applies the same predicate before either its
+vector or JSONL instruction branch, so a rejected directive is never reported as
+imported. Both context renderers apply the predicate again. Mapping rows expose their
+fields directly. Legacy vector strings use the row's MD5-derived key to prove which
+in-band separator splits the rule from its NOT-clause; rows keyed by another writer
+remain one rule rather than being guessed apart. A legacy volatile row stays
+available to listing and manual deletion, never reaches a prompt, and carries
+`withheld_reason="volatile_session_fact"` in the lessons API so `learn_list` marks it
+`WITHHELD`. Vector population checks use the same renderability predicate, so a store
+containing only withheld rows does not suppress the JSONL lesson fallback.
+The `learn_add` MCP handler, task runner, consolidation, dashboard POST route, headless
+`--slack-only` route, and direct writers therefore enforce the same boundary. The MCP
+handler renders the reason as `Error: volatile_session_fact: ...` and asks for a reusable
+behavioral rule instead. An imperative concrete model choice belongs in
+`agent.role_models.<role>`. Model-family guidance and plain model-version references
+remain durable.
+
 **Migration**: `migrate_from_markdown()` reads `lessons.jsonl` and writes each entry as `lesson.*` semantic key with `source=migration, confidence=0.9`. User-explicit lessons (confidence 1.0) can't be overwritten by migration.
 
 Categories: `tool`, `preference`, `knowledge`. Injected as a `[Learned corrections]` block. V1 session context retains query-ranked, project-scoped lessons; V2 selects bounded, project-scoped lessons without a query embedding. Explicit lesson readers can use hybrid relevance and fill the caller's character budget, reporting shown and omitted counts; the JSONL path caps at `_MAX_LESSONS_IN_CONTEXT = 50`. The JSONL store retains `_MAX_LESSONS_TOTAL = 200` and prunes oldest-first beyond that.
@@ -4242,6 +4298,7 @@ Auto-sync at startup + on-demand discovery from dashboard. Default servers: `kir
 **Command divergence** (`_commands_diverged`): an existing server is only re-synced when its `mcp.json` command differs from the one recorded in the agent config. The two legitimately differ in spelling because `agent._resolve_command` stores the `shutil.which` result while `mcp.json` keeps the bare name, so the comparison folds path resolution:
 
 - A basename match is only accepted when one side is a **rooted path** and the other a **bare name** (no separator), since PATH lookup is what produced the rooted form. Two distinct rooted paths sharing a basename (`/opt/a/srv` vs `/opt/b/srv`) and a CWD-relative path (`bin/srv` vs `/usr/bin/srv`) each name a specific different file, so both stay divergent.
+- The basename acceptance holds only while the rooted side still names a **runnable file**; a pin that does not resolve is divergence, so a re-sync is proposed instead of leaving the server to fail at spawn time. The probe is `isfile` + `X_OK`, the predicate `agent._resolve_command` applies to an absolute command, not `shutil.which`, which can report a good file as unresolvable inside a user-namespace sandbox. Only the **agent side** is probed: `mcp.json` holds what the user authored, while the agent entry holds what a past resolution pinned, so only the pin can go stale on its own. A path not rooted in a named volume on this host (the other OS's spelling, a driveless Windows root) is never probed, so a portable `mcp.json` is never called stale.
 - On Windows the keys are `normcase`+`normpath` folded (paths are case-insensitive and accept either separator), and a trailing `PATHEXT` suffix is stripped from the **rooted side only** — `shutil.which("npx")` returns `...\npx.CMD`, which would otherwise read as divergent from `npx` on every cycle and re-sync + reset every session at each startup. Stripping both sides would wrongly collapse distinct executables (`foo.bat` vs `foo.cmd`).
 - A leading separator with no drive letter (`/usr/bin/srv`) counts as rooted on Windows even though `ntpath.isabs` rejects it, so an `mcp.json` authored on macOS/Linux is read identically on every host.
 

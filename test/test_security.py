@@ -2029,6 +2029,23 @@ class TestBuiltinDenyPatterns:
     explicit secret-fetching tool names and destructive ops remain.
     """
 
+    @pytest.fixture(autouse=True)
+    def _own_host_seed_stays_local(self, monkeypatch) -> None:
+        """The ``ssh`` cases here are the first own-host lookup in the process.
+
+        ``is_denied("ssh ...")`` seeds the ssh-to-self floor's own-host set on
+        first use and, once the backoff allows, starts a DNS enrichment thread.
+        The seed learns this machine's outbound address with a UDP ``connect``
+        to a documentation peer -- packet-less, but a real off-loopback connect
+        the routing table has to answer -- and the worker resolves real names.
+        These tests are about the deny patterns, not about this host's identity,
+        so the seed is pinned to the hostname alone and the worker never starts.
+        """
+        from kiro_crew.security import argv_floor
+
+        monkeypatch.setattr(argv_floor, "_own_interface_addresses", set)
+        monkeypatch.setattr(argv_floor, "_OWN_HOST_RESOLVE_NEXT_TRY", float("inf"))
+
     def test_allows_command_with_credential_in_path(self) -> None:
         """Commands in dirs like CredentialValidatorServiceCDK must not be blocked."""
         from kiro_crew.security import is_denied
@@ -7072,37 +7089,29 @@ class TestPublishFloorNestedPayloads:
         one is enough because it runs to the END of the token list and therefore
         already spans every later verb's own suffix.
 
-        Measured across an 8x SIZE GAP, not 2x. At 2x the expected readings are 2x
-        for linear and 4x for quadratic, which a loaded runner does not separate --
-        this assertion failed CI at 3.54x on an implementation that is linear, and
-        no threshold between 2 and 4 is both sound and stable. At 8x the readings
-        are 8x against 64x, so a 20x bound tolerates 2x of scheduling noise and
-        still fails an implementation that has actually regressed. The exact,
-        timing-free half of this property is pinned by
+        Growth is measured as the total characters of payload the walk produces,
+        not as wall-clock time. A join's cost is the length of the string it
+        builds, so the character total IS the join work, and it is a pure
+        function of the input: an 8x size gap reads as exactly 8x for a linear
+        walk and 64x for one that joins once per verb, with nothing to tune. The
+        wall-clock form of this assertion was widened once and still flipped on a
+        loaded host, because the small sample is a few milliseconds and one
+        preemption during the large one breaches any ratio a regression would
+        also breach. Interpreter call counts do not work either: ``str.join`` is
+        one C call whatever its length, so an unbounded join reads as linear
+        there. The exact, size-free half of the property is pinned by
         ``test_only_one_joined_payload_is_produced_per_walk`` (one join per call)
         and ``test_a_join_produced_frame_does_not_join_again`` (no join chain).
         """
-        import time
-
         from kiro_crew.security import _nested_shell_payloads
 
-        def elapsed(n: int) -> float:
+        def payload_chars(n: int) -> int:
             tokens = ["eval", "a", "b"] * n
-            start = time.perf_counter()
-            _nested_shell_payloads(list(tokens))
-            return time.perf_counter() - start
+            return sum(len(payload) for payload in _nested_shell_payloads(list(tokens)))
 
-        def best(n: int, samples: int = 3) -> float:
-            return min(elapsed(n) for _ in range(samples))
-
-        elapsed(500)
-        small, large = best(2000), best(16000)
-        assert large < small * 20, f"{small:.4f}s -> {large:.4f}s looks super-linear"
-        # No absolute wall-clock cap: under the backend jobs' coverage tracing the
-        # same linear implementation costs whatever its LINE-EVENT count is, not
-        # its algorithmic cost, so an absolute bound reds on tracing overhead a
-        # same-runner uninstrumented A/B measures at parity (branch/main 0.94).
-        # The same-run ratio above is the regression guard.
+        small, large = payload_chars(2000), payload_chars(16000)
+        # 16 sits between the linear reading (8x) and the quadratic one (64x).
+        assert large < small * 16, f"{small} -> {large} payload chars looks super-linear"
 
     def test_only_one_joined_payload_is_produced_per_walk(self) -> None:
         """The bound above is what keeps it linear, so pin the bound itself."""
@@ -8076,7 +8085,7 @@ class TestARefusalNamesItsRuleAndSpan:
         """
         from kiro_crew.security import is_denied
 
-        payload = "imp" + "ort " + "kiro" + "_" + "crew"
+        payload = "imp" + "ort " + "kiro" + "_" + "crew" + ".cli"
         reason = is_denied("pyth" + 'on -c "' + payload + '"')
         assert reason is not None
         line = reason.splitlines()[-1]
@@ -8650,3 +8659,141 @@ class TestSelfTokensFoldLineContinuations:
         """The fold must not disturb shlex's quote resolution downstream."""
         tokens = security._self_tokens(f"pkill -f '[;]*{self.NAME}'")
         assert f"[;]*{self.NAME}" in tokens, tokens
+
+
+class TestSubstitutionBodiesReadFoldedOpeners:
+    """A ``\\`` + newline inside a substitution opener does not hide the body.
+
+    The shell removes a line continuation while READING, before it lexes an
+    opener, so ``cat <\\`` + newline + ``(...)`` is a process substitution to bash
+    (measured: ``cat <\\<newline>(echo hi)`` prints ``hi``; the ``>\\<newline>(``
+    and ``$\\<newline>(`` spellings run their bodies the same way).
+    ``_substitution_bodies`` recognises its openers byte-literally, so handing it
+    the RAW source extracts no body for a continuation-split opener and the inner
+    command goes unscanned: ``cat <\\<newline>(bash -c '<name> <verb>')`` reads
+    as ALLOWED while bash runs the mint. The payload walk therefore reads the
+    bodies from the same quote-aware fold the tokenizer applies, so the two views
+    agree.
+
+    The matrix is the three parenthesised openers x (split opener, split program,
+    split verb), each asserted against its unsplit twin, plus the CRLF, real
+    newline, single-quoted and ANSI-C spellings that must NOT change verdict.
+    """
+
+    VERB = "tok" + "en"
+    NAME = "kiro" + "crew"
+    OPENERS = ("<(", ">(", "$(")
+
+    @classmethod
+    def _mint(cls) -> str:
+        return f"{cls.NAME} {cls.VERB}"
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_the_unsplit_spelling_is_denied(self, opener: str) -> None:
+        """Baseline: the plain spelling of each opener is already refused."""
+        assert security.is_denied(f"cat {opener}{self._mint()})") is not None
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_a_continuation_inside_the_opener_is_folded(self, opener: str) -> None:
+        """``<\\`` + newline + ``(`` opens a substitution; the body is walked.
+
+        The body is a wrapper (``bash -c``) so the inner mint is reachable ONLY
+        through the substitution-body walk -- the top-level argv sees one opaque
+        token. A raw-source body scan reads this spelling as ALLOWED.
+        """
+        split = f"cat {opener[0]}\\\n({'bash -c'} '{self._mint()}')"
+        plain = f"cat {opener}bash -c '{self._mint()}')"
+        assert security.is_denied(plain) is not None
+        assert security.is_denied(split) is not None
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_a_continuation_inside_the_opener_reaches_the_payload_walk(self, opener: str) -> None:
+        """Pins the WALK, not just the verdict: the body appears as its own frame."""
+        command = f"cat {opener[0]}\\\n(bash -c '{self._mint()}')".lower()
+        sources = [source for source, _tokens in security._shell_payload_walk(command)]
+        assert any(self._mint() in source and "cat" not in source for source in sources), sources
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_a_continuation_inside_the_program_name_is_denied(self, opener: str) -> None:
+        """``<(kiro\\`` + newline + ``crew <verb>)`` is one program word to bash."""
+        split = f"cat {opener}{self.NAME[:4]}\\\n{self.NAME[4:]} {self.VERB})"
+        assert security.is_denied(split) is not None
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_a_continuation_inside_the_verb_is_denied(self, opener: str) -> None:
+        """``<(<name> tok\\`` + newline + ``en)`` is one verb word to bash."""
+        split = f"cat {opener}{self.NAME} {self.VERB[:3]}\\\n{self.VERB[3:]})"
+        assert security.is_denied(split) is not None
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_a_split_opener_around_a_computed_verb_is_denied(self, opener: str) -> None:
+        """The assignment-then-invoke body is only visible once the body is walked."""
+        body = f"T=$(printf {self.VERB}); {self.NAME} $T"
+        assert security.is_denied(f"cat {opener}{body})") is not None
+        assert security.is_denied(f"cat {opener[0]}\\\n({body})") is not None
+
+    def test_a_split_opener_nested_inside_another_substitution_is_denied(self) -> None:
+        """The fold applies at every depth of the walk, not only at the top frame."""
+        command = f"echo $(cat <\\\n(bash -c '{self._mint()}'))"
+        assert security.is_denied(command) is not None
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_a_backslash_crlf_inside_the_opener_is_not_a_continuation(self, opener: str) -> None:
+        """``\\`` + CRLF is NOT folded: bash escapes the CR and the LF ends the line.
+
+        Measured against bash, the CRLF spelling of the opener does not form a
+        substitution, so it is not a mint. The verdict must match the REAL
+        newline spelling of the same text, in both directions: neither is refused
+        for a benign body, and a mint on the line AFTER the CR stays denied
+        because that line runs on its own.
+        """
+        crlf = f"cat {opener[0]}\\\r\n(echo hi)"
+        real = f"cat {opener[0]}\n(echo hi)"
+        assert security.is_denied(crlf) is None
+        assert security.is_denied(real) is None
+        assert security.is_denied(f"cat {opener[0]}\\\r\n{self._mint()}") is not None
+
+    @pytest.mark.parametrize("opener", OPENERS)
+    def test_a_backslash_crlf_inside_the_body_is_not_folded(self, opener: str) -> None:
+        """``<(kiro\\`` + CRLF + ``crew <verb>)`` runs two commands inside the body.
+
+        Bash runs ``kiro<CR>`` (not found) and then ``crew <verb>`` -- neither is
+        the mint -- so the folded word must not be fabricated. Only the verdict on
+        a body that DOES mint on its second line is pinned in the deny direction.
+        """
+        two_lines = f"cat {opener}true\\\r\n{self._mint()})"
+        assert security.is_denied(two_lines) is not None
+        folded_body = security._substitution_bodies(
+            security._fold_line_continuations(
+                f"cat {opener}{self.NAME[:4]}\\\r\n{self.NAME[4:]} x)"
+            )
+        )
+        assert folded_body == [f"{self.NAME[:4]}\\\r\n{self.NAME[4:]} x"], folded_body
+
+    def test_a_real_newline_inside_the_body_keeps_its_verdict(self) -> None:
+        """An UNESCAPED newline is a separator inside a body too; the fold leaves it."""
+        assert security.is_denied("cat <(echo a\necho b)") is None
+        assert security.is_denied(f"cat <(echo a\n{self._mint()})") is not None
+
+    def test_a_single_quoted_continuation_inside_the_body_is_literal(self) -> None:
+        """Single quotes keep ``\\`` + newline literal, so no mint is fabricated."""
+        assert (
+            security.is_denied(f"cat <(echo '{self.NAME[:4]}\\\n{self.NAME[4:]} {self.VERB}')")
+            is None
+        )
+
+    def test_an_ansi_c_continuation_inside_the_body_is_literal(self) -> None:
+        """``$'…'`` keeps ``\\`` + newline literal, so no mint is fabricated."""
+        assert (
+            security.is_denied(f"cat <(echo $'{self.NAME[:4]}\\\n{self.NAME[4:]} {self.VERB}')")
+            is None
+        )
+
+    def test_the_ansi_c_publish_literal_stays_allowed(self) -> None:
+        """The benign case the issue measured flipping under a seed-level fold stays allowed.
+
+        Folding at the body walk, rather than at the walk's SEED, cannot reshape
+        text outside a substitution, and the fold it uses preserves ANSI-C spans.
+        """
+        command = "echo bash -c $'g\\'it\\\n\\' push origin main'"
+        assert security.is_denied(command) is None

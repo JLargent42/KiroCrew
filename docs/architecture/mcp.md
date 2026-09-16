@@ -595,6 +595,28 @@ are CONSTRUCTED and cannot be changed afterwards. `socket_path`, `overlay_dir`,
 once at spawn, so they too are marked `restart=True` in the config schema and
 apply to a broker started after the change.
 
+### Windows target command spelling
+
+Before writing `--target-command`, the rewriter restores the on-disk basename
+of a bare Windows command resolved through `shutil.which`. `which` can append
+uppercase `.EXE` from `PATHEXT` even when the file is named `demo-mcp.exe`.
+Windows can open that path, but a launcher that dispatches by its own basename
+with a case-sensitive lookup can reject it. The rewriter scans the resolved
+path's parent directory and substitutes the unique case-insensitive basename
+match instead of canonicalizing the full path.
+
+That narrow lookup preserves the lexical parent route (including a directory
+junction) and a file symlink's own name. Explicit absolute commands did not pass
+through `PATHEXT` and retain the operator's spelling unchanged. Empty or
+unresolvable commands remain unwrapped; an `OSError` while reading the parent,
+or an ambiguous case-insensitive match in a case-sensitive directory, keeps the
+`which` result. POSIX paths are unchanged. The normal cache-hit and
+transient-keep checks compare the same normalized bare-command probes, so a
+case-only rename invalidates a cached resolution without changing its alias
+route. Fingerprint schema 6 regenerates overlays carrying older bare-command
+spellings. Stub argv and the daemon target map therefore consume the same
+command string.
+
 ### Stub argument transport
 
 Generated overlays carry backend arguments as a base64url-encoded UTF-8 JSON
@@ -618,6 +640,24 @@ rather than falling back to different arguments. Legacy `--target-args`,
 schema 4 regenerates cached delimiter-based overlays on upgrade. Upgrades must
 keep the rewriter and stub from the same package; an older stub cannot consume
 the new flags.
+
+Encoding the backend arguments alone leaves the rest of the stub's metadata raw:
+the target executable path, work dir, socket, env sidecar path, server and agent
+names and the `autoApprove` JSON. `cmd.exe` expands `%NAME%` for any NAME set
+in its environment inside any of these, quoted or not, and offers no escape for
+it on a `/c` command line -- measured natively, `python%X%.exe` reached the stub
+as `pythonexpanded.exe` and the tool name `read%X%` as `readexpanded`, so the
+stub launched a different executable and registered a different approval hash
+than the daemon computed from the operator's spec. The overlay therefore carries
+the stub's whole flag list as ONE envelope, `--stub-flags-b64`, using the same
+codec; inside it the flags keep their plain spelling. `stub._parse_args` and the
+rewriter's `_collect_target_env` splice the envelope back through
+`hashing.expand_stub_flags` before reading, so a plain-flag overlay written by an
+older rewriter parses through the same path and hashes identically. The
+per-session `--channel-id` appended by `session_servers` rides its own envelope.
+Fingerprint schema 5 regenerates cached plain-flag overlays on upgrade. The
+interpreter path in the entry's `command` is the one value the codec cannot
+cover: the CLI runs it, not the stub.
 
 ## How app agents reach MCP servers
 
@@ -811,8 +851,9 @@ answers `tools/list` from):
   the tool is called when earlier facts or experiences are needed. Owner-selected copying is a dashboard action, not an MCP
   capability. The full contract is in
   [memory](../system-specs/modules/memory-skills-hooks.md#member-memory-experience-and-lifecycle).
-- **Structured monitor read:** `monitor_inspect` (strict authenticated session
-  identity only; no ancestor fallback)
+- **Monitor read:** `monitor_inspect` (strict authenticated session
+  identity only; no ancestor fallback; reports a structured monitor or a legacy
+  timer loop's presence reading, whichever the session holds)
 - **Crew routing:** `select_crew`
 - **Sessions and history:** `list_sessions`, `get_chat_session`,
   `search_chat_history`

@@ -705,15 +705,44 @@ applier — a raised turn budget is in force on the next prompt.
 
 ## Stop Orchestration
 
-`stop_turn()` is the shared orchestration layer for both dashboard and Slack stop surfaces. Sequence:
+`stop_turn()` is the shared orchestration layer for every stop surface (dashboard Stop button, Slack `/kirocrew stop`, transport stop verbs). Sequence:
 
-1. `clear_queue(key)` — queue drop is unconditional on first press.
-2. If `force=True`: skip cancel, go straight to hard kill (step 4).
-3. Send `session/cancel` via `provider.cancel(wait_ack_timeout=budget)`:
+1. Record the Stop: `stop_requests[key] += 1` (per folded key, on
+   `SessionLifecycleState`). This runs BEFORE anything is awaited so the
+   dashboard runner's end-of-turn gates -- which may run the moment the
+   provider's cancel lands -- already see it; `prev_turn_cancelled` is set only
+   after the ack and is too late for them.
+2. `clear_queue(key)` — queue drop is unconditional on first press (skipped
+   with `preserve_queue=True`).
+3. If `force=True`: skip cancel, go straight to hard kill (step 5).
+4. Send `session/cancel` via `provider.cancel(wait_ack_timeout=budget)`:
    - `"acked"` → set `session.prev_turn_cancelled = True`, call `on_soft` callback, return `"soft"`.
    - `"no_turn"` → return `"idle"`.
    - `"timeout"` or `"error"` → fall through to hard kill.
-4. Hard kill: `reset(key)` → fire-and-forget `_eager_respawn(key)` task → call `on_hard` callback → return `"hard"`.
+5. Hard kill: `reset(key)` → fire-and-forget `_eager_respawn(key)` task → call `on_hard` callback → return `"hard"`.
+
+### Session-scoped Stop record
+
+`SessionManager.stop_generation(key)` reads the count from step 1 (0 for a key
+never stopped). It exists because a channel-born dashboard slot runs its turns
+on the channel's session (`effective_session_key` returns
+`linked_session_key`), so a stop issued on the channel side reaches
+`stop_turn()` and the provider cancel but never the slot's own `_stop_state`.
+The dashboard runner snapshots the count at turn entry and its live Stop
+signal (`_stop_pressed()`) treats any later change as a user Stop, next to the
+slot's in-flight state and the slot's own `_stop_generation`; every
+end-of-turn continuation gate (refusal recovery, Stop-hook continuation,
+promise-only recovery, post-compaction continuation) reads that one signal.
+
+Lifetime: the record is keyed by session key rather than stored on the
+`_Session` object, so it survives the `reset()` a hard stop performs (a flag on
+the session would vanish with the very turn it stopped). It is popped on the
+teardown paths that end the key's conversation for good -- `remove()`,
+`remove_if_unclaimed()`, `destroy()`, and the identity-sweep retirement --
+beside the sibling per-key dicts. `cancel_current()` does NOT record a stop: it
+is the host's own best-effort abort (queue drain, injection retry, run
+teardown), not a person pressing Stop, and must not suppress a continuation
+the way a Stop does.
 
 ### Cancelled-turn context restore
 
@@ -1205,14 +1234,23 @@ explicit request rather than something the gateway does on its own.
 On restart / Make-Live cutover the previous gateway's kiro-cli is killed. If it
 died uncleanly (SIGKILL, crash, OOM, or a drain timeout), its per-session lock
 can stay held briefly, so the new gateway's `session/load` is rejected with an
-**"active in another process"** error. Recovery happens at the resume
+**"active in another process"** error. The dashboard's hard-stop path has a
+second shape of the same race: `stop_turn` resets the session and eagerly
+respawns it, and kiro-cli's `session/load` in the new holder creates its lock
+and re-reads it to confirm ownership — if the killed holder's exit handler
+unlinks the same path in that window the load fails with **"failed to re-read
+lock file ...: No such file or directory"**. Both are transient
+(`_RESUME_TRANSIENT_LOCK_MARKERS`: `"active in another process"`, `"re-read lock
+file"` — deliberately not a bare `"lock file"`, so a permanent failure such as
+`Permission denied` on the lock path still fails fast to Phase 2)
+and recovery happens at the resume
 chokepoint (`AcpProvider._load_session_with_retry`, `providers/acp.py`) and
 self-heals regardless of *why* the resume failed — it never depends on the dead
 holder cooperating (unlike cooperative drain), so it covers every kill mode:
 
 1. **Phase 1 — bounded retry (lossless).** Re-issue `session/load` up to
    `_RESUME_MAX_ATTEMPTS` (4) times with exponential backoff
-   (`_RESUME_BACKOFF_BASE_S` → 1s, 2s, 4s). If the stale lock releases, the
+   (`_RESUME_BACKOFF_BASE_S` → 1s, 2s, 4s). If the lock clears, the
    session resumes with full native history. A genuine (non-lock) load error is
    **not** retried, and a dead runtime aborts the loop immediately (the caller's
    respawn path takes over).
@@ -1683,15 +1721,35 @@ session dies, `killpg` only reaches the kiro-cli process group — MCP servers
 in other groups get reparented to init and leak memory.
 
 **Tracking**: at session init, `AcpClient.ensure_ready()` snapshots all
-descendant PIDs and persists them to `kiro_pids.txt` as `child_pid:parent_pid`
-pairs via `_track_child_pids(pids, parent_pid=self._pid)`.  On clean shutdown,
+descendant PIDs and persists them to `kiro_pids.txt` as
+`child_pid:parent_pid[:start-id]` entries via
+`_track_child_pids(pids, parent_pid=self._pid)`; the third field is the
+child's process-start identity (`_pid_start_token`, colon-free, in-process
+and non-blocking on every platform), omitted only when unreadable at track
+time.  On clean shutdown,
 `_reset_state()` removes them via `_untrack_child_pids()`.  If the gateway
 crashes, the entries remain in the file for the next startup.
 
 **Detection**: reads `kiro_pids.txt`, processes only `child:parent` lines
 (bare PID lines are kiro-cli parents handled by `cleanup_orphaned_sessions()`).
 If the child is alive but its parent PID is dead, the child is orphaned and
-killed.
+killed.  Two guards run first.  The start identity (entries carrying the
+start-id field) is subtractive evidence: a live `_pid_start_token` that
+differs from the recorded one proves the PID was recycled, and the stale
+entry is pruned without killing.  A matching or unreadable token never
+authorizes the kill by itself -- the tracking file is same-uid-writable, so
+a forged line must not aim the sweep at an arbitrary process.  The kill is
+authorized only by the reparent heuristic: a genuine orphan reparented to
+init (pid 1), or still showing the dead parent's PID (kill/reparent race),
+is killed outright, while a PPid in the same-uid `systemd --user` subreaper
+set -- the same accepted-parent set `_our_orphan_pids()` uses, computed by
+the shared `_accepted_subreaper_pids()` -- additionally requires BOTH the
+`KIROCREW_SPAWNED` environ marker AND positive runtime argv identity
+(`_tracked_child_has_runtime_identity`: managed agent runtime, MCP
+entrypoint, or marked launcher shape; unreadable argv fails closed), because
+every manager-started user service holds the manager's PID as its PPid for
+its whole life and the marker is tree-wide, inherited even by intentional
+survivors.  Any other PPid means recycled: pruned without killing.
 
 **Why not ancestor walk?** MCP servers are spawned in separate process groups
 and immediately reparented to init (ppid=1) even while the session is alive.

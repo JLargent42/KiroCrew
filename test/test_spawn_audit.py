@@ -370,10 +370,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::_git",
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::setUp",
         # Diagnostics support-bundle version probe: fixed argv
-        # ``["kiro-cli", "--version"]`` with a 5s timeout, no shell, no cwd, and
+        # ``[<kiro-cli>, "--version"]`` with a 5s timeout, no shell, no cwd, and
         # no agent-influenced args — it only stamps the collected kiro-cli
-        # version into versions.txt. The binary name is a module constant; a
-        # resource ceiling / sandbox adds nothing to a `--version` call.
+        # version into versions.txt. The binary is the absolute path
+        # ``kiro_cli.pin_kiro_cli`` returns from the known install directories
+        # with the inherited PATH excluded (no pin, no spawn), so nothing an
+        # agent can write to names the executable; a resource ceiling / sandbox
+        # adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
         # Tailnet origin derivation + forwarded-peer whois (RFC:
         # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
@@ -1431,13 +1434,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # gate's own create-and-delete probe of a throwaway task calls it
         # directly. Not agent-influenced.
         "pod/windows.py::_schtasks_raw",
-        # The refusal report's process description: `tasklist /FI "PID eq <n>"
-        # /NH /FO CSV`, one call per pid, best-effort and its output only ever
-        # rendered into a message. Every argument is fixed except the pid, which
-        # is an integer this module read from the OS parent map -- never a caller
-        # value, let alone an agent one -- and the binary comes from
-        # `trusted_system_bin`, not from PATH. Not agent-influenced.
-        "pod/windows.py::_describe_processes",
         # The pod's own gateway. On Linux and macOS the service manager execs
         # it; Windows has no exec, so the task's wrapper spawns
         # `<python> -m kiro_crew gateway ...` itself and supervises it. Argv is

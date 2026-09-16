@@ -5,7 +5,6 @@ import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/rea
 import { useModelsDegraded } from '../providers/modelListHealth'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { useVisualViewport } from '../hooks/useVisualViewport'
-import { useImeGuard } from '../hooks/useImeGuard'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { settingsPath } from '../components/settingsPath'
@@ -48,13 +47,16 @@ import {
 } from '../store/chatSlice'
 import { confirmedDelivered } from '../utils/sendDelivery'
 import { sendTurn } from '../chat-core/transport/sendTurn'
+import { applySteerReceipt } from '../chat-core/transport/steerReceipt'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import { onTerminalReady, sendToTerminalSession, getTerminalShell, getTerminalFenceShells } from '../utils/terminalRegistry'
-import { runInTerminalText } from '../utils/fenceShell'
-import { addTab as addDockTerminal } from '../hooks/useBottomTerminal'
+import { runInTerminalText, RUN_IN_TERMINAL_READY_DEADLINE_MS, RUN_IN_TERMINAL_OPENING_GRACE_MS } from '../utils/fenceShell'
+import { addTab as addDockTerminal, removeTab as removeDockTerminal, hasTab as hasDockTerminal } from '../hooks/useBottomTerminal'
+import { isPopoutOpen as isTerminalPopoutOpen } from '../utils/terminalPopout'
+import { disposeTerminalSession, useDeleteTerminalSession } from '../components/CliPanel'
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
-import { sseSlotTitle, triggerRefresh, updateSlot, slotIsRemoteBound } from '../store/dashboardSlice'
+import { triggerRefresh, updateSlot, slotIsRemoteBound } from '../store/dashboardSlice'
 import { performSlotSwitch } from '../lib/slotSwitch'
 import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
@@ -306,7 +308,7 @@ import { turnHadPolicyBlock } from '../app-sdk/turnPolicyBlock'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
-import TypewriterText from '../components/TypewriterText'
+import SessionTitleControl from './chat/SessionTitleControl'
 import { useChatNavigation } from '../hooks/useChatNavigation'
 import { useChatPins } from '../hooks/useChatPins'
 import SubagentProgressBar from './chat/SubagentProgressBar'
@@ -334,7 +336,7 @@ import { focusComposerAfter, revealComposer } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
 import { useKnowledgeFetch, extractKnowledgeQuery, expandKnowledgeBlock } from './chat/useKnowledgeFetch'
 import { KnowledgePicker } from './chat/KnowledgePicker'
-import { EyeOff, Loader, Pen, MessageSquare, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, X } from 'lucide-react'
+import { MessageSquare, Clock, Undo2, Columns2, ExternalLink, X } from 'lucide-react'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { PanelLeftSolid, PanelLeftLight, PanelRightSolid } from '../components/icons/panels'
 
@@ -486,6 +488,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const location = useLocation()
   const queryClient = useQueryClient()
   const provider = useProvider()
+  // Kills a Run-in-terminal tab's backend PTY when the dispatch rolls back
+  // (see the mc:run-in-terminal handler). Routed through the same mutation the
+  // tab-close paths use (per the use-react-query guideline); read through a
+  // ref because that handler's effect deliberately registers once ([] deps).
+  const deleteTerminalSession = useDeleteTerminalSession()
+  const deleteTerminalSessionRef = useRef(deleteTerminalSession)
+  deleteTerminalSessionRef.current = deleteTerminalSession
   const [searchParams, setSearchParams] = useSearchParams()
   // Declared with the other top-of-component hooks because the ?sid= URL-sync
   // effect reads it (mobile replaces rather than pushes a session switch), and
@@ -1011,15 +1020,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     mutationFn: ({ text, sendId, slot }: { text: string; sendId?: string; slot: string }) =>
       sendTurn({ message: text, slot, steer: true, ...(sendId ? { meta: { sendId } } : {}) }),
     onSuccess: (receipt, { text, sendId, slot }) => {
-      // Receipt policy for a steer. The composer was cleared at submit and the
-      // optimistic bubble is NOT persisted -- the next transcript rebuild drops
-      // it -- so a steer that did not provably reach the gateway hands its text
-      // back. Everything below is addressed to the SENDING slot, not the
-      // active one: the user can switch sessions inside the deadline window,
-      // and this text and its rows belong to the transcript they were typed
-      // into (the same rule `send()`'s restore and steer-echo append follow).
+      // Receipt policy for a steer, owned once in chat-core (issue #9457):
+      // applySteerReceipt decides WHICH ruling applies; the adapter below is
+      // ChatPage's HOW. The composer was cleared at submit and the optimistic
+      // bubble is NOT persisted -- the next transcript rebuild drops it -- so a
+      // steer that did not provably reach the gateway hands its text back.
+      // Everything here is addressed to the SENDING slot, not the active one:
+      // the user can switch sessions inside the deadline window, and this text
+      // and its rows belong to the transcript they were typed into (the same
+      // rule send()'s restore and steer-echo append follow).
+      //
       // "On screen" means the LIVE composer state belongs to this slot --
-      // `composerSlotRef`, not `activeSlotRef`: during a slot switch the active
+      // composerSlotRef, not activeSlotRef: during a slot switch the active
       // slot has already flipped while the composer still holds (and is about
       // to flush) the outgoing slot's text. Writing only the persisted draft in
       // that window would be overwritten by that flush from the stale input;
@@ -1033,59 +1045,43 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         if (onScreenNow) setInput(back)
       }
       const row = (message: ChatMessage) => dispatch(appendSlotMessage({ slot, message }))
-      // A confirmed echo is stronger evidence than a missing HTTP response,
-      // including when a steer raced onto a new turn and lost its steer flag.
-      if ((receipt.status === 'response-late' || receipt.status === 'transport-error')
-        && sendId && selectSendConfirmed(store.getState(), slot, sendId)) return
-      // - `refused` / unconfirmed `transport-error`: report the server's reason
-      //   or the connection error, and restore the draft. The reducer drops only
-      //   an optimistic bubble; left standing it would be
-      //   a third, false representation of the same text next to the error row
-      //   and the refilled composer.
-      if (receipt.status === 'refused' || receipt.status === 'transport-error') {
-        if (sendId) dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
-        row({
+      applySteerReceipt(receipt, {
+        // A confirmed echo is stronger evidence than a missing HTTP response,
+        // including when a steer raced onto a new turn and lost its steer flag.
+        echoReconciled: () => !!sendId && selectSendConfirmed(store.getState(), slot, sendId),
+        restore: handBack,
+        // The reducer drops only an optimistic bubble; left standing it would be
+        // a third, false representation of the same text next to the error row
+        // and the refilled composer. 'queued' is the reducer's DROP arm, 'turn'
+        // demotes. Guarded on sendId/slot exactly as before: with no sendId the
+        // reducer has no key and there is nothing to resolve (the old code's
+        // `if (sendId)` on the failure arms and its `if (!sendId || !slot)
+        // return` before the accepted arms both collapse to this guard).
+        resolveBubble: (outcome) => {
+          if (!sendId || !slot) return
+          dispatch(resolveOptimisticSteer({ slot, sendId, outcome: outcome === 'turn' ? 'turn' : 'queued' }))
+        },
+        reportFailure: (reason, status) => row({
           role: 'error',
-          content: receipt.reason
-            ? i18nT('pages.chatPage.send_failed_with_error', { error: receipt.reason })
-            : i18nT(receipt.status === 'transport-error' ? 'pages.chatPage.send_failed_connection' : 'pages.chatPage.send_failed'),
+          content: reason
+            ? i18nT('pages.chatPage.send_failed_with_error', { error: reason })
+            : i18nT(status === 'transport-error' ? 'pages.chatPage.send_failed_connection' : 'pages.chatPage.send_failed'),
           cls: '',
-        })
-        handBack()
-        return
-      }
-      // - `response-late`: the transport's deadline fired and aborted the POST.
-      //   It may have arrived (a slow answer) or not (a stalled socket the abort
-      //   killed) -- the steer never had a deadline before this transport, so
-      //   this window is new here. If the server's own echo already reconciled
-      //   the bubble, the steer landed: nothing to do. Otherwise the bubble is
-      //   removed (standing, it would read as delivered), the text goes back,
-      //   and a WARN-tone notice tells the user to check the transcript before
-      //   resending -- a duplicate is visible and deletable, a lost steer is not.
-      if (receipt.status === 'response-late') {
-        if (sendId) {
-          // `queued` is the reducer's DROP arm (its other arm, `turn`, demotes):
-          // an unconfirmed steer drops its bubble for the same reason a
-          // demoted-to-queue one does -- the server-side row, if any, is the
-          // representation, and a standing bubble would assert delivery.
-          dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
-        }
-        handBack()
+        }),
         // The lead glyph is NoticeCard's tone selector (parseNotice): \u26A0 =
         // warn, which also gives the row its "Warning" screen-reader label.
         // Kept out of the catalog string so the copy stays shared with the
         // surfaces that render it in their own strip.
-        row({ role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' })
-        return
-      }
-      if (!sendId || !slot) return
-      // - `unknown`: a 2xx whose body would not parse. Accepted; `steered` is the
-      //   one shape the badge's claim is true for and an unreadable body
-      //   confirms nothing, so neither rewrites the bubble.
-      if (receipt.status === 'unknown') return
-      const body = receipt.body as { steered?: boolean }
-      if (body.steered) return
-      dispatch(resolveOptimisticSteer({ slot, sendId, outcome: receipt.status === 'queued' ? 'queued' : 'turn' }))
+        warnUnconfirmed: () => row({ role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' }),
+        // ChatPage's steer is TEXT-ONLY and carries no raw/files split into the
+        // mutation (`text` is already the wire text; attachments are excluded
+        // from ChatPage steer by design, see steer()). It never stashed on a
+        // queued demotion and structurally cannot do so losslessly, so this arm
+        // stays a no-op -- the queue card falls to the parser fallback exactly
+        // as it did before #9457. resolveBubble('drop') still fires for the
+        // demotion via the helper's queued path.
+        stashDemoted: () => undefined,
+      })
     },
   })
   const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
@@ -2899,10 +2895,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // place that mapping is spelled — a Trust affordance on this path would claim
   // a standing grant the backend never records (#5400, #5434).
   const dismissApproval = useCallback((aid: string, decision?: string) => {
-    dispatch(resolveByApprovalId({ id: aid, decision }))
+    dispatch(resolveByApprovalId({ id: aid, slot: activeSlot || undefined, decision }))
     const n = store.getState().notifications.items.find(x => x.approval_id === aid)
     if (n) dispatch(removeNotificationByTs(n.ts))
-  }, [dispatch])
+  }, [activeSlot, dispatch])
   const switchAgent = useCallback(async (agentName: string) => {
     if (!activeSlot) {
       setPendingAgent(agentName)
@@ -3174,10 +3170,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // (row menu, drag-to-folder, new-chat-in-folder) already funnels through, so
   // the optimistic update and its guarded rollback are inherited rather than
   // re-implemented here. Both answers clear the card by the ts it rendered with,
-  // for the same reason the follow-up actions do.
-  const folderSuggestionAccept = useCallback(() => {
+  // for the same reason the follow-up actions do. The card passes the folder id
+  // its dropdown currently shows — the suggestion by default, or whatever the
+  // user picked instead.
+  const folderSuggestionAccept = useCallback((folderId: string) => {
     if (!activeSlot || !folderSuggestion) return
-    moveSlotToFolder(activeSlot, folderSuggestion.folderId)
+    moveSlotToFolder(activeSlot, folderId)
     dispatch(clearFolderSuggestion({ slot: activeSlot, ts: folderSuggestion.ts }))
   }, [activeSlot, folderSuggestion, moveSlotToFolder, dispatch])
 
@@ -3459,12 +3457,125 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         )
         emit(sendToTerminalSession(sessionId, text))
       })
-      // Give the PTY time to connect; if it never does, report failure.
-      setTimeout(() => { unsub(); emit(false) }, 6000)
+      // Give the PTY time to connect. A missing `ready` frame is not enough to
+      // prove the dispatch died because a shell profile can replace the
+      // readiness hook while the child process stays live. At the deadline,
+      // report failure for the button hint, then ask the existing terminal
+      // sessions route whether this dispatch's shell is still running.
+      // `settled` distinguishes the normal ready path: once ready has fired,
+      // the result is already emitted and the deadline does nothing.
+      setTimeout(() => {
+        if (settled) return
+        unsub()
+        emit(false)
+
+        // Only probe while this dispatch still owns the tab it minted. Closing
+        // the tab or popping the panel out transfers teardown ownership.
+        if (!hasDockTerminal(sessionId) || isTerminalPopoutOpen()) return
+
+        void (async () => {
+          // One look at the sessions route. `reuseMs` is the cache window: the
+          // first probe shares a request with any concurrent deadline, the
+          // confirm probe must see the present.
+          const probe = async (reuseMs: number) => {
+            const payload: unknown = await queryClient.fetchQuery({
+              queryKey: ['terminal-sessions'],
+              queryFn: async () => {
+                const response = await fetch('/api/terminal/sessions')
+                if (!response.ok) {
+                  throw new Error(`Failed to list terminal sessions (${response.status})`)
+                }
+                return response.json()
+              },
+              staleTime: reuseMs,
+            })
+            if (
+              !payload
+              || typeof payload !== 'object'
+              || !('sessions' in payload)
+              || !Array.isArray(payload.sessions)
+            ) {
+              throw new Error('Invalid terminal sessions response')
+            }
+            const found: Record<string, unknown> | undefined = payload.sessions.find(
+              (entry: unknown): entry is Record<string, unknown> => (
+                !!entry
+                && typeof entry === 'object'
+                && 'session_id' in entry
+                && entry.session_id === sessionId
+              ),
+            )
+            if (found && typeof found.alive !== 'boolean') {
+              throw new Error('Invalid terminal session liveness response')
+            }
+            return found
+          }
+
+          let session: Record<string, unknown> | undefined
+          try {
+            // Concurrent deadlines are what this reuse window dedupes, so it is
+            // far shorter than the deadline itself: a session young enough to be
+            // missing from a reused snapshot cannot have reached its own
+            // deadline yet, so no probe can read a snapshot older than itself.
+            session = await probe(1_000)
+            if (!session) {
+              // Absent is not gone. A shell still opening holds a placeholder
+              // the sessions route skips, so it reads exactly like a session
+              // that never existed -- and rolling that back would remove the tab
+              // from under a shell about to come up. Confirm once, uncached,
+              // after a bounded grace.
+              await new Promise(resolve => setTimeout(resolve, RUN_IN_TERMINAL_OPENING_GRACE_MS))
+              if (!hasDockTerminal(sessionId) || isTerminalPopoutOpen()) return
+              session = await probe(0)
+            }
+          } catch (error) {
+            // Keep on probe failure: removing a possibly-live shell and its
+            // scrollback is irreversible. The tab is user-closable, and the
+            // backend orphan reaper backstops the PTY. The kept tab is
+            // otherwise unexplained, so say so through the required surface --
+            // and keep the probe's own transport error out of that copy, since
+            // the user asked to run a command, not to list terminal sessions.
+            // The console keeps it for whoever debugs the probe.
+            // eslint-disable-next-line no-console -- a failed liveness probe is invisible in dev otherwise
+            console.warn('run-in-terminal: liveness probe failed:', errMessage(error))
+            showActionError(
+              i18nT('pages.chatPage.run_in_terminal_liveness_probe_failed_error'),
+            )
+            return
+          }
+
+          // The user may close the tab or pop the panel out while the probe is
+          // in flight. In either case this dispatch no longer owns it.
+          if (!hasDockTerminal(sessionId) || isTerminalPopoutOpen()) return
+          if (session?.alive === true) {
+            // A profile that replaces the readiness hook (#7657) lands here on
+            // EVERY click, so this is the routine outcome rather than an edge:
+            // the terminal opens, the command never runs, and a 2s button flash
+            // is too small to carry that. The shell is confirmed live, so the
+            // tab is worth keeping and the silence is worth breaking.
+            showActionError(i18nT('pages.chatPage.run_in_terminal_shell_alive_error'))
+            return
+          }
+
+          // Same teardown, same order, as the tab-close paths: end the backend
+          // PTY, drop the local WS + cached xterm, then remove the store entry.
+          // A session the probe did not list is already gone from the backend
+          // registry, so skip the DELETE -- it would 404 and surface a spurious
+          // close failure for a session that needs no closing.
+          if (session) deleteTerminalSessionRef.current.mutate(sessionId)
+          disposeTerminalSession(sessionId)
+          removeDockTerminal(sessionId)
+          // Closing a tab the user watched open is the ROUTINE outcome here, so
+          // it cannot be the quiet one: say what happened to the command.
+          showActionError(i18nT('pages.chatPage.run_in_terminal_dispatch_rolled_back_error'))
+        })()
+      }, RUN_IN_TERMINAL_READY_DEADLINE_MS)
     }
     window.addEventListener('mc:run-in-terminal', handler)
     return () => window.removeEventListener('mc:run-in-terminal', handler)
-  }, [])
+    // Both are stable for the provider's / component's lifetime (a context
+    // client and a []-dep useCallback), so the listener still installs once.
+  }, [queryClient, showActionError])
   // Cold-tab hydration: after a reload (or when restoring a slot's strip from
   // the persisted panel-tabs store), file tabs come back as lightweight
   // references with their heavy content stripped (content === undefined). Read
@@ -3795,8 +3906,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
   }, [embedMode, splitMode, enterSplit, splitFeatureEnabled, activeSlot])
-  const [generatingTitleSlots, setGeneratingTitleSlots] = useState<Set<string>>(new Set())
-  const [titleDraft, setTitleDraft] = useState('')
   const lastTextIdx = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       // Agree with renderMessage's skip: a hidden invisible-only row draws
@@ -4045,7 +4154,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // The session triple matches what the assistant / note rows hand
     // MarkdownRenderer (see the AssistantMessage and inject branches below),
     // so a `/chat?sid=…` link behaves identically across row kinds (#8253).
-    (c: string, mt: Record<string, unknown> | undefined) => renderUserContent({
+    (c: string, mt: Record<string, unknown> | undefined, ts?: string) => renderUserContent({
       content: c,
       meta: mt,
       onFileOpen: handleFileOpen,
@@ -4054,26 +4163,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       onSessionOpen: selectSessionTab,
       sessions: connected ? sessionTitles : undefined,
       activeSession: activeSlot || undefined,
+      // The short-name chip needs the row's write time; without it no short name
+      // resolves here, because slot numbers are reused.
+      messageTs: ts,
     }),
     [handleFileOpen, handleFolderOpen, linkPreviewsOn, selectSessionTab, connected, sessionTitles, activeSlot]
   )
 
-  const cancelTitleRef = useRef(false)
-  // #10203: per-slot recovery state for header-rename failures. `gen` is a
-  // monotonic attempt generation: a recovery may apply ONLY while its own
-  // attempt is still the slot's latest, so a delayed recovery can never
-  // overwrite anything a newer attempt (failed or successful) did -- title
-  // equality alone cannot tell a stale optimistic value from a newer confirmed
-  // rename to the identical string. `baseline` is the last CONFIRMED title;
-  // `inflight` holds this slot's own un-settled optimistic titles, so a store
-  // title outside that set refreshes the baseline at commit time (a success
-  // here, or another client's rename delivered over SSE). The entry is dropped
-  // when the last pending attempt settles.
-  const renameRecoveryRef = useRef(new Map<string, { baseline: string; inflight: Set<string>; gen: number }>())
-  // The session-title field is an Enter-to-commit input; the guard owns both the
-  // composition latch and the keypress, so the rename cannot fire on the Enter that
-  // commits an IME candidate.
-  const titleIme = useImeGuard()
   useEffect(() => {
     const togglePin = () => {
       // Always-available collapse. Only guard is no-sessions (the sidebar is
@@ -5392,7 +5488,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock className="lucide-inline" /> {cronLabel}</span>}
                 {/* Same session wiring as the assistant branch. Without it `resolveSessionChip`
                     refuses at its first guard and a `/chat?sid=` link gains `target="_blank"`. */}
-                <div className="msg-content px-4 py-3 text-sm leading-6 rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} softBreaks /></MessageErrorBoundary></div>
+                <div className="msg-content px-4 py-3 text-sm leading-6 rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} messageTs={m.ts} softBreaks /></MessageErrorBoundary></div>
                 {/* No `font-mono`: a formatted date is prose, and Tailwind's
                     `font-mono` pins `var(--mono)` — a token the Font Family
                     setting never writes, so it overrode the user's choice and
@@ -6678,42 +6774,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     else if (!sidebarPinned) setSidebarPinned(true)
                     dispatch(requestSlotReveal(activeSlot))
                   } : undefined}
-                  onRename={activeSlot ? () => { setEditingTitleSlot(activeSlot); setTitleDraft(title) } : undefined}
+                  onRename={activeSlot ? () => setEditingTitleSlot(activeSlot) : undefined}
                   mode={effectiveMode}
                 />
                 </div>
-              {editingTitle ? (
-                <div className="flex min-w-0 flex-1 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
-                  {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
-                  {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                  {/* #10203: a refused rename must also revert the optimistic sseSlotTitle.
-                      Recovery re-reads the server truth (deduped through queryClient.fetchQuery)
-                      and applies ONLY this slot's title -- never the whole snapshot, whose late
-                      fulfillment could transiently clobber a newer concurrent write of another
-                      slot. A recovery may apply only while ITS OWN attempt is the slot's latest
-                      generation AND the store still holds its refused value, so a delayed
-                      recovery can never overwrite a newer attempt's outcome -- including a newer
-                      confirmed rename to the identical string, which title equality alone cannot
-                      distinguish. When the re-read fails (transport or auth failure takes
-                      renameSlot and chatSlots down together) fall back to a local revert to the
-                      recovery baseline in renameRecoveryRef: the last CONFIRMED title, refreshed
-                      at commit time from any store title that is not one of this slot's own
-                      pending optimistic values. */}
-                  <Input className="session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-none md:max-w-[50vw] focus:!shadow-none focus-visible:border-b focus-visible:border-accent" size={Math.min(Math.max(titleDraft.length + 2, 6), 80)} autoFocus value={titleDraft} onChange={e => setTitleDraft(e.target.value)} {...titleIme.bindComposition<HTMLInputElement>({ onBlur: () => { if (!cancelTitleRef.current && titleDraft.trim() && activeSlot && titleDraft !== title) { const key = activeSlot; const refused = titleDraft.trim(); const rec = renameRecoveryRef.current.get(key) ?? { baseline: title, inflight: new Set<string>(), gen: 0 }; const current = boundStore.getState().dashboard.slots.find(s => s.key === key)?.title ?? title; if (!rec.inflight.has(current)) rec.baseline = current; rec.inflight.add(refused); rec.gen++; const myGen = rec.gen; renameRecoveryRef.current.set(key, rec); const settle = () => { rec.inflight.delete(refused); if (rec.inflight.size === 0 && rec.gen === myGen) renameRecoveryRef.current.delete(key) }; const mayRecover = () => rec.gen === myGen && boundStore.getState().dashboard.slots.find(s => s.key === key)?.title === refused; dispatch(sseSlotTitle({ key, title: refused })); api.renameSlot(key, refused).then(() => { if (rec.gen === myGen) rec.baseline = refused; settle() }, async e => { showActionError(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT('pages.chatPage.could_not_rename_session')); try { const server = (await queryClient.fetchQuery({ queryKey: ['chat-slots'], queryFn: () => api.chatSlots(), staleTime: 0, gcTime: 0 })).find((s: { key: string; title?: string }) => s.key === key); if (server?.title !== undefined && rec.gen === myGen) rec.baseline = server.title; if (mayRecover()) dispatch(sseSlotTitle({ key, title: server?.title ?? rec.baseline })) } catch { if (mayRecover()) dispatch(sseSlotTitle({ key, title: rec.baseline })) } finally { settle() } }) } cancelTitleRef.current = false; setEditingTitleSlot(null) } })} onKeyDown={e => { if (e.key === 'Enter' && titleIme.claimEnter(e)) (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') { titleIme.reset(); cancelTitleRef.current = true; setEditingTitleSlot(null) } }} />
-                </div>
-              ) : (
-                <div className="cursor-text flex min-w-0 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover transition-colors">
-                  <Clickable className="flex min-w-0 items-center gap-1" onClick={() => { if (activeSlot && generatingTitleSlots.has(activeSlot)) return; setEditingTitleSlot(activeSlot); setTitleDraft(title) }}>
-                    {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
-                    {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                    <TypewriterText text={title} className="session-header-title text-sm font-semibold text-muted font-body truncate min-w-0 md:max-w-[50vw]" />
-                    <Pen size={13} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-60 transition-opacity" />
-                  </Clickable>
-                  {activeSlot && (generatingTitleSlots.has(activeSlot) ? <Loader size={16} className="shrink-0 text-accent animate-spin" /> : <Btn aria-label={i18nT('pages.chatPage.regenerate_title_with_llm')} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-40 hover:!opacity-100 hover:text-accent transition-all cursor-pointer bg-transparent border-none p-0" title={i18nT('pages.chatPage.regenerate_title_with_llm')} onClick={e => { e.stopPropagation(); if (!activeSlot || generatingTitleSlots.has(activeSlot)) return; const slot = activeSlot; setGeneratingTitleSlots(prev => new Set(prev).add(slot)); api.generateTitle(slot).then(r => { /* title is redacted server-side via redact_exfiltration_urls + redact_credentials */ if (r.title) dispatch(sseSlotTitle({ key: slot, title: r.title })) }).catch(e => {
-                    showActionError(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT('pages.chatPage.could_not_generate_title'))
-                  }).finally(() => setGeneratingTitleSlots(prev => { const next = new Set(prev); next.delete(slot); return next })) }}><Sparkles size={16} /></Btn>)}
-                </div>
-              )}
+                {/* Shared with every split-view pane header (#9727). The editor
+                    flag stays here, pinned to the slot it opened on. */}
+                {activeSlot && (
+                  <SessionTitleControl
+                    slotKey={activeSlot}
+                    title={title}
+                    editing={editingTitle}
+                    onEditingChange={open => setEditingTitleSlot(open ? activeSlot : null)}
+                    onError={showActionError}
+                    onAttempt={() => setActionError(null)}
+                  />
+                )}
                 </div>
               {effectiveMode === 'orchestrator' && <span className="pointer-events-auto"><InfoTip text={i18nT('pages.chatPage.autopilot_plans_before_executing_each_stage_need')} /></span>}
               <InboundLinkChip slotKey={activeSlot} />
@@ -7270,9 +7346,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <AnimatePresence>
                     {folderSuggestion && activeSlot ? (
                       <div className="pt-1.5" key="folder-suggestion">
+                        {/* Keyed by the suggestion's ts: a replacement card
+                            remounts the component, so its dropdown re-prefills
+                            and a selection made against the previous suggestion
+                            cannot leak onto the new one. `chatFolders` is the
+                            sidebar's own ['chat-folders'] cache (normalized to
+                            [] on error above), so the dropdown costs no extra
+                            request and degrades to a suggestion-only option
+                            list when folders are unavailable. */}
                         <FolderSuggestionCard
-                          folderName={folderSuggestion.folderName}
-                          breadcrumb={folderSuggestion.breadcrumb}
+                          key={folderSuggestion.ts}
+                          suggestedFolderId={folderSuggestion.folderId}
+                          suggestedFolderName={folderSuggestion.folderName}
+                          suggestedFolderBreadcrumb={folderSuggestion.breadcrumb}
+                          folders={chatFolders}
                           onAccept={folderSuggestionAccept}
                           onDecline={folderSuggestionDecline}
                         />
@@ -7572,6 +7659,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 models={filteredModels}
                 activeModel={shownModel}
                 onSelectModel={name => switchModel(name)}
+                modelsLoading={remoteCrew.modelsPending}
+                modelsFailed={remoteCrew.failed}
+                retryingModels={remoteCrew.retrying}
+                onRetryModels={() => remoteCrew.refetch()}
                 filter={modelFilter}
                 setFilter={setModelFilter}
                 onClose={() => setModelDropdown(false)}

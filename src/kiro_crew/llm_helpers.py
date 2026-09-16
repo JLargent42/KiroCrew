@@ -24,7 +24,12 @@ from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.credential_errors import is_credential_propagation_delay
-from kiro_crew.hooks import _EDIT_TOOL_KIND, fire_tool_hooks, get_global_hook_store
+from kiro_crew.hooks import (
+    _EDIT_TOOL_KIND,
+    fire_tool_hooks,
+    get_global_hook_store,
+    hook_gate_kwargs,
+)
 from kiro_crew.platform.tool_paths import (
     command_shaped_strings,
     edit_target_candidates,
@@ -43,10 +48,11 @@ from kiro_crew.security import (
     MAX_SCANNABLE_COMMAND_CHARS,
     is_denied,
     is_sensitive_bash_command,
-    is_sensitive_path,
     is_sensitive_write_path,
+    is_unverifiable_path_refusal,
     redact_credentials,
     redact_exfiltration_urls,
+    sensitive_path_refusal,
 )
 from kiro_crew.sel import sel as _sel
 
@@ -1042,7 +1048,12 @@ def _title_denial(
     place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
     ``"regex"``; the reasons are the exact strings the on-loop checks produced.
     """
-    if is_sensitive_path(title):
+    path_refusal = sensitive_path_refusal(title)
+    if path_refusal:
+        # A stall is passed through as worded (recognised by its fixed prefix, which
+        # the deny guidance classifies by); a match keeps this producer's wording.
+        if is_unverifiable_path_refusal(path_refusal):
+            return ("path", path_refusal)
         return ("path", f"Blocked: sensitive path: {title}")
     bash_reason = is_sensitive_bash_command(title)
     if bash_reason:
@@ -1157,7 +1168,10 @@ def _first_tool_input_denial(
                 ),
                 s[:64],
             )
-        if is_sensitive_path(s):
+        path_refusal = sensitive_path_refusal(s)
+        if path_refusal:
+            if is_unverifiable_path_refusal(path_refusal):
+                return ("path", path_refusal, s)
             return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
         _input_bash = is_sensitive_bash_command(s)
         if _input_bash:
@@ -2520,14 +2534,7 @@ async def _resolve_permission(
             session_key=session_key,
             agent=agent,
             app=app,
-            tool_kind=event.tool_kind,
-            raw_params=event.raw_tool_params,
-            diff_path=event.diff_path,
-            command=event.shell_command,
-            is_shell=event.is_shell,
-            mcp_server_name=event.mcp_server_name,
-            mcp_tool_name=event.tool_name,
-            mcp_identity_trusted=event.mcp_identity_trusted,
+            **hook_gate_kwargs(event),
             # READ_ONLY asks for the classifier's verdict alone: the gate skips
             # its grant tiers (`auto_approve_tools`, app-own-server), which vouch
             # for the caller rather than for the call's effect, so a grant that

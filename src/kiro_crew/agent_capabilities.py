@@ -19,6 +19,11 @@ from typing import Any, Callable
 
 from kiro_crew import agent_state
 from kiro_crew.agent import agents_spec_lock, kiro_agents_dir_path
+from kiro_crew.agent_spec_format import (
+    agent_spec_candidates,
+    iter_agent_spec_files,
+    parse_agent_spec_bytes,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -56,7 +61,7 @@ def _read_spec(path: Path) -> dict:
 
     try:
         raw = safe_read_file_bytes_nolink(str(path), str(path.parent), max_bytes=MAX_DOCUMENT_BYTES)
-        result = json.loads(raw) if raw is not None else None
+        result = parse_agent_spec_bytes(raw, path) if raw is not None else None
     except (ValueError, FileTooLargeError):
         raise CapabilityError("source_unreadable") from None
     if not isinstance(result, dict):
@@ -82,7 +87,7 @@ def _source(name: str, project: str, *, allow_private: bool = False) -> tuple[Pa
             # A broken file claiming this exact filename cannot authorize a
             # fallback to the broader global scope. Unrelated junk is skipped
             # by the shared resolver, just as it is on the normal agent path.
-            if (root / (name + ".json")).exists():
+            if any(p.exists() for p in agent_spec_candidates(root, name)):
                 raise CapabilityError("source_unreadable")
             continue
         if _conflicting_spec_for(name, path, root) is not None:
@@ -95,19 +100,14 @@ def _source(name: str, project: str, *, allow_private: bool = False) -> tuple[Pa
                 raise CapabilityError("private_parent_forbidden")
             from kiro_crew.agent_discovery import _global_agent_info
 
-            source = (
-                "project"
-                if scope == "project"
-                else (
-                    "builtin"
-                    if path.name in OWNED_KIRO_AGENT_FILES
-                    else (
-                        "package"
-                        if _global_agent_info(path, spec).source == "package"
-                        else "custom"
-                    )
-                )
-            )
+            if scope == "project":
+                source = "project"
+            elif path.name in OWNED_KIRO_AGENT_FILES:
+                source = "builtin"
+            elif _global_agent_info(path, spec).source == "package":
+                source = "package"
+            else:
+                source = "custom"
             return (
                 path,
                 spec,
@@ -244,11 +244,17 @@ def resolve_effective(
             conflict = key in overrides.get(section, {})
             needs = _expands(section, old, new)
             selected = (section, key) in (accept or set())
+            if old is None:
+                kind = "added"
+            elif new is None:
+                kind = "removed"
+            else:
+                kind = "changed"
             changes.append(
                 {
                     "section": section,
                     "id": key,
-                    "kind": "added" if old is None else "removed" if new is None else "changed",
+                    "kind": kind,
                     "conflict": conflict,
                     "requires_approval": needs,
                     "before": old,
@@ -741,6 +747,12 @@ class CapabilityService:
             descriptor = (intent or {}).get(
                 "parent", {"name": parent_name, "scope": "global", "source": "unknown"}
             )
+        if intent:
+            mode = "inherited"
+        elif lineage:
+            mode = "legacy_snapshot"
+        else:
+            mode = "shared"
         snapshot = {
             "member": member,
             "target": target,
@@ -752,7 +764,7 @@ class CapabilityService:
             "intent": intent,
             "catalog": catalog,
             "project": project,
-            "mode": "inherited" if intent else "legacy_snapshot" if lineage else "shared",
+            "mode": mode,
             "error": error,
             "binding": binding_data,
             "connections": connections,
@@ -972,16 +984,18 @@ class CapabilityService:
                 keys.setdefault(section)
             for key in keys:
                 override = overrides.get(section, {}).get(key)
+                if not override:
+                    state = "inherited"
+                elif override["action"] == "remove":
+                    state = "removed"
+                else:
+                    state = "local"
                 output.append(
                     {
                         "section": section,
                         "id": key,
                         "label": key,
-                        "state": (
-                            "inherited"
-                            if not override
-                            else "removed" if override["action"] == "remove" else "local"
-                        ),
+                        "state": state,
                         "present": key in rows[section],
                         "value": rows[section].get(
                             key, "" if section in ("prompt", "model") else None
@@ -1111,16 +1125,18 @@ class CapabilityService:
                 for key in dict.fromkeys([*old[section], *new[section]]):
                     before, after = old[section].get(key), new[section].get(key)
                     if before != after:
+                        if before is None:
+                            change = "added"
+                        elif after is None:
+                            change = "removed"
+                        else:
+                            change = "changed"
                         impact.append(
                             {
                                 "member": current["member"],
                                 "section": section,
                                 "id": key,
-                                "change": (
-                                    "added"
-                                    if before is None
-                                    else "removed" if after is None else "changed"
-                                ),
+                                "change": change,
                                 "approval_expanded": section in ("allowedTools", "autoApprove")
                                 and after is not None,
                             }
@@ -1297,11 +1313,13 @@ class CapabilityService:
                 roots = [root]
                 if snap["project"]:
                     roots.append(project_agents_dir(snap["project"]))
-                occupied = {p.stem.lower() for directory in roots for p in directory.glob("*.json")}
+                occupied = {
+                    p.stem.lower() for directory in roots for p in iter_agent_spec_files(directory)
+                }
                 from kiro_crew.agent_discovery import _read_agent_spec
 
                 for directory in roots:
-                    for path in directory.glob("*.json"):
+                    for path in iter_agent_spec_files(directory):
                         declared = _read_agent_spec(
                             path, operation="capability_publish", source="dashboard"
                         )

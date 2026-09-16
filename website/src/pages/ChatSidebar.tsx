@@ -9,7 +9,7 @@ import ErrorNotice, { ErrorNoticeMenuItem } from '../components/ErrorNotice'
 import JiraLogo from '../components/icons/JiraLogo'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import FolderGlyph from '../components/FolderGlyph'
-import { DndContext, closestCenter, pointerWithin, useDroppable, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection } from '@dnd-kit/core'
+import { DndContext, closestCenter, pointerWithin, useDroppable, useDndContext, DragOverlay, MeasuringStrategy, type DragEndEvent, type DragStartEvent, type DragOverEvent, type CollisionDetection } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy, useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -197,8 +197,8 @@ const ROW_STATUS_LINE_MUTED_CLS = `${ROW_STATUS_CLS} text-muted flex items-cente
 const ROW_ICON_PX = 10
 
 /** Is this click the "open as a tab" modifier gesture? One predicate for every
- *  surface that offers it (session rows, the New button), so the platform split
- *  cannot drift between them. The split is deliberate: Ctrl+click IS a
+ *  surface that offers it (session rows, the New button, the folder create
+ *  entries), so the platform split cannot drift between them. The split is deliberate: Ctrl+click IS a
  *  right-click on macOS, so honouring it there would fire this and the context
  *  menu from one press; Cmd is the tab modifier there. Shift and Alt are
  *  excluded because both carry other meanings in the sidebar (range/reorder). */
@@ -501,6 +501,37 @@ function ChatPaneDropZone({ refusal }: { refusal: SessionRefBlockReason | null }
       )}
     </div>
   )
+}
+
+/**
+ * Reports whether the enclosing DndContext has an active drag, so the sidebar
+ * can reconcile its own drag mirror (`activeDrag`, `dragFrozen`) against the
+ * store dnd-kit actually holds.
+ *
+ * The mirror is set from `onDragStart` and cleared from `onDragEnd` /
+ * `onDragCancel`, but dnd-kit only fires the end callbacks when its
+ * `sensorContext.active` is populated, and that ref is filled by a layout
+ * effect on the commit AFTER the start. A press-move-release that finishes
+ * before this component commits (the sidebar is heavy and the mouse sensor
+ * arms at 5px) therefore leaves dnd-kit idle while the mirror still says a
+ * drag is live: the row projection stays frozen (rows filtered before the
+ * gesture never come back, the pinned divider repeats), and the chat-pane
+ * drop zone stays on screen with nothing to drop.
+ *
+ * One probe per DndContext, keyed by a stable id: the tree/flat lanes have
+ * one context and the board has one per column, and only a context that
+ * hosted the gesture reports active — an idle neighbour must not be read as
+ * "no drag anywhere".
+ */
+function DndActiveProbe({ report }: { report: (id: string, active: boolean) => void }) {
+  const id = useId()
+  const { active } = useDndContext()
+  const isActive = active != null
+  useLayoutEffect(() => {
+    report(id, isActive)
+    return () => report(id, false)
+  }, [id, isActive, report])
+  return null
 }
 
 /** Approximate height (px) of a folder header row. For root folder drags the
@@ -5599,10 +5630,33 @@ function ChatSidebar({
     if (d?.type === 'session' && d.key) setActiveDrag({ type: 'session', id: d.key })
     else if (d?.type === 'folder') setActiveDrag({ type: 'folder', id: e.active.id as string })
   }, [releaseHoverPin])
-  const handleSidebarDragEnd = useCallback((event: DragEndEvent) => {
+  // The one place the drag mirror is torn down: end, cancel, and the
+  // reconciler below all go through it so none can leave a piece behind.
+  const resetSidebarDrag = useCallback(() => {
     setActiveDrag(null)
     setDragFrozen(false)
     if (dragExpandTimer.current) { clearTimeout(dragExpandTimer.current.timer); dragExpandTimer.current = null }
+  }, [])
+  // Which DndContexts currently hold an active drag, as reported by their
+  // DndActiveProbe. A ref, not state: the probes write it from layout effects
+  // and the reconciler reads it from a passive effect in the same commit.
+  const dndActiveContexts = useRef(new Set<string>())
+  const reportDndActive = useCallback((id: string, active: boolean) => {
+    if (active) dndActiveContexts.current.add(id)
+    else dndActiveContexts.current.delete(id)
+  }, [])
+  // Reconcile the mirror with dnd-kit's store after every commit: a live
+  // mirror with no context reporting a drag is a gesture whose end dnd-kit
+  // never delivered (see DndActiveProbe). Deliberately dependency-free — the
+  // store can go idle in a commit that changes neither mirror value, and the
+  // check is two reads against a ref.
+  useEffect(() => {
+    if (activeDrag === null && !dragFrozen) return
+    if (dndActiveContexts.current.size > 0) return
+    resetSidebarDrag()
+  })
+  const handleSidebarDragEnd = useCallback((event: DragEndEvent) => {
+    resetSidebarDrag()
     const { active, over } = event
     if (!over) return
     const a = active.data.current as {
@@ -5665,8 +5719,8 @@ function ChatSidebar({
       if (o?.type === 'folder-drop') moveByDrag(a.key, o.folderId ?? null)
       else if (o?.type === 'folder') moveByDrag(a.key, over.id as string)
     }
-  }, [reorderFolders, reorderPinned, searchRanked, pinned, moveByDrag, moveFolderByDrag, localSlots, activeSlot, onDropSessionRef])
-  const handleSidebarDragCancel = useCallback(() => { setActiveDrag(null); setDragFrozen(false); if (dragExpandTimer.current) { clearTimeout(dragExpandTimer.current.timer); dragExpandTimer.current = null } }, [])
+  }, [resetSidebarDrag, reorderFolders, reorderPinned, searchRanked, pinned, moveByDrag, moveFolderByDrag, localSlots, activeSlot, onDropSessionRef])
+  const handleSidebarDragCancel = resetSidebarDrag
   // Auto-expand collapsed folders when a dragged item hovers over them for 500ms.
   const dragExpandTimer = useRef<{ id: string; timer: ReturnType<typeof setTimeout> } | null>(null)
   const handleSidebarDragOver = useCallback((event: DragOverEvent) => {
@@ -5725,8 +5779,12 @@ function ChatSidebar({
   }, [folders, updateFolderMutation, boardFolderCollapsed])
   // The most recent failed folder-scoped create, surfaced inline under that
   // folder's header. A single {folderId, columnId, message} rather than a
-  // per-folder record: creates are user-initiated one at a time, and the
-  // actionable failure is the one the user just clicked into. `columnId`
+  // per-folder record: the actionable failure is the one the user just clicked
+  // into. The background-tab gesture makes rapid-fire creates possible, so an
+  // older attempt settling after a newer one is real; the attempt counter below
+  // keeps a stale settle from resurrecting or clearing the latest notice, at
+  // the accepted cost that only the newest attempt's failure is surfaced.
+  // `columnId`
   // scopes the notice to the board column the create was issued from (a root
   // folder renders once per column, and an unscoped notice would mount N
   // identical alerts). Cleared by dismissal or by the next successful create.
@@ -5736,9 +5794,13 @@ function ChatSidebar({
   // cannot resurrect a stale notice (and a stale success cannot clear a newer
   // failure's notice).
   const folderCreateAttemptRef = useRef(0)
-  type CreateChatInFolderVars = { folderId: string; columnId?: string; focus?: boolean; attempt: number; memoryMode?: 'incognito' | 'temporary' }
+  // `inNewTab` is the folder-create twin of createChatMutation's flag (see the
+  // comment there): the Cmd/Ctrl-click and middle-click gesture creates the
+  // session WITHOUT activating it, then hands the key to `onOpenSlotInNewTab`
+  // in background mode so the user stays on the transcript they were reading.
+  type CreateChatInFolderVars = { folderId: string; columnId?: string; focus?: boolean; attempt: number; memoryMode?: 'incognito' | 'temporary'; inNewTab?: boolean }
   const createChatInFolderMutation = useMutation({
-    mutationFn: ({ folderId, memoryMode }: CreateChatInFolderVars) => {
+    mutationFn: ({ folderId, memoryMode, inNewTab }: CreateChatInFolderVars) => {
       const agent = resolveFolderAgent(folders, folderId, defaultAgent)
       // A mode-specific create pins plain mode, not the defaultAutopilot preference.
       const ephemeral = !!memoryMode
@@ -5752,9 +5814,11 @@ function ChatSidebar({
       // project — createSlot applies it before the slot activates, so the
       // first message can't race a late project switch.
       const project = resolveFolderProjectDir(folders, folderId)
-      return dispatch(createSlot({ agent, mode: effectiveMode, folder_id: folderId, project, ...(memoryMode ? { memory_mode: memoryMode } : {}) })).unwrap()
+      // The tab gesture registers the slot without stealing focus -- same
+      // `activate: false` contract as the header New button's gesture.
+      return dispatch(createSlot({ agent, mode: effectiveMode, folder_id: folderId, project, activate: !inNewTab, ...(memoryMode ? { memory_mode: memoryMode } : {}) })).unwrap()
     },
-    onSuccess: (slot: Slot, { folderId, columnId, focus, attempt }: CreateChatInFolderVars) => {
+    onSuccess: (slot: Slot, { folderId, columnId, focus, attempt, inNewTab }: CreateChatInFolderVars) => {
       // A create that went through supersedes an earlier failure notice for
       // the same folder (e.g. the user fixed the folder's project directory
       // and retried); notices for OTHER folders stay put, and a stale success
@@ -5764,14 +5828,22 @@ function ChatSidebar({
       }
       // Focus only after the create fulfils: the composer is bound to the
       // active slot, so focusing while createSlot is still in flight puts the
-      // caret on the OLD session and anything typed lands in its draft.
-      if (focus) focusComposer()
+      // caret on the OLD session and anything typed lands in its draft. The
+      // background-tab case never focuses: the user stays where they are.
+      if (focus && !inNewTab) focusComposer()
       if (slot?.key && columnId) {
         // Board view: also drop the new session into the column it was created
         // from, so a status-lane column shows it immediately instead of the
         // untagged session vanishing from a tag-filtered column. Mirrors a
         // drag-drop and is a harmless no-op for filter-only / non-status columns.
+        // Runs for the tab gesture too -- column membership is independent of
+        // which slot has focus.
         dropSlotMutation.mutate({ slot: slot.key, columnId })
+      }
+      if (inNewTab && onOpenSlotInNewTab && slot?.key) {
+        // Background: adds a tab beside the active one without switching, same
+        // as the header New button's gesture (see createChatMutation).
+        onOpenSlotInNewTab(slot.key, { background: true })
       }
     },
     onError: (err: unknown, { folderId, columnId, attempt }: CreateChatInFolderVars) => {
@@ -5810,7 +5882,7 @@ function ChatSidebar({
       setFolderCreateError({ folderId, columnId, message, title, report, offerSettings: isStaleProjectDir })
     },
   })
-  const createChatInFolder = useCallback((folderId: string, opts?: { columnId?: string; focus?: boolean; memoryMode?: 'incognito' | 'temporary' }) => {
+  const createChatInFolder = useCallback((folderId: string, opts?: { columnId?: string; focus?: boolean; memoryMode?: 'incognito' | 'temporary'; inNewTab?: boolean }) => {
     // A nested folder selected from the create menu may be hidden behind one
     // or more collapsed ancestors. Expand the complete path optimistically so
     // the destination and its new session are visible as creation begins.
@@ -5828,7 +5900,7 @@ function ChatSidebar({
       persistClearFolderOverrides(folder.id)
       currentId = folder.parent_id || undefined
     }
-    createChatInFolderMutation.mutate({ folderId, columnId: opts?.columnId, focus: opts?.focus, attempt: ++folderCreateAttemptRef.current, memoryMode: opts?.memoryMode })
+    createChatInFolderMutation.mutate({ folderId, columnId: opts?.columnId, focus: opts?.focus, attempt: ++folderCreateAttemptRef.current, memoryMode: opts?.memoryMode, inNewTab: opts?.inNewTab })
   }, [createChatInFolderMutation, folders, updateFolderMutation])
 
   // Create autopilot session mutation (consistent with useMutation pattern)
@@ -6153,6 +6225,10 @@ function ChatSidebar({
                 {(() => {
                   const rows = (
                     <>
+                      {/* Menu create entries take NO open-in-tab gesture (#10575,
+                       *  scoped out): a menu closes on select, and Radix keyboard
+                       *  activation synthesizes a modifier-free click, so the
+                       *  gesture would be mouse-only and undiscoverable. */}
                       <DropdownMenuItem data-testid={`col-${columnId}-folder-${folder.id}-new-incognito`} onClick={() => { createChatInFolder(folder.id, { columnId, memoryMode: 'incognito' }) }}><EyeOff size={13} className="text-warn" /> {i18nT('components.welcomeView.incognito')}</DropdownMenuItem>
                       <DropdownMenuItem data-testid={`col-${columnId}-folder-${folder.id}-new-temporary`} onClick={() => { createChatInFolder(folder.id, { columnId, memoryMode: 'temporary' }) }}><VenetianMask size={13} className="text-aim" /> {i18nT('components.welcomeView.temporary')}</DropdownMenuItem>
                     </>
@@ -6187,7 +6263,19 @@ function ChatSidebar({
                 <DropdownMenuItem className="text-danger focus:text-danger" onClick={() => { if (confirm(i18nT('pages.chatSidebar.delete_folder_confirm', { name: folder.name }))) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-            <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-new-chat`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id, { columnId }) }} onMouseDown={e => { e.stopPropagation() }} onKeyDown={e => { e.stopPropagation() }}>
+            {/* Same three-gesture contract as the header New button; the
+             *  existing stopPropagation stays so the header click/drag
+             *  handlers never see the press. */}
+            <button type="button" data-testid={`col-${columnId}-folder-${folder.id}-new-chat`} className="text-muted hover:text-accent bg-transparent border-none cursor-pointer p-[2px]" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
+              onClick={e => { e.stopPropagation(); createChatInFolder(folder.id, { columnId, inNewTab: !!onOpenSlotInNewTab && isOpenInTabModifierClick(e) }) }}
+              onMouseDown={e => { e.stopPropagation(); if (e.button === 1 && onOpenSlotInNewTab) e.preventDefault() }}
+              onAuxClick={onOpenSlotInNewTab ? (e => {
+                if (e.button !== 1) return
+                e.preventDefault()
+                e.stopPropagation()
+                createChatInFolder(folder.id, { columnId, inNewTab: true })
+              }) : undefined}
+              onKeyDown={e => { e.stopPropagation() }}>
               <MessageSquarePlus size={11} />
             </button>
           </span>
@@ -6204,8 +6292,15 @@ function ChatSidebar({
              *  list-view parity (see renderFolderBlock). Reached only when the
              *  setting is OFF - with it on there is no body to put this in. */}
             {deepChildren.length === 0 && childSlots.length === 0 && (
-              <button key={`col-${columnId}-newchat-${folder.id}`} type="button"
-                onClick={() => createChatInFolder(folder.id, { columnId })}
+              <button key={`col-${columnId}-newchat-${folder.id}`} type="button" data-testid={`col-${columnId}-folder-${folder.id}-empty-new-chat`}
+                // Same three-gesture contract as the folder header's "+".
+                onMouseDownCapture={onOpenSlotInNewTab ? (e => { if (e.button === 1) e.preventDefault() }) : undefined}
+                onAuxClick={onOpenSlotInNewTab ? (e => {
+                  if (e.button !== 1) return
+                  e.preventDefault()
+                  createChatInFolder(folder.id, { columnId, inNewTab: true })
+                }) : undefined}
+                onClick={e => createChatInFolder(folder.id, { columnId, inNewTab: !!onOpenSlotInNewTab && isOpenInTabModifierClick(e) })}
                 title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
                 className="w-full flex items-center gap-2.5 px-4 py-2 rounded-md text-[11px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
                 <span>{i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}</span><MessageSquarePlus size={11} className="shrink-0 ml-auto" />
@@ -6620,6 +6715,10 @@ function ChatSidebar({
               {(() => {
                 const rows = (
                   <>
+                    {/* Menu create entries take NO open-in-tab gesture (#10575,
+                     *  scoped out): a menu closes on select, and Radix keyboard
+                     *  activation synthesizes a modifier-free click, so the
+                     *  gesture would be mouse-only and undiscoverable. */}
                     <DropdownMenuItem data-testid={`folder-new-incognito-${folder.id}`} onClick={() => { createChatInFolder(folder.id, { memoryMode: 'incognito' }) }}><EyeOff size={13} className="text-warn" /> {i18nT('components.welcomeView.incognito')}</DropdownMenuItem>
                     <DropdownMenuItem data-testid={`folder-new-temporary-${folder.id}`} onClick={() => { createChatInFolder(folder.id, { memoryMode: 'temporary' }) }}><VenetianMask size={13} className="text-aim" /> {i18nT('components.welcomeView.temporary')}</DropdownMenuItem>
                   </>
@@ -6668,7 +6767,19 @@ function ChatSidebar({
               <DropdownMenuItem className="text-danger focus:text-danger" data-testid={`folder-delete-${folder.id}`} onClick={() => { if (confirm(i18nT('pages.chatSidebar.delete_folder_confirm', { name: folder.name }))) deleteFolderMutation.mutate(folder.id) }}><X size={13} /> {i18nT('pages.chatSidebar.delete_folder')}</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          <button type="button" data-testid={`folder-new-chat-${folder.id}`} className="cursor-pointer p-[4px] rounded text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} onClick={e => { e.stopPropagation(); createChatInFolder(folder.id) }}><MessageSquarePlus size={12} /></button>
+          {/* Same three-gesture contract as the header New button: plain click
+           *  creates and switches; Cmd/Ctrl-click and middle-click create the
+           *  session as a background TAB. Gated on `onOpenSlotInNewTab` --
+           *  embedded hosts have no tab strip, so the modifier is ignored. */}
+          <button type="button" data-testid={`folder-new-chat-${folder.id}`} className="cursor-pointer p-[4px] rounded text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none" title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
+            onMouseDownCapture={onOpenSlotInNewTab ? (e => { if (e.button === 1) e.preventDefault() }) : undefined}
+            onAuxClick={onOpenSlotInNewTab ? (e => {
+              if (e.button !== 1) return
+              e.preventDefault()
+              e.stopPropagation()
+              createChatInFolder(folder.id, { inNewTab: true })
+            }) : undefined}
+            onClick={e => { e.stopPropagation(); createChatInFolder(folder.id, { inNewTab: !!onOpenSlotInNewTab && isOpenInTabModifierClick(e) }) }}><MessageSquarePlus size={12} /></button>
         </div>
         )}
       </div>
@@ -6792,8 +6903,15 @@ function ChatSidebar({
       // leaving the hover-only create control on the header as the only
       // (invisible-at-rest) way to start a session in it.
       <div key={`folder-children-${folder.id}`} className="border-l border-border mb-1 ml-3 pl-1 rounded-bl-md">
-        <button key={`folder-newchat-${folder.id}`} type="button"
-          onClick={() => createChatInFolder(folder.id)}
+        <button key={`folder-newchat-${folder.id}`} type="button" data-testid={`folder-empty-new-chat-${folder.id}`}
+          // Same three-gesture contract as the folder header's "+" above.
+          onMouseDownCapture={onOpenSlotInNewTab ? (e => { if (e.button === 1) e.preventDefault() }) : undefined}
+          onAuxClick={onOpenSlotInNewTab ? (e => {
+            if (e.button !== 1) return
+            e.preventDefault()
+            createChatInFolder(folder.id, { inNewTab: true })
+          }) : undefined}
+          onClick={e => createChatInFolder(folder.id, { inNewTab: !!onOpenSlotInNewTab && isOpenInTabModifierClick(e) })}
           title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
           className="w-full flex items-center gap-2.5 pl-3.5 pr-3 py-2 rounded-md text-[12px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
           <span>{i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}</span><MessageSquarePlus size={13} className="shrink-0 ml-auto" />
@@ -7342,9 +7460,13 @@ function ChatSidebar({
               <span id={bulkSkipRunningLabelId}>{i18nT('pages.chatSidebar.skip')} {i18nT('pages.chatSidebar.running_session', { count: bulkRunningCount })}</span>
             </label>
           )}
+          {/* No hand-off: the chosen bulkModel/skipRunning selection is unsaved,
+              and the navigation would discard it. Its own line, above the
+              Cancel/Switch pair: a third control in that row would break
+              max-two-buttons-per-row, and an inline notice sharing the row
+              collapses to one character per line at sidebar width. */}
+          <ErrorNotice message={bulkModelError} className="mb-2" testId="bulk-model-error" />
           <div className="flex items-center gap-2 justify-end">
-            {/* No hand-off: chosen bulkModel/skipRunning selection is unsaved */}
-            <ErrorNotice message={bulkModelError} variant="inline" className="flex-1" testId="bulk-model-error" />
             <Btn className="text-[12px] px-3 py-1" onClick={() => { setBulkModelOpen(false); setBulkModel(''); setBulkModelError('') }}>{i18nT('pages.chatSidebar.cancel')}</Btn>
             <Btn className="text-[12px] px-3 py-1 bg-accent text-accent-fg hover:bg-accent-hover" disabled={!bulkModel || bulkAffectedCount === 0 || bulkModelMutation.isPending} onClick={() => { setBulkModelError(''); bulkModelMutation.mutate({ model: bulkModel, skipRunning: bulkSkipRunning }) }}>{bulkModelMutation.isPending ? i18nT('pages.chatSidebar.switching') : i18nT('pages.chatSidebar.switch_session', { count: bulkAffectedCount })}</Btn>
           </div>
@@ -7973,6 +8095,7 @@ function ChatSidebar({
           <DndContext sensors={dndSensors} collisionDetection={sidebarCollision}
             measuring={dndMeasuring}
             onDragStart={handleSidebarDragStart} onDragEnd={handleSidebarDragEnd} onDragCancel={handleSidebarDragCancel}>
+            <DndActiveProbe report={reportDndActive} />
             {chatDropTarget && onDropSessionRef && activeDrag?.type === 'session'
               && createPortal(
                 <ChatPaneDropZone refusal={draggingRefRefusal} />,
@@ -8058,6 +8181,7 @@ function ChatSidebar({
             <DndContext sensors={dndSensors} collisionDetection={sidebarCollision}
               measuring={dndMeasuring}
               onDragStart={handleSidebarDragStart} onDragOver={handleSidebarDragOver} onDragEnd={handleSidebarDragEnd} onDragCancel={handleSidebarDragCancel}>
+              <DndActiveProbe report={reportDndActive} />
               {/* "Drag a session into the open chat" target. Portaled into
                *  ChatPage's pane so it covers the WHOLE conversation area (not
                *  just the composer), while staying inside this DndContext —
@@ -8403,6 +8527,7 @@ function ChatSidebar({
                            *  body portal per column for nothing. */}
                           {!flatView && (
                           <DndContext sensors={dndSensors} collisionDetection={sidebarCollision} measuring={{ droppable: { strategy: MeasuringStrategy.Always } }} onDragStart={handleSidebarDragStart} onDragEnd={handleSidebarDragEnd} onDragCancel={handleSidebarDragCancel}>
+                            <DndActiveProbe report={reportDndActive} />
                             <SortableContext items={relevantFolders.map(f => f.id)} strategy={verticalListSortingStrategy}>
                               {relevantFolders.map(f => <SortableColumnFolder key={f.id} folder={f} columnId={col.id} colSlotKeys={colSlotKeys} subtree={[...(folderSubtrees.get(f.id) ?? collectFolderSubtreeIds(folders, f.id))]} renderColumnFolder={renderColumnFolder} />)}
                             </SortableContext>

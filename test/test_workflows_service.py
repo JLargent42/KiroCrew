@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -111,6 +112,31 @@ class BlockingSourceStore:
         self.deleted.append(run_id)
 
 
+# A hang guard, not the assertion: ``_await_store_entry`` settles on causality
+# and this only turns a lost run into a failed test, well under pytest-timeout.
+_HANG_GUARD_SECS = 30.0
+
+
+async def _await_store_entry(store: BlockingSourceStore, task: asyncio.Task) -> None:
+    """Wait until the store's source-bearing save has begun blocking a worker.
+
+    ``begin_host_run`` reaches that save only after the run-id allocator's
+    fsync chain and scope admission, all off-loop; on a loaded Windows runner
+    that alone can outlast a fixed wall-clock budget. Waiting on the causal
+    signal keeps every assertion that follows (off-loop thread, responsive
+    loop, cancellation cleanup) exactly as strong while removing the clock.
+    If ``task`` settles first, its own failure surfaces; a clean settle without
+    the save is a deterministic failure.
+    """
+    give_up_at = time.monotonic() + _HANG_GUARD_SECS
+    while not store.started.is_set():
+        if task.done():
+            task.result()
+            raise AssertionError("the task settled before its source-bearing save began")
+        assert time.monotonic() < give_up_at, "the source-bearing save never began"
+        await asyncio.sleep(0.005)
+
+
 def _patch_stream(monkeypatch, replies: list[str]) -> dict:
     """Patch stream_and_collect to return successive canned replies."""
     state = {"i": 0}
@@ -176,6 +202,10 @@ async def test_author_uses_isolated_destroyed_lite_session(monkeypatch) -> None:
         provider.is_process_alive = lambda: True
         provider.context_usage_pct = lambda: 0.0
         provider.has_active_turn = lambda: False
+        # The identity reclaim after a turn calls the inner client's sync
+        # ``reclaim``; as an AsyncMock child it would return an un-awaited
+        # coroutine.
+        provider.client.reclaim = lambda: None
         provider.cwd = ""
         providers.append(provider)
         agents.append(agent or "")
@@ -768,7 +798,7 @@ async def test_host_source_persistence_runs_off_event_loop() -> None:
 
     update = asyncio.create_task(svc.set_source(run_id, source, source_format="task-plan"))
     try:
-        assert await asyncio.to_thread(store.started.wait, 1)
+        await _await_store_entry(store, update)
         await asyncio.sleep(0)
         assert update.done() is False
         assert store.save_thread_id != loop_thread_id
@@ -795,7 +825,7 @@ async def test_host_registration_persistence_runs_off_event_loop() -> None:
         )
     )
     try:
-        assert await asyncio.to_thread(store.started.wait, 1)
+        await _await_store_entry(store, registration)
         await asyncio.sleep(0)
         assert registration.done() is False
         assert store.save_thread_id != loop_thread_id
@@ -819,7 +849,7 @@ async def test_cancelled_host_registration_removes_the_partial_run() -> None:
             driver="taskrunner",
         )
     )
-    assert await asyncio.to_thread(store.started.wait, 1)
+    await _await_store_entry(store, registration)
 
     registration.cancel()
     store.release.set()
@@ -828,6 +858,25 @@ async def test_cancelled_host_registration_removes_the_partial_run() -> None:
 
     assert svc.list_runs() == []
     assert store.deleted == ["wf_000001"]
+
+
+async def test_store_entry_barrier_is_causal_not_wall_clock() -> None:
+    store = BlockingSourceStore()
+
+    async def fail_before_saving() -> None:
+        raise RuntimeError("registration failed before the store")
+
+    with pytest.raises(RuntimeError, match="before the store"):
+        await _await_store_entry(store, asyncio.create_task(fail_before_saving()))
+    with pytest.raises(AssertionError, match="settled before its source-bearing save"):
+        await _await_store_entry(store, asyncio.create_task(asyncio.sleep(0)))
+
+    started = asyncio.create_task(asyncio.sleep(3600))
+    try:
+        store.started.set()
+        await _await_store_entry(store, started)  # returns on the signal alone
+    finally:
+        started.cancel()
 
 
 async def test_host_rebind_persistence_runs_off_event_loop() -> None:
@@ -849,7 +898,7 @@ async def test_host_rebind_persistence_runs_off_event_loop() -> None:
 
     checkpoint = asyncio.create_task(svc.rebind(run_id, driver_task, task_id="task_rebind"))
     try:
-        assert await asyncio.to_thread(store.started.wait, 1)
+        await _await_store_entry(store, checkpoint)
         await asyncio.sleep(0)
         assert checkpoint.done() is False
         assert store.save_thread_id != loop_thread_id
@@ -1059,17 +1108,20 @@ async def test_start_definition_loads_saved_source_off_the_event_loop(
 async def test_start_launches_run_and_injects_on_done(monkeypatch) -> None:
     _patch_stream(monkeypatch, ["stub"])  # the workflow's ctx.agent uses this
     done: list[dict] = []
-    svc = WorkflowService(
-        sessions=FakeSessions([]),
-        on_done=lambda rid, snap: done.append({"rid": rid, **snap}),
-    )
+    notified = asyncio.Event()
+
+    def on_done(rid, snap):
+        done.append({"rid": rid, **snap})
+        notified.set()
+
+    svc = WorkflowService(sessions=FakeSessions([]), on_done=on_done)
     out = await svc.start(GOOD_SCRIPT, name="demo", session_key="slot:main")
     assert "run_id" in out
     snap = await _wait_terminal(svc, out["run_id"])
     assert snap["status"] == "finished"
     assert snap["result"] == {"ok": True}
-    # M6.4: on_done carried the originating session so the result routes to chat
-    await asyncio.sleep(0.02)
+    # Terminal state precedes the durable flush and result-to-chat callback.
+    await asyncio.wait_for(notified.wait(), timeout=3.0)
     assert done and done[0]["session_key"] == "slot:main"
 
 

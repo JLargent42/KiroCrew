@@ -36,6 +36,8 @@ produces exactly those silent failures, which is why the helper is named per cal
 | macOS sandbox file-read permission | `process_can_read_under_sandbox(pid, trusted_absolute_path)`; queries Seatbelt without opening the file, checks incarnation before and after, and returns `None` on unknown | treating all sandboxed processes as either private or Global; a query error as a grant |
 | Loopback TCP caller PID | `get_tcp_peer_pid(sockname[:2], peername[:2])`; unique ESTABLISHED reverse IPv4/IPv6 tuple, failure is unknown. Linux maps the kernel socket inode to process FDs; macOS uses trusted system lsof; Windows uses the owner-PID table. Offload this probe; prefer Unix peer credentials where available. | HTTP headers, a listener's PID, or matching only a port |
 | Match process cmdline | `process_matches(pid, needles)` | `/proc/<pid>/cmdline` / `ps` |
+| Read Linux process name | `linux_process_name(pid)`; exact kernel `comm`, `None` off Linux or on an unreadable/empty value. Fixture tests may pass `proc_root=`. | reading `/proc/<pid>/comm` outside the compatibility layer |
+| Compare process cgroups | `process_cgroups_match(pid, reference_pid)`; compares stable unified cgroup v2 membership and returns `None` off Linux, on cgroup v1, on unreadable/changing membership, or when identity is otherwise inconclusive. Fixture tests may pass `proc_root=`. | comparing one `/proc/<pid>/cgroup` read without stability rechecks |
 | Process start time (PID-reuse guard) | `process_start_time(pid)` | `/proc/<pid>/stat` / `ps -o lstart=` (both answer `None` on Windows, so the guard silently never confirms) |
 | Is this pid a PROCESS rather than a thread | `is_thread_group_leader(pid)` for one pid; `live_thread_group_leaders()` once for a whole sweep | `pid_exists(pid)` alone (Linux numbers threads from the pid space and POSIX permits signalling a tid, so a pid recycled as a THREAD of an unrelated process reads as alive forever). Both answer `None`, never `False`, when unknowable — treat `None` as "retain", never as licence to act |
 | Signals | `platform_compat.SIGKILL` / `SIGTERM` | `signal.SIGKILL` (undefined on Windows) |
@@ -52,6 +54,7 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Confirm a Linux readonly filesystem | `is_readonly_filesystem(path)`; false for other platforms or probe failure. Used to reject a private-runtime diagnostic marker planted in the writable host home. | `os.statvfs` in a cross-platform consumer, or readonly file mode alone |
 | Directory link | `symlink_or_junction(target, link)` | `os.symlink` (`WinError 1314` without elevation) |
 | Detect/remove a dir link | `is_link_or_junction(path)` / `unlink_link_or_junction(path)` | `path.is_symlink()` (misses a Windows junction) |
+| Compare a resolved path against an unresolved one | `strip_extended_length_prefix(path)` on BOTH sides before comparing | comparing the two spellings as `Path.resolve` returns them (on Windows `ntpath.realpath` keeps the extended-length prefix when its prefix-strip re-check races a concurrent swap of the same file, so a prefixed child against an unprefixed parent reads as a path escape; the fold is LEXICAL and must not re-resolve, which would bless the redirect the caller is testing for) |
 | Hold a directory in place while a child writes into it by path | `pin_directory(path)` (then `os.close`) | `os.open(dir, O_RDONLY)` (EACCES on Windows, and even where it opens it follows a link planted at the name) |
 | Process RSS (live) / peak RSS / CPU | `proc_rss_bytes()` / `proc_peak_rss_bytes()` / `proc_cpu_seconds()` | `resource.getrusage` (`ru_maxrss` is a high-water mark, never a live reading, and its unit is KiB on Linux but bytes on macOS) |
 | Available host memory | `host_available_mib()` (0 = unknown, never 0 = no memory) | `/proc/meminfo` directly (Linux-only, so the bound built on it silently vanishes on macOS and Windows) |
@@ -75,23 +78,31 @@ no model load or inference.
 An open Windows process handle pins its process object and prevents PID reuse even
 through exit; reuse is possible only after exit and the last handle closes
 ([Windows process-object lifetime](https://devblogs.microsoft.com/oldnewthing/20110107-00/?p=11803)).
-`windows.stop` retains root/descendant handles through every scan and closes them
-only in its outer `finally`, so excluding retained PIDs cannot hide a replacement.
+Exact-handle tree discovery retains root/descendant handles through its scans;
+retained PIDs cannot hide a replacement while their handles remain open.
 Host-effect tests must attempt authoritative teardown in `finally`; OS refusal or
 incomplete identity proof must fail loudly and preserve isolated HOME/service
 evidence, never certify zero residue or invoke an unsafe duplicate cleanup authority.
 Service-free, newly owned precondition cleanup is a separate case.
 
-A missing live root is not a completed drain. Before `/End`, `windows.stop`
-refuses when it cannot anchor a live root and finds a PID record (including
-malformed/unreadable/dead/reused identities), wrapper, result, handoff marker,
-HOME, or registered task. State observed before settling is retained as evidence
-if the supervisor clears it while stop waits. A settled handoff does not prove
-its descendants stopped; a handoff observed after the original tree drain also
-blocks deletion, even if its marker disappears while waiting. Only a plane with
-no prior runtime evidence can take the unanchored, never-started no-op path.
-These refusals preserve records, task, and HOME; they do not infer descendant
-death from root death or grant termination authority over a recycled PID.
+`windows.stop` requires a boot-contained Job descriptor or a generation-bound
+kernel-zero receipt. The CLI reserves the run before scheduling; the supervisor
+claims it under a separate short lock, assigns the initial child while suspended,
+and atomically publishes its exact identities before resume. A legacy PID record,
+marker, HOME or task without that protocol refuses reclamation.
+
+Before `/End`, stop opens the existing Job and pins its publisher and available
+initial process by exact identity. Access/query failures never mean death. After
+retiring the publisher it requires a successful Job zero-count query and persists
+a receipt. A publisher may also publish that receipt as its final action after
+draining, with no further child creation or resume. Receipt consumers still retire
+the publisher before cleanup. The receipt survives task-deletion, sidecar-deletion
+or HOME-cleanup failure. Authoritative teardown must delete the handoff marker,
+PID record and result sidecar successfully before consuming the receipt after the
+full seven-sweep HOME cleanup. A retry uses the same generation's receipt even if
+the Job has disappeared; supervisor-side diagnostic cleanup remains best-effort.
+This covers unobserved restart branches without reconstructing dead intermediaries;
+marker/PID record removal and polling history do not authorize reclamation.
 
 `descendant_termination_handles` checks every first-snapshot edge against exact
 handle creation/exit times, then rechecks identity and lifetime bounds after a
@@ -131,12 +142,46 @@ before it was ever observed/pinned remains unverifiable; a single numeric snapsh
 is not enough to recover that chain. The deterministic and self-owned native
 regressions are in `test/test_platform_compat.py`, `TestProcessDescendants`.
 
+## Pod lifetime Job primitives
+
+`pod._windows_job.PodJob` owns pod-specific named Windows Job handles. Creation
+uses a unique global name and an owner-only protected DACL, so the scheduler and
+CLI can run in different Windows sessions; opening an
+existing job never creates one. Assignment borrows the caller's original process
+handle and requires a never-resumed `CREATE_SUSPENDED` child. Breakaway and
+kill-on-close flags are refused. Membership and accounting errors raise rather
+than reporting absence; termination succeeds only after a bounded kernel zero
+count. Closing a handle does not terminate members. The shared resource-ceiling
+helper and its configuration are unchanged.
+
+The Task Scheduler backend uses these primitives with `pod._windows_run` durable
+run identities and publisher retirement. Job emptiness alone is not reclamation
+authority. Before attempting `/Run`, a failed start may cancel only its exact
+unclaimed reservation under the supervisor's claim lock. The durable `cancelled`
+state refuses admission and survives task/wrapper/result cleanup errors; the next
+`start` retries that cleanup before reserving a new generation. The claim lock
+covers cancellation through receipt deletion. Claimed, malformed or changed-run
+records and unexpected HOME/PID/handoff evidence refuse rollback. A failed or
+raised `/Run` never grants cancellation, even if no publisher has claimed yet.
+If cancellation itself cannot be persisted, the ordinary reservation remains
+unresolved rather than being inferred safe on a later invocation.
+Native tests exercise owner-only access, descendant containment,
+nested resource jobs and breakaway refusal; injected failures run on all hosts.
+
 ## Verifying a change
 
 CI holds all three platforms at the UNIT layer: the `backend-test` shards cover
 Linux, `backend-test-windows` covers Windows, and `backend-test-macos` covers
 macOS. All three run the whole suite, so a POSIX call that only works on Linux
-goes red on the macOS shards rather than shipping. A shard passing is still not
+goes red on the macOS shards rather than shipping — but the macOS shards are
+NIGHTLY (`platform-tests.yml`, called by `nightly.yml`), not per-pull-request: a
+`macos-15` runner took 176-213 minutes to arrive on the PR path, which is ~64% of a
+pull request's CI wall clock, and the queue sat on the required check. So a
+POSIX-but-not-Linux regression is caught within a day and before any nightly bytes
+are published, rather than before merge. In front of a pull request there is
+`macos-on-demand.yml` (the same full suite, called against the PR head, advisory;
+runs on a darwin-sensitive path, on the `ci:macos` label, or on a 1-in-20 SHA sample) and the static side of
+this table. A shard passing is still not
 evidence that a gateway starts: 25 whole files are excluded on Windows by
 `test/windows-collect-ignore.txt` and further node ids by
 `test/windows-expected-failures.txt` and `test/macos-expected-failures.txt`.

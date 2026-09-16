@@ -65,6 +65,7 @@ from kiro_crew.hooks import (
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
     fire_tool_hooks,
+    hook_gate_kwargs,
     identity_grant_covers_child,
 )
 from kiro_crew.llm_helpers import (
@@ -1395,6 +1396,7 @@ class SubagentInfo:
     # startup watchdog measures from THIS timestamp so it never reaps an agent
     # that is merely waiting for approval. None until execution starts.
     _exec_started: float | None = None
+    _first_stream_started: float | None = None
     # Learned-cost high-water marks (dynamic-subagent-sizing.md §4.1), sampled
     # periodically by the reaper loop and folded into the cost store at exit.
     peak_rss_gb: float = 0.0
@@ -2492,6 +2494,9 @@ class SubagentManager:
     def batch_members_pending(self, batch_id: str) -> bool:
         return self._waves.batch_members_pending_impl(batch_id)
 
+    def wave_has_live_nested_spawns(self, batch_id: str) -> bool:
+        return self._waves.wave_has_live_nested_spawns_impl(batch_id)
+
     def finalize_batch(self, batch_id: str) -> None:
         return self._waves.finalize_batch_impl(batch_id)
 
@@ -2757,6 +2762,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     evict_completed_agents,
     extract_options,
     fire_tool_hooks,
+    hook_gate_kwargs,
     identity_grant_covers_child,
     has_dashboard_surface,
     list_orphans,

@@ -11,7 +11,11 @@ resume.
 
 This module also provides Kiro Crew's shared orchestration substrate: run
 identity, lifecycle state, event history, exact source, provenance, cancellation
-binding, and the reusable definition library. Python dynamic workflows are one
+binding, and the reusable definition library. `RunRegistry.has_pending_work_for`
+provides a session-scoped, in-memory execution/terminal-handoff query for
+conversation-completion notifications. A terminal run whose driver has not
+exited still owns its handoff; no event or result snapshot is built for this
+query. Python dynamic workflows are one
 driver of that substrate. TaskRunner is another, stricter product layer: it uses
 the common substrate but keeps its planning, approval, retry, test,
 git/worktree, replan, persistence, and cleanup semantics.
@@ -638,7 +642,10 @@ change the run's store binding or grant a caller access to another member.
 
 `mark_terminal` is idempotent: only the first terminal transition counts. Its async
 counterpart is used by live workflows and host drivers; it drains queued checkpoints,
-flushes the selected outcome, then fires `on_done` (result-to-chat injection).
+flushes the selected outcome, then fires `on_done` (result-to-chat injection). The
+in-memory terminal status is visible before that durable flush and callback complete,
+so tests asserting delivery wait for a callback-owned signal with a bounded timeout
+rather than sleeping after observing terminal status.
 `record_event` fans out to `on_event` (live WS push). Dynamic workflows keep that
 callback synchronous and queue an owned async checkpoint every fifth event; authored
 source publication uses the same queue. The synchronous `ctx.log`/`ctx.phase` contract

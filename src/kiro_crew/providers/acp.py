@@ -26,6 +26,8 @@ from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
@@ -40,7 +42,9 @@ from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_CODEX,
+    PROVIDER_LABEL_DEEPSEEK,
     PROVIDER_LABEL_DEFAULT,
+    PROVIDER_LABEL_GOOSE,
     PROVIDER_LABEL_KAS,
     PROVIDER_LABEL_OPENCODE,
     PROVIDER_LABEL_PI,
@@ -293,6 +297,32 @@ def _read_cli_overlay(work_dir: Path) -> dict[str, str]:
 # to a fresh session + KiroCrew history replay (see _start_kiro_runtime_impl).
 _RESUME_MAX_ATTEMPTS = 4  # total session/load attempts before fresh fallback
 _RESUME_BACKOFF_BASE_S = 1.0  # backoff = base * 2**attempt → 1s, 2s, 4s between attempts
+# Substrings (matched case-insensitively) of a session/load error that name a
+# TRANSIENT native-lock condition — one that clears once the previous holder
+# finishes dying — as opposed to a genuine load failure. Two shapes are known:
+#
+# * "active in another process": the dead holder's lock is still held.
+# * "re-read lock file": kiro-cli creates its per-session lock, then re-reads
+#   it to confirm it won; when the previous holder's exit handler unlinks the
+#   SAME path in that window the load fails with "failed to re-read lock file
+#   ...: No such file or directory". Observed on the dashboard's hard-stop
+#   path, whose eager respawn issues session/load while the killed holder is
+#   still tearing down. Left un-retried this demoted a lossless resume to the
+#   lossy conversation-log replay for the rest of the tab's life.
+#
+# Deliberately the re-read phrase and not a bare "lock file": a permanent lock
+# failure ("failed to open lock file: Permission denied") must still fail fast
+# to the fresh-session fallback rather than spend the backoff budget first.
+_RESUME_TRANSIENT_LOCK_MARKERS: tuple[str, ...] = (
+    "active in another process",
+    "re-read lock file",
+)
+
+
+def _is_transient_resume_lock_error(exc: BaseException) -> bool:
+    """True when *exc* from ``session/load`` names a lock race worth retrying."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _RESUME_TRANSIENT_LOCK_MARKERS)
 
 
 class AcpProvider(LLMProvider):
@@ -533,6 +563,16 @@ class AcpProvider(LLMProvider):
         return self._client.backend == ACP_BACKEND_PI
 
     @property
+    def is_goose_backend(self) -> bool:
+        """True when this ACP provider talks to goose (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_GOOSE
+
+    @property
+    def is_deepseek_backend(self) -> bool:
+        """True when this ACP provider talks to DeepSeek Harness (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_DEEPSEEK
+
+    @property
     def is_kas_backend(self) -> bool:
         """True when this ACP provider talks to KAS (kiro-agent)."""
         return self._client.backend == ACP_BACKEND_KAS
@@ -761,9 +801,15 @@ class AcpProvider(LLMProvider):
     def _owning_channel_id(self) -> str | None:
         """The channel this provider's session belongs to, or ``None``.
 
-        Carried on the claim frame beside the session key so a channel-driven
-        session's forwarded calls keep naming their channel. Read off the
-        placeholder client like :meth:`_owning_session_key`.
+        Two readers. The claim frame carries it beside the session key so a
+        channel-driven session's forwarded calls keep naming their channel; the
+        runtime's session-start paths carry it onto a MIRRORED host's ``mcpServers``
+        elements, which is the only channel a codex stdio server has for it --
+        codex-rs launches one with ``env_clear()`` plus an allowlist.
+
+        Both readers want ``""`` rather than ``None`` from the runtime's side, so the
+        call sites there spell the fallback; this stays ``None`` for the claim frame,
+        whose field is omitted rather than sent empty.
         """
         channel = getattr(self._client, "_channel_id", None)
         return channel if isinstance(channel, str) and channel else None
@@ -798,6 +844,7 @@ class AcpProvider(LLMProvider):
         agent: str | None,
         member_session_key: str = "",
         session_key: str = "",
+        channel_id: str = "",
     ) -> AcpSessionHandle | None:
         """Resume via session/load, retrying past a stale native session lock.
 
@@ -807,8 +854,9 @@ class AcpProvider(LLMProvider):
         resume LOSSLESSLY (full native history). Outcomes:
 
         * load succeeds            → return the handle (fast path: no sleep).
-        * "active in another        → retry up to ``_RESUME_MAX_ATTEMPTS`` with
-          process" lock held         backoff; return the handle if it clears.
+        * transient lock error     → retry up to ``_RESUME_MAX_ATTEMPTS`` with
+          (see _RESUME_TRANSIENT_     backoff; return the handle if it clears.
+          LOCK_MARKERS)
         * lock never clears        → return ``None`` (caller falls back to a
                                        fresh session + history replay — Phase 2).
         * any OTHER load error     → return ``None`` immediately (retrying a
@@ -824,6 +872,7 @@ class AcpProvider(LLMProvider):
                     agent=agent or None,
                     member_session_key=member_session_key,
                     session_key=session_key,
+                    channel_id=channel_id,
                 )
                 if attempt:
                     logger.info(
@@ -835,7 +884,7 @@ class AcpProvider(LLMProvider):
                     )
                 return handle
             except Exception as exc:
-                if "active in another process" not in str(exc).lower():
+                if not _is_transient_resume_lock_error(exc):
                     # Genuine load failure — will not clear with time.
                     logger.warning(
                         "Failed to resume session %s, starting fresh",
@@ -852,9 +901,9 @@ class AcpProvider(LLMProvider):
                 if attempt + 1 < _RESUME_MAX_ATTEMPTS:
                     backoff = _RESUME_BACKOFF_BASE_S * (2**attempt)
                     logger.info(
-                        "Resume of kiro session %s refused (lock active in "
-                        "another process); retry %d/%d in %.1fs",
+                        "Resume of kiro session %s refused (%s); retry %d/%d in %.1fs",
                         resume_sid,
+                        str(exc).strip() or type(exc).__name__,
                         attempt + 1,
                         _RESUME_MAX_ATTEMPTS,
                         backoff,
@@ -863,10 +912,11 @@ class AcpProvider(LLMProvider):
         # Exhausted every attempt on a persistent lock. Loud, grep-able marker;
         # the caller migrates to a fresh session with KiroCrew history replay.
         logger.warning(
-            "Resume of kiro session %s failed after %d attempts (lock still "
-            "active in another process — a stale lock from an uncleanly-killed "
-            "holder, or a rare same-gateway session-key alias miss); migrating "
-            "to a fresh session with KiroCrew history replay",
+            "Resume of kiro session %s failed after %d attempts (native lock "
+            "still unavailable — a stale lock from an uncleanly-killed holder, a "
+            "lock-file race with a holder still tearing down, or a rare "
+            "same-gateway session-key alias miss); migrating to a fresh session "
+            "with Kiro Crew history replay",
             resume_sid,
             _RESUME_MAX_ATTEMPTS,
         )
@@ -1024,6 +1074,7 @@ class AcpProvider(LLMProvider):
                             agent,
                             member_session_key=self._member_session_key(),
                             session_key=self._owning_session_key(),
+                            channel_id=self._owning_channel_id() or "",
                         )
                     finally:
                         phases["session_load"] = (time.monotonic() - _t_load) * 1000.0
@@ -1082,6 +1133,7 @@ class AcpProvider(LLMProvider):
                         agent=agent or None,
                         member_session_key=self._member_session_key(),
                         session_key=self._owning_session_key(),
+                        channel_id=self._owning_channel_id() or "",
                     )
                 except AcpRuntimeError as exc:
                     if runtime.saw_not_logged_in():
@@ -1615,7 +1667,15 @@ class AcpProvider(LLMProvider):
             tool_input=e.tool_input,
             tool_input_redacted=e.tool_input_redacted,
             tool_output=e.tool_output,
+            tool_output_digest=e.tool_output_digest,
+            tool_output_bytes=e.tool_output_bytes,
             tool_final=e.tool_final,
+            # Forwarded beside `tool_final` because it is NOT derivable from it:
+            # `tool_final` is true only for a completed call, so a consumer that
+            # needs to know a tool FAILED has this field or nothing. Dropping it
+            # here would leave every non-dashboard consumer of the provider
+            # interface unable to tell a failure from a call still in progress.
+            tool_status=e.tool_status,
             usage=e.usage,
             raw_tool_params=e.raw_tool_params,
             # PROVENANCE flags for the child-fidelity gate. Dropping these
@@ -2001,4 +2061,8 @@ def provider_label(provider: Any) -> str:
         return PROVIDER_LABEL_OPENCODE
     if backend == ACP_BACKEND_PI:
         return PROVIDER_LABEL_PI
+    if backend == ACP_BACKEND_GOOSE:
+        return PROVIDER_LABEL_GOOSE
+    if backend == ACP_BACKEND_DEEPSEEK:
+        return PROVIDER_LABEL_DEEPSEEK
     return PROVIDER_LABEL_DEFAULT

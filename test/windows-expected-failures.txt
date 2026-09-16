@@ -59,7 +59,6 @@ test/test_cli.py::TestInstallPidfdChildWatcher::test_installs_safe_watcher_on_ma
 test/test_cli.py::TestInstallPidfdChildWatcher::test_sets_watcher_on_linux
 test/test_cli.py::TestRestart::test_spawn_detached_gateway_uses_kirocrew_bin
 test/test_cli.py::TestSetupWorkspaceDir::test_uses_saved_path_as_default
-test/test_config_paths.py::TestConfigDir::test_kirocrew_home_system_dir_is_ignored
 test/test_config_paths.py::TestDefaultWorkspaceBase::test_macos_uses_volumes_when_present
 test/test_cpp_wiring_enterprise.py::test_launcher_script_hides_sso
 test/test_cron_cancel.py::TestSubprocessRegistry::test_run_command_sandboxed_can_be_cancelled_mid_run
@@ -136,7 +135,6 @@ test/test_pod.py::TestUpVerb::test_up_happy_path_json
 test/test_process_tree.py::TestDirectChildren::test_proc_children_parsed
 test/test_prompts.py::TestApiPrompts::test_detail_unreadable
 test/test_prompts.py::TestExpandPromptMention::test_unreadable_file
-test/test_push_branch_gate.py::TestGitPushEnforcement::test_redos_safe_on_pathological_input
 test/test_refresh_tokens.py::test_tr_u_17_persistence_file_mode_0600
 test/test_review_fixes.py::TestEnvPermissions::test_env_permissions_enforced
 test/test_review_fixes.py::TestLoaderChmodWarning::test_chmod_enforced_on_open_permissions

@@ -32,6 +32,8 @@ from enum import Enum
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
@@ -40,6 +42,7 @@ from kiro_crew.acp_backends import (
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
 from kiro_crew.providers.mirrors.codex import CodexMirror
+from kiro_crew.providers.mirrors.goose import GooseMirror
 from kiro_crew.providers.mirrors.opencode import OpenCodeMirror
 
 
@@ -65,6 +68,17 @@ class ProjectionKind(str, Enum):
     #: kind under which a session legitimately holds none of Crew's tools, and the
     #: only one that has to name what would have to exist for that to change.
     NO_CHANNEL = "no-channel"
+    #: The shared MCP broker reaches this backend on a transport it advertises, and
+    #: no spec projection is written for it. So the session holds Crew's POOLED
+    #: tools -- the stubs ``_pooled_mcp_servers`` appends for a backend outside
+    #: :data:`MIRRORS` -- and not the servers its own agent spec declares.
+    #:
+    #: Distinct from ``no-channel`` because the difference is observable in a
+    #: session: there the array carries nothing Crew put in it, here it carries the
+    #: broker. And distinct from ``mirror`` because the spec's own servers and its
+    #: per-tool deny set do not travel. Not a finished state, so it names its
+    #: ``tracking`` like the two kinds above.
+    BROKER_ONLY = "broker-only"
 
 
 class PerToolDeny(str, Enum):
@@ -140,6 +154,11 @@ class McpProjection:
     def __post_init__(self) -> None:
         if not self.reason.strip():
             raise ValueError("an McpProjection needs a reason")
+        if self.kind is ProjectionKind.BROKER_ONLY and not self.tracking.strip():
+            raise ValueError(
+                "a broker-only projection must name its tracking issue or doc anchor "
+                "for the spec projection it still lacks"
+            )
         if self.kind is ProjectionKind.NO_CHANNEL:
             if not self.channel.strip():
                 raise ValueError(
@@ -180,6 +199,7 @@ MIRRORS: dict[str, type[AgentConfigMirror]] = {
     ACP_BACKEND_CLAUDE: ClaudeCodeMirror,
     ACP_BACKEND_CODEX: CodexMirror,
     ACP_BACKEND_OPENCODE: OpenCodeMirror,
+    ACP_BACKEND_GOOSE: GooseMirror,
 }
 
 #: Every backend this build can spell, and how its MCP surface is reached.
@@ -287,6 +307,59 @@ PROJECTIONS: dict[str, McpProjection] = {
             "change does this by loading a bridge extension into pi), or an extension "
             "of Crew's that bridges MCP the way the gate extension bridges permissions "
             "-- the one channel this harness is shown to read today"
+        ),
+        tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
+    ),
+    ACP_BACKEND_GOOSE: McpProjection(
+        kind=ProjectionKind.MIRROR,
+        reason="goose.py -- the second single-binary spec harness to carry a session "
+        "array, and the entry that shows what a MEASURED channel claim costs versus an "
+        "inferred one. Its initialize advertises mcpCapabilities of http and sse with no "
+        "stdio flag, the same reading that once had opencode declared no-channel, and it "
+        "is the same non-evidence: ACP's McpCapabilities schema has exactly two boolean "
+        "fields and no stdio field, so a conforming agent cannot advertise stdio. Rather "
+        "than infer either way this was driven end to end against goose 1.50.1: the "
+        "element acp.session_mcp.acp_server_element already emits is accepted, and the "
+        "named stdio child is asked initialize, notifications/initialized, tools/list AND "
+        "tools/call by goose itself, with the tool's own result arriving on "
+        "tool_call_update -- so the transport is mounted, the tools are enumerated and the "
+        "tool is REACHABLE, which is the claim pi's entry above cannot make. Crew writes "
+        "no goose MCP config: the only other thing it supplies is GOOSE_MODE in the "
+        "child's environment, carrying the permission mode and nothing else. One hazard "
+        "rides along and it is the inverse of opencode's whole-session strictness: an "
+        "element whose command cannot start is DROPPED rather than failing session/new, so "
+        "an unstartable pooled broker stub costs no session and leaves a healthy-looking "
+        "one carrying none of Crew's tools",
+        # WHOLE-SERVER as a CONSERVATIVE choice, which is the one way this differs from
+        # opencode's identical verdict. goose puts the pair on the wire, as
+        # _meta.goose.toolCall.toolName and extensionName on the tool_call frame, and Crew
+        # reads it -- the identity table in acp._dispatch carries a row for that channel,
+        # so the per-call deny path does match a denied pair here. The half still missing
+        # is the projection side: no per-tool form mounts a narrowed server with its denied
+        # tools filtered out of the array, the way codex's does. Withholding the server
+        # whole, Crew's own control plane included, is the direction that cannot leave a
+        # switched-off tool reachable while that is true. Follow-up: a per-tool projection
+        # for this harness, after which the verdict is TRANSLATED per tool.
+        per_tool_deny=PerToolDeny.WHOLE_SERVER,
+    ),
+    ACP_BACKEND_DEEPSEEK: McpProjection(
+        kind=ProjectionKind.BROKER_ONLY,
+        reason=(
+            "deepseek accepts stdio entries in the session/new mcpServers array, which "
+            "is why it IS in ACP_BACKENDS_SESSION_MCP_ARRAY and why it is not a "
+            "no-channel: the broker stubs _pooled_mcp_servers appends for a backend "
+            "outside MIRRORS are shaped as stdio elements "
+            "(mcp_gateway.session_servers._acp_server_entry emits command/args/env) and "
+            "that is the shape this harness mounts. Captured end to end rather than "
+            "inferred: test/fixtures/acp_frames/deepseek/mcp-stdio-mount-live.jsonl sends "
+            "one such element pointing at a real stdio MCP server, session/new returns a "
+            "sessionId, the server is asked initialize/tools/list/tools/call, and the "
+            "turn carries the resulting tool_call and its result. So a deepseek session "
+            "holds Crew's pooled tools, and holds them reachably. What it does not hold "
+            "is the servers its own agent spec declares, or the spec's per-tool deny "
+            "set, because no mirror translates them. One hazard rides along, in "
+            "mcp-stdio-rollback-live.jsonl: an element whose command cannot start fails "
+            "the WHOLE session rather than being dropped"
         ),
         tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
     ),

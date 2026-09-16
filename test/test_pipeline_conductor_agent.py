@@ -17,7 +17,8 @@ from pathlib import Path
 
 from skill_script_helpers import load_skill_script
 
-from kiro_crew import agent
+from conftest import make_dir_link
+from kiro_crew import agent, platform_compat
 from kiro_crew.agent_files import (
     OWNED_KIRO_AGENT_FILES,
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
@@ -71,11 +72,11 @@ class TestPipelineConductorInstaller:
         missing from that allowlist silently rots when Playwright servers move."""
         assert PIPELINE_CONDUCTOR_AGENT_FILENAME in OWNED_KIRO_AGENT_FILES
 
-    def test_prompt_carries_the_verbosity_placeholder(self, tmp_path, monkeypatch):
-        """Custom agents get their OWN prompt, so the token must appear here or
-        the user's verbosity setting silently never reaches this agent."""
+    def test_prompt_does_not_carry_the_retired_verbosity_token(self, tmp_path, monkeypatch):
         data = self._install(tmp_path, monkeypatch)
-        assert "{{VERBOSITY_BLOCK}}" in data["prompt"]
+        # Reply style now arrives as session-context chrome for every
+        # agent; a token left here would reach the model as a literal.
+        assert "{{VERBOSITY_BLOCK}}" not in data["prompt"]
 
     def test_prompt_drives_patrol_with_monitor_start_not_wait(self, tmp_path, monkeypatch):
         data = self._install(tmp_path, monkeypatch)
@@ -1721,8 +1722,9 @@ class TestFleetProbe:
     # ── 2d: cwd-scoped banned scan ────────────────────────────────────────────
 
     def _proc(self, tmp_path: Path, pid: str, argv: bytes, cwd: Path | None) -> Path:
-        """One fake ``/proc/<pid>``. ``cwd`` is written as a SYMLINK because that
-        is what the kernel exposes and what the probe reads.
+        """One fake ``/proc/<pid>``. ``cwd`` is written as a reparse link (a
+        junction on Windows) because that is what the kernel exposes and what
+        the probe reads.
 
         A ``stat`` file is always written: every live process on a real system
         has one, and the probe reads its ``starttime`` (field 22) as the process
@@ -1740,7 +1742,7 @@ class TestFleetProbe:
         (proc / pid / "stat").write_text(f"{pid} (proc) R " + " ".join(stat_tail) + "\n", "ascii")
         if cwd is not None:
             cwd.mkdir(parents=True, exist_ok=True)
-            os.symlink(str(cwd), str(proc / pid / "cwd"))
+            make_dir_link(proc / pid / "cwd", cwd)
         return proc
 
     def test_a_banned_match_outside_the_fleet_is_foreign_not_banned(
@@ -2055,8 +2057,8 @@ class TestFleetProbe:
         for target in (Path(os.sep), store.parent):
             link = tmp_path / f"link-{abs(hash(str(target))) % 1000}"
             if link.is_symlink() or link.exists():
-                link.unlink()
-            os.symlink(str(target), str(link))
+                platform_compat.unlink_link_or_junction(link)
+            make_dir_link(link, target)
             cfg.write_text(
                 json.dumps({"sessions": [], "fleet_worktrees": [str(link)]}), encoding="utf-8"
             )
@@ -2349,7 +2351,7 @@ class TestFleetProbe:
         real = tmp_path / "real-fleet" / "wt-a"
         real.mkdir(parents=True)
         link = tmp_path / "via-link"
-        os.symlink(str(tmp_path / "real-fleet"), str(link))
+        make_dir_link(link, tmp_path / "real-fleet")
         # The process reports the REAL path; the config names the symlinked one.
         proc = self._proc(tmp_path, "5100", b"pytest\x00test/x.py\x00", real)
         cfg = self._config(tmp_path, monkeypatch, [], fleet_worktrees=[str(link / "wt-a")])
