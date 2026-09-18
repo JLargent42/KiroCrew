@@ -21,6 +21,7 @@ from kiro_crew.acp.kas_agents import (
     KAS_MAX_CUSTOM_AGENTS,
     KasAgentTranslationError,
     build_kas_custom_agents,
+    hoist_managed_servers,
     load_agent_spec,
     resolve_prompt,
     to_client_custom_agent,
@@ -696,6 +697,174 @@ class TestRuntimeSuppliesTheStubbedSet:
     """
 
     @staticmethod
+    def _overlay_with_a_stub(root: Path, agent: str) -> Path:
+        """A user-level overlay holding one broker stub for *agent*."""
+        from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
+
+        overlay = root / "overlay"
+        overlay.mkdir(parents=True, exist_ok=True)
+        (overlay / f"{agent}.json").write_text(
+            json.dumps(
+                {
+                    "name": agent,
+                    "mcpServers": {
+                        "pooled": {
+                            _WRAPPER_MARKER: True,
+                            "command": "/stub",
+                            "args": ["--target-command=user-level-cmd"],
+                            "env": {},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return overlay
+
+    def test_a_checkout_does_not_scope_the_kas_overlay_lookup(self, tmp_path):
+        """KAS projects the USER-LEVEL spec, so its stub set must stay name-keyed.
+
+        ``load_agent_spec`` is handed ``paths.kiro_agents_dir()`` and reads nothing
+        else, so a checkout declaring the same name does not change which agent this
+        session runs. Scoping the lookup here would collapse the set to empty, and
+        the projection would then declare the user-level servers un-subtracted: they
+        would run outside the pool, outside caller-identity attribution and outside
+        broker governance, with the operator believing the gateway applies.
+        """
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        overlay = self._overlay_with_a_stub(tmp_path, "kirocrew")
+        # A checkout that DOES declare the same name, which is the trigger.
+        agents = tmp_path / "checkout" / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "mcpServers": {}}), encoding="utf-8"
+        )
+
+        assert session_servers_mod.injection_server_names(overlay, "kirocrew") == frozenset(
+            {"pooled"}
+        )
+        # And the scoped answer is the one the KAS path must NOT take.
+        assert (
+            session_servers_mod.injection_server_names(
+                overlay, "kirocrew", work_dir=tmp_path / "checkout"
+            )
+            == frozenset()
+        )
+
+    def test_the_scope_decider_answers_none_for_a_user_level_only_host(self):
+        """The injection half of the same rule, read off the seam rather than the name.
+
+        ONE function answers for every caller -- ``AcpClient`` and ``AcpRuntime``
+        alike -- so a host that reads the user level alone joins the set and both
+        paths change together. A second spelling on one path is how the next such
+        host gets mis-scoped, which is the round-1 defect repeated.
+
+        It answers in KEYWORDS because the checkout is only half the scope: which
+        spec FORMATS this session's agent resolution honours is the other half, and
+        a site taking the checkout without that rule would either un-broker a
+        mirrored host's real servers or leave a project markdown agent running the
+        user-level stub's command. Splatting one mapping makes the two inseparable.
+        """
+        from kiro_crew.acp.types import (
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_KAS,
+            ACP_BACKEND_KIRO,
+            overlay_project_scope,
+        )
+
+        # A user-level-only host passes NOTHING, so the lookup keeps its by-name
+        # defaults rather than being handed a checkout to ignore.
+        assert overlay_project_scope(ACP_BACKEND_KAS, "/checkout") == {}
+        # kiro-cli resolves ``--agent`` from the checkout itself and discovers JSON
+        # only, so a project markdown spec is not the agent it runs.
+        assert overlay_project_scope(ACP_BACKEND_KIRO, "/checkout") == {
+            "work_dir": "/checkout",
+            "markdown_specs": False,
+            "dispatchable_only": True,
+        }
+        # A mirrored host's array is composed by Crew from a spec it resolved
+        # itself, and that resolution honours the markdown form.
+        assert overlay_project_scope(ACP_BACKEND_CODEX, "/checkout") == {
+            "work_dir": "/checkout",
+            "markdown_specs": True,
+            "dispatchable_only": False,
+        }
+        # A host with no opinion recorded keeps the checkout rather than silently
+        # losing its project scope, and takes the JSON-only answer: with no mirror
+        # it resolves no project spec through Crew at all.
+        assert overlay_project_scope("some-future-host", "/checkout") == {
+            "work_dir": "/checkout",
+            "markdown_specs": False,
+            "dispatchable_only": True,
+        }
+
+    def test_the_format_half_follows_the_projection_that_consumes_it(self):
+        """Every mirrored host gets ``markdown_specs=True``, read off the registry.
+
+        Hand-listing the mirrored hosts here would go stale the moment one is
+        added, and the failure would be silent: that host's sessions would keep a
+        user-level stub in place for a project markdown agent its own projection
+        honours, mounting that stub's command under the checkout's agent. Deriving
+        the expectation from ``has_mirror`` is what makes a new mirror correct by
+        construction rather than by someone remembering this list.
+        """
+        from kiro_crew.acp.types import (
+            ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
+            overlay_project_scope,
+        )
+        from kiro_crew.agent_sdk import backends as backends_mod
+        from kiro_crew.providers.mirrors.registry import has_mirror
+
+        candidates = {
+            value
+            for name, value in vars(backends_mod).items()
+            if name.startswith("ACP_BACKEND_") and isinstance(value, str)
+        }
+        assert len(candidates) >= 8, f"the enumeration found only {candidates}"
+        mirrored_seen = 0
+        for backend in sorted(candidates):
+            scope = overlay_project_scope(backend, "/checkout")
+            if backend in ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY:
+                assert scope == {}, backend
+                continue
+            assert scope["work_dir"] == "/checkout", backend
+            assert scope["markdown_specs"] == has_mirror(backend), backend
+            # The two keys are facets of ONE question -- which resolver decides this
+            # session's spec -- so a host is never told "both forms" and "must parse".
+            # Crew's projection matches on the filename fallback; kiro-cli does not.
+            assert scope["dispatchable_only"] is not scope["markdown_specs"], backend
+            mirrored_seen += bool(has_mirror(backend))
+        assert mirrored_seen >= 1, "no mirrored backend reached the assertion above"
+
+    @pytest.mark.asyncio
+    async def test_the_harness_still_subtracts_the_stub_under_a_shadowing_checkout(
+        self, monkeypatch, tmp_path
+    ):
+        """The real harness call site, with the real lookup and a real overlay.
+
+        The runtime hands its own work dir down to ``session_extras``, so a checkout
+        that happens to declare this agent's name must not change the answer: KAS
+        runs the user-level agent either way. If the harness scoped the lookup, the
+        set would arrive empty, the projection would declare the user-level servers
+        un-subtracted, and they would run un-brokered.
+        """
+        overlay = self._overlay_with_a_stub(tmp_path, "kirocrew")
+        checkout = tmp_path / "checkout"
+        agents = checkout / ".kiro" / "agents"
+        agents.mkdir(parents=True)
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "mcpServers": {}}), encoding="utf-8"
+        )
+        seen: list[frozenset] = []
+        rt = self._runtime(monkeypatch, str(overlay), seen)
+        rt._work_dir = checkout
+
+        await rt._kas_custom_agents("kirocrew")
+
+        assert seen == [frozenset({"pooled"})]
+
+    @staticmethod
     def _runtime(monkeypatch, overlay, seen):
         from kiro_crew.acp import runtime as runtime_mod
 
@@ -715,12 +884,37 @@ class TestRuntimeSuppliesTheStubbedSet:
             kas_agents_mod, "load_agent_spec", lambda _dir, agent: {"name": agent, "prompt": "p"}
         )
 
-        def _capture(_dir, agent, _spec, *, stub_server_names=frozenset(), member_dispatch=False):
+        def _capture(
+            _dir,
+            agent,
+            _spec,
+            *,
+            stub_server_names=frozenset(),
+            member_dispatch=False,
+            session_key="",
+        ):
             seen.append(stub_server_names)
             return [{"id": agent}]
 
         monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _capture)
         return rt
+
+    @pytest.mark.asyncio
+    async def test_runtime_carries_each_callers_identity_through_the_harness(self, monkeypatch):
+        rt = self._runtime(monkeypatch, None, [])
+        import kiro_crew.acp.kas_agents as kas_agents_mod
+
+        seen = []
+
+        def capture(directory, agent, spec, *, stub_server_names, member_dispatch, session_key):
+            seen.append((session_key, member_dispatch))
+            return [{"id": agent}]
+
+        monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", capture)
+        await rt._kas_custom_agents("worker", session_key="subagent:first")
+        await rt._kas_custom_agents("worker", session_key="subagent:second")
+        await rt._kas_custom_agents("worker")
+        assert seen == [("subagent:first", False), ("subagent:second", False), ("", False)]
 
     @pytest.mark.asyncio
     async def test_the_overlay_set_is_forwarded(self, monkeypatch):
@@ -731,7 +925,10 @@ class TestRuntimeSuppliesTheStubbedSet:
         monkeypatch.setattr(
             session_servers_mod,
             "injection_server_names",
-            lambda _o, _a: frozenset({"kirocrew-core"}),
+            # ``**_kw``: the real signature takes the session's checkout as
+            # ``work_dir``, and a double that refuses it sends the caller down its
+            # except branch instead of exercising the forwarding under test.
+            lambda _o, _a, **_kw: frozenset({"kirocrew-core"}),
         )
 
         await rt._kas_custom_agents("kirocrew")
@@ -746,7 +943,7 @@ class TestRuntimeSuppliesTheStubbedSet:
         import kiro_crew.mcp_gateway.session_servers as session_servers_mod
 
         monkeypatch.setattr(
-            session_servers_mod, "injection_server_names", lambda _o, _a: frozenset()
+            session_servers_mod, "injection_server_names", lambda _o, _a, **_kw: frozenset()
         )
 
         await rt._kas_custom_agents("kirocrew")
@@ -761,7 +958,7 @@ class TestRuntimeSuppliesTheStubbedSet:
         seen: list[frozenset] = []
         rt = self._runtime(monkeypatch, "/overlay", seen)
 
-        def _boom(_o, _a):
+        def _boom(_o, _a, **_kw):
             raise OSError("overlay unreadable")
 
         import kiro_crew.mcp_gateway.session_servers as session_servers_mod
@@ -924,3 +1121,197 @@ class TestSpecLookup:
             load_agent_spec(tmp_path, "kirocrew")
 
         assert str(tmp_path / "kirocrew.json") in str(exc.value)
+
+
+class TestNativeManagedMcpIdentity:
+    def test_managed_callback_targets_live_gateway_without_relaying_spec_env(self, monkeypatch):
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "61234")
+        monkeypatch.setenv("KIROCREW_PORT", "5476")
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "kirocrew-core": {
+                        "command": "x",
+                        "env": {
+                            "KIROCREW_HOME": "/h",
+                            "KIROCREW_PORT": "secret-in-editable-spec",
+                            "SECRET_TOKEN": "secret",
+                        },
+                    },
+                    "third-party": {"command": "y"},
+                }
+            ),
+            "p",
+        )
+        assert out["mcpServers"]["kirocrew-core"]["env"] == {
+            "KIROCREW_HOME": "/h",
+            "KIROCREW_PORT": "61234",
+        }
+        assert "env" not in out["mcpServers"]["third-party"]
+        assert "secret" not in json.dumps(out)
+
+    @pytest.mark.parametrize("port", ["", "auto", "secret", "0", "-1", "65536", "１２３"])
+    def test_invalid_bound_port_never_reaches_managed_spec(self, monkeypatch, port):
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", port)
+        out = to_client_custom_agent("a", _spec(), "p")
+        assert "KIROCREW_PORT" not in out["mcpServers"]["kirocrew-core"].get("env", {})
+
+    def test_worker_identity_is_runtime_scoped_without_member_control_tools(self):
+        spec = _spec(
+            tools=["@kirocrew-work"],
+            mcpServers={
+                "kirocrew-work": {
+                    "command": "worker",
+                    "env": {"KIROCREW_SESSION_KEY": "forged-parent"},
+                },
+                "third-party": {"command": "other"},
+            },
+        )
+        worker = to_client_custom_agent("worker", spec, "p", session_key="subagent:abc12345")
+        assert worker["mcpServers"]["kirocrew-work"]["env"] == {
+            "KIROCREW_SESSION_KEY": "subagent:abc12345",
+        }
+        assert "env" not in worker["mcpServers"]["third-party"]
+        assert "kirocrew-dashboard" not in json.dumps(worker)
+        assert "forged-parent" not in json.dumps(worker)
+        unrelated = to_client_custom_agent("worker", spec, "p")
+        assert "env" not in unrelated["mcpServers"]["kirocrew-work"]
+
+
+class TestHoistManagedServers:
+    """Managed declarations travel in the session-level array, restrictions intact.
+
+    Captured released kiro-cli 2.18.0 honours a session-level entry over a
+    same-named global or workspace ``mcp.json`` server on new and load
+    (``bugfix-repair58b-fable/2.18.0-payload-probe.json`` sends this very
+    payload) while an agent-block declaration loses to the global one
+    (``bugfix-repair58-fable/2.18.0-newload-global+agent.json``), and stamps no
+    provenance -- so the array is the one declaration site whose report is
+    positively the session's own.
+    """
+
+    def _projected(self, **servers):
+        spec = _spec(
+            mcpServers={
+                "kirocrew-core": {"command": "kc", "args": ["mcp"], "env": {"SECRET": "s"}},
+                "third-party": {"command": "tp", "env": {"TOKEN": "t"}},
+                **servers,
+            },
+            tools=["@kirocrew-core", "@third-party"],
+            excludedTools=["@kirocrew-core/learn_add"],
+        )
+        return to_client_custom_agent("kirocrew", spec, "p", session_key="subagent:k")
+
+    def test_active_managed_stdio_entry_moves_into_the_array_as_an_acp_element(self):
+        projected = self._projected()
+        before = json.loads(json.dumps(projected))
+        agents, array = hoist_managed_servers([projected], "kirocrew", [])
+        assert projected == before, "the projection is not mutated"
+        assert array == [
+            {
+                "name": "kirocrew-core",
+                "command": "kc",
+                "args": ["mcp"],
+                "env": [{"name": "KIROCREW_SESSION_KEY", "value": "subagent:k"}],
+                "type": "stdio",
+            }
+        ], "the ALREADY projected entry travels: secret withheld, session key kept"
+        assert agents[0]["mcpServers"] == {"third-party": {"command": "tp"}}
+        # Grants are untouched: refs resolve wherever the server is declared.
+        assert agents[0]["tools"] == projected["tools"]
+        assert agents[0]["excludedTools"] == ["@kirocrew-core/learn_add"]
+        assert agents[0].get("permissions") == projected.get("permissions")
+
+    def test_block_key_is_removed_when_nothing_remains(self):
+        spec = _spec(mcpServers={"kirocrew-core": {"command": "kc"}})
+        projected = to_client_custom_agent("kirocrew", spec, "p")
+        agents, array = hoist_managed_servers([projected], "kirocrew", [])
+        assert "mcpServers" not in agents[0]
+        assert [e["name"] for e in array] == ["kirocrew-core"]
+        assert array[0]["env"] == []
+
+    def test_caller_entries_stay_first_and_are_never_duplicated(self):
+        projected = self._projected()
+        member = {
+            "name": "kirocrew-dashboard",
+            "command": "d",
+            "args": [],
+            "env": [],
+            "type": "stdio",
+        }
+        stub = {
+            "name": "kirocrew-core",
+            "command": "broker",
+            "args": [],
+            "env": [],
+            "type": "stdio",
+        }
+        agents, array = hoist_managed_servers([projected], "kirocrew", [member, stub])
+        assert array == [member, stub], "an injected name is authoritative and appears once"
+        assert agents[0] is projected, "nothing hoisted, nothing rewritten"
+
+    def test_inactive_agents_are_left_alone(self):
+        active = self._projected()
+        other = to_client_custom_agent(
+            "other", _spec(mcpServers={"kirocrew-work": {"command": "w"}}), "p"
+        )
+        agents, array = hoist_managed_servers([active, other], "kirocrew", [])
+        assert [e["name"] for e in array] == ["kirocrew-core"]
+        assert agents[1] is other
+        assert other["mcpServers"] == {"kirocrew-work": {"command": "w"}}
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"command": "kc", "disabled": True},
+            {"command": "kc", "disabledTools": ["learn_add"]},
+            {"command": "kc", "timeout": 5},
+            {"command": "kc", "type": "registry"},
+            {"url": "https://example.invalid/mcp"},
+            {"args": ["mcp"]},
+        ],
+        ids=["disabled", "disabledTools", "timeout", "registry", "remote", "no-command"],
+    )
+    def test_a_restricted_or_unrepresentable_entry_keeps_the_block_path(self, entry):
+        projected = to_client_custom_agent(
+            "kirocrew", _spec(mcpServers={"kirocrew-core": entry}), "p"
+        )
+        agents, array = hoist_managed_servers([projected], "kirocrew", [])
+        assert array == []
+        assert agents[0] is projected
+        assert agents[0]["mcpServers"]["kirocrew-core"] == entry
+
+    def test_no_agents_or_no_block_is_a_passthrough(self):
+        array = [{"name": "x"}]
+        assert hoist_managed_servers(None, "kirocrew", array) == (None, array)
+        assert hoist_managed_servers([], "kirocrew", array) == ([], array)
+        bare = {"id": "kirocrew", "prompt": "p", "tools": []}
+        agents, out = hoist_managed_servers([bare], "kirocrew", array)
+        assert agents[0] is bare and out is array
+
+    def test_the_no_payload_path_imports_nothing(self, monkeypatch):
+        # The kiro path (no custom agents) must return before the lazy import of
+        # the agent/config translation module, so a spawn there loads nothing new.
+        import builtins
+        import sys
+
+        monkeypatch.delitem(sys.modules, "kiro_crew.acp.session_mcp", raising=False)
+        real_import = builtins.__import__
+
+        def guarded(name, *args, **kwargs):
+            if name == "kiro_crew.acp.session_mcp":
+                raise AssertionError("session_mcp imported on the no-payload path")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded)
+        assert hoist_managed_servers(None, "kirocrew", []) == (None, [])
+
+    def test_hoisted_elements_are_ordered_by_name(self):
+        spec = _spec(
+            mcpServers={"kirocrew-work": {"command": "w"}, "kirocrew-core": {"command": "c"}},
+            tools=["@kirocrew-core", "@kirocrew-work"],
+        )
+        projected = to_client_custom_agent("kirocrew", spec, "p")
+        _, array = hoist_managed_servers([projected], "kirocrew", [])
+        assert [e["name"] for e in array] == ["kirocrew-core", "kirocrew-work"]

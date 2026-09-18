@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from functools import cached_property
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 # Event kinds — re-exported from the single source of truth
 from kiro_crew.acp.types import (  # noqa: F401
@@ -31,6 +31,12 @@ from kiro_crew.acp.types import (  # noqa: F401
 from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.essential_delivery import EssentialDelivery
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Type-only: this module's runtime imports are deliberately just acp.types
+    # and constants, and recovery.ladder pulls in mcp_gateway + metrics.
+    from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
+    from kiro_crew.recovery.ladder import InfraError
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
@@ -195,6 +201,21 @@ class LLMProvider(ABC):
         a compaction that cannot succeed.
         """
         return False
+
+    @property
+    def last_infra_error(self) -> InfraError | None:
+        """The L1 verdict on the LAST tool result, or None for "no verdict".
+
+        Declared here so the session layer never has to probe an adapter for the
+        attribute: the default None is the SAFE value, the same rule as
+        ``last_compaction_transient``. A provider that cannot classify tool
+        results gives up the turn exactly as it did before L1 existed.
+
+        Read-only on purpose — the classifying layer (``AcpSessionHandle``) is
+        the sole writer, so no caller can fabricate a verdict to force a tool
+        re-issue.
+        """
+        return None
 
     def context_window_tokens(self) -> int:
         """Return the real served context window in tokens (0 if unknown).
@@ -409,6 +430,21 @@ class LLMProvider(ABC):
         """True when the provider can host multiplexed sub-agent sessions on one
         process. Default False — session sharing is opt-in, never inherited."""
         return False
+
+    @property
+    def tool_search_settings(self) -> "ToolSearchSettings | None":
+        """The operator's MCP Tool Search choice this provider spawned with, or
+        ``None`` when it carries none.
+
+        Read by whoever builds a runtime on this provider's behalf (a companion
+        runtime for a sub-agent) so that runtime is handed the SAME setting the
+        parent's handshake sent, rather than being left to the host's default.
+        Declared here with a safe default rather than probed off the instance
+        (harness-parity H14): a provider that never threaded the setting answers
+        ``None`` and the runtime it seeds stays exactly as before. The ACP
+        provider answers with its resolved ``ToolSearchSettings``.
+        """
+        return None
 
     @property
     def manual_compact_unsupported_backend(self) -> str | None:

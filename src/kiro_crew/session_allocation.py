@@ -96,7 +96,7 @@ class AllocationDeps:
     session_provider_type: Callable[[], Callable[[Any, Any], LLMProvider]]
     unlink_session_queue: Callable[[Any], None]
     unlink_queued_temp_paths: Callable[[dict[str, Any]], None]
-    session_model: Callable[[Any, str | None], str | None]
+    session_model: Callable[[Any, str | None, str | None], str | None]
     load_config: Callable[[], Any]
     resolve_crew_identity: Callable[[Any, str | None, str | None], str]
     load_watchdog_settings: Callable[[str], object]
@@ -248,6 +248,13 @@ def _collect_parent_runtime_kwargs(
         value = getattr(client, attribute, None)
         if value is not None:
             kwargs[key] = value
+    # The MCP Tool Search choice rides the runtime constructor on a wire-settings
+    # host, so a companion runtime built without it would run with the setting
+    # left to the host's default rather than the explicit value the parent sent.
+    # Read off the LLMProvider capability (safe default None), never probed.
+    tool_search = provider.tool_search_settings
+    if tool_search is not None:
+        kwargs["tool_search"] = tool_search
     return kwargs
 
 
@@ -1077,6 +1084,20 @@ class SessionAllocationService:
         session = self._sessions.get(self._owner._fold_key(key))
         return session.agent if session else ""
 
+    def get_agent_selection(self, key: str) -> tuple[str, str]:
+        """Copy the live allocation's selection without reinterpreting its name."""
+        session = self._sessions.get(self._owner._fold_key(key))
+        if session is None:
+            return "template", ""
+        member = getattr(session, "capability_member", None)
+        agent = getattr(session, "agent", None)
+        if not isinstance(member, str) or not isinstance(agent, str):
+            raise ValueError("resume_failed: parent agent selection unavailable")
+        # prepare_runtime captures the member even before capability enrollment.
+        # An empty member means this allocation selected the provider template;
+        # subsequent roster changes must not reinterpret that literal.
+        return ("member", member) if member else ("template", agent)
+
     def set_approval_policy(self, key: str, policy: str) -> None:
         key = self._owner._fold_key(key)
         session = self._sessions.get(key)
@@ -1426,8 +1447,8 @@ class SessionAllocationService:
 
             def resolve_model() -> str | None:
                 cfg = self._deps.load_config() if preparation.revision else owner._cfg
-                selected = preparation.member if preparation.revision else agent
-                return self._deps.session_model(cfg, selected)
+                selected = preparation.member or agent
+                return self._deps.session_model(cfg, selected, claim_crew)
 
             model = await asyncio.to_thread(resolve_model)
 

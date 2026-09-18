@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,10 +32,11 @@ from kiro_crew.agent_discovery import (
     read_agent_spec_strict,
     spec_by_declared_name,
 )
-from kiro_crew.agent_spec_format import agent_spec_candidates
+from kiro_crew.agent_spec_format import agent_spec_candidates, iter_agent_spec_files
 
 # The migration module owns the pre-migration leftover-tab spelling.
 from kiro_crew.channel_transcript_migration import _orphan_target_stem
+from kiro_crew.cloud.login_target import parse_whoami_output
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, cron_owner_matches
 from kiro_crew.dashboard import directive_queue
@@ -115,14 +116,40 @@ async def api_sessions_memory(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
-_health_cache: dict[str, dict] = {}
+_health_cache: dict[str, Any] = {}
 _health_cache_ts: float = 0.0
 _health_lock = LoopBoundLock()
 _HEALTH_REFRESH_SECS = 15
 
 
+def _empty_health_payload() -> dict[str, Any]:
+    """The payload shape when nothing has been computed yet (or the compute failed)."""
+    return {
+        "stalled": {},
+        "slots": {},
+        "waiting": [],
+        "recovering": [],
+        "queued": {"available": False, "count": 0, "oldest_wait_secs": 0.0, "by_state": {}},
+        "effective_caps": {},
+        "degrade_reason": None,
+        "counts": {"running": 0, "queued": 0, "waiting": 0, "recovering": 0, "stalled": 0},
+    }
+
+
 async def api_sessions_health(request: web.Request) -> web.Response:
-    """GET /api/sessions/health — slots flagged as stalled from log scan."""
+    """GET /api/sessions/health — structured session health.
+
+    ``{stalled, slots, waiting, recovering, queued, effective_caps,
+    degrade_reason, counts, ...}`` from task rows + slot state + ACP handle
+    liveness (``dashboard/session_health.py``); the log scan is a secondary
+    evidence source only. ``stalled`` keeps its pre-structured shape
+    (``{slot_key: {reason, since_ts, ...}}``) so an older client still reads it.
+
+    The slot snapshot is taken ON the loop (it walks live slot objects), the
+    classification, store read and log tail run off it. Cached for
+    ``_HEALTH_REFRESH_SECS`` so a busy dashboard cannot turn this into a
+    per-request SQLite + file scan.
+    """
     global _health_cache, _health_cache_ts
     now = time.monotonic()
     if now - _health_cache_ts > _HEALTH_REFRESH_SECS:
@@ -132,12 +159,28 @@ async def api_sessions_health(request: web.Request) -> web.Response:
                 try:
                     from kiro_crew.dashboard import session_health
 
-                    _health_cache = await asyncio.to_thread(session_health.compute_session_health)
+                    # ``request.app`` is a MagicMock in much of the suite: a
+                    # missing ``state`` yields an empty snapshot, and a store that
+                    # is not a real TaskStore fails its first read inside the
+                    # computation and reads as "unavailable" -- never an error.
+                    state = request.app.get("state") if hasattr(request.app, "get") else None
+                    taskq = getattr(getattr(state, "subagents", None), "_taskq", None)
+                    snapshot = session_health.snapshot_state(state)
+                    _health_cache = await asyncio.to_thread(
+                        session_health.compute_session_health,
+                        None,
+                        taskq=taskq,
+                        monitor=None,
+                        snapshot=snapshot,
+                    )
                     _health_cache_ts = time.monotonic()
                 except Exception:
-                    logger.warning("session_health scan failed", exc_info=True)
+                    logger.warning("session_health computation failed", exc_info=True)
                     _health_cache_ts = time.monotonic()
-    return web.json_response({"stalled": _health_cache})
+    payload = _empty_health_payload()
+    if isinstance(_health_cache, dict):
+        payload.update(_health_cache)
+    return web.json_response(payload)
 
 
 _usage_cache: dict[str, object] = {}
@@ -201,12 +244,28 @@ def _text_scrape_enabled() -> bool:
         return False
 
 
-def _log_scrape_disabled_once() -> None:
-    """Announce the skipped scrape exactly once per process."""
+def _log_scrape_disabled_once(signin_required: bool = False) -> None:
+    """Announce the skipped scrape exactly once per process.
+
+    ``signin_required`` swaps the message for the auth-class case, where the
+    default text ("the API returned no credit plan") names a cause that did not
+    happen and points at a knob that cannot help -- see
+    :func:`_unavailable_reason`. Without the swap, an operator reading only the log
+    is told to enable a billed scrape to fix an expired sign-in.
+    """
     global _usage_scrape_disabled_logged
     if _usage_scrape_disabled_logged:
         return
     _usage_scrape_disabled_logged = True
+    if signin_required:
+        logger.info(
+            "Kiro usage: no live Kiro credential could be read, so the credit "
+            "pill stays unavailable. Sign in to Kiro again (for example by "
+            "running kiro-cli login) to restore it. Enabling "
+            "dashboard.usage_text_scrape_enabled will NOT help here -- the "
+            "scrape is a billed kiro-cli chat turn that needs the same sign-in."
+        )
+        return
     logger.info(
         "Kiro usage: the API returned no credit plan and the /usage text scrape "
         "is disabled, so the credit pill stays unavailable. The scrape is a "
@@ -244,6 +303,46 @@ def _record_scrape_outcome(success: bool) -> None:
             _usage_scrape_failures,
             _USAGE_SCRAPE_BACKOFF_SECS,
         )
+
+
+#: Pill ``reason`` for an auth-class usage failure: no live credential could be
+#: read, or the API refuses the one that was. The remedy is a fresh sign-in, and
+#: unlike ``scrape_disabled`` it costs nothing to act on.
+_REASON_SIGNIN_REQUIRED = "signin_required"
+#: Pill ``reason`` for the other case: the API answered about the account and
+#: reported no credit plan, and the billed scrape that could still find one is
+#: opted out.
+_REASON_SCRAPE_DISABLED = "scrape_disabled"
+
+
+def _unavailable_reason(api_result: kiro_usage_api.UsageResult) -> str:
+    """Pick the pill's ``reason`` for a failed read whose scrape will not run.
+
+    ``scrape_disabled`` is only true when the API actually answered ABOUT the
+    account. When the read failed because no live credential was readable, or
+    because the credential was rejected, that message states a cause that did not
+    happen ("the free usage API returned no plan for this account") and prescribes
+    a remedy that spends credits without being able to work: the ``/usage`` scrape
+    is a billed kiro-cli chat turn needing the same sign-in, so every attempt is
+    paid for and fails until ``_record_scrape_outcome`` parks it.
+
+    So an auth-class ``auth_state`` reports ``signin_required`` instead. Anything
+    the API path could not prove was an auth problem keeps the original message --
+    a spurious "sign in again" on a working sign-in would be the same class of
+    defect in the other direction.
+
+    This changes the message only. The scrape decision above is deliberately
+    untouched: an empty candidate list does NOT prove kiro-cli cannot
+    authenticate, because kiro-cli may authenticate from a store this module does
+    not enumerate (see :func:`_identity_matches_account`), so suppressing the
+    scrape here would break hosts where it works today.
+    """
+    if api_result.auth_state in (
+        kiro_usage_api.AUTH_NO_CREDENTIAL,
+        kiro_usage_api.AUTH_REJECTED,
+    ):
+        return _REASON_SIGNIN_REQUIRED
+    return _REASON_SCRAPE_DISABLED
 
 
 def _cache_without_scrape(
@@ -620,10 +719,22 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
     only local source of the account email.
 
     Returns a dict with any of ``email`` / ``account_type`` / ``start_url``, or
-    ``{}`` on any failure — identity is decorative, so it must never break the
-    credit readout. stdout is untrusted: only the LEADING JSON object is parsed
-    (kiro-cli appends a non-JSON "Profile:" block after it), values must be
-    strings, and each is length-bounded before it can reach the cache/UI.
+    ``{}`` on any failure — identity is decorative here, so it must never break
+    the credit readout. A caller that must tell "could not read" apart from
+    "no identity" uses :func:`_fetch_whoami_or_none`.
+    """
+    return (await _fetch_whoami_or_none(kiro_bin)) or {}
+
+
+async def _fetch_whoami_or_none(kiro_bin: str) -> dict[str, object] | None:
+    """Run ``kiro-cli whoami --format json`` and parse it, keeping failure distinct.
+
+    Returns the parsed identity when whoami answered (``{}`` when it exited
+    cleanly reporting none), and ``None`` when nothing is known — it timed out,
+    could not start, or exited nonzero without printing an identity. stdout is
+    untrusted: only the LEADING JSON object is parsed (kiro-cli appends a
+    non-JSON "Profile:" block after it), values must be strings, and each is
+    length-bounded before it can reach the cache/UI.
     """
     proc = None
     cleanup = None
@@ -648,48 +759,28 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=30)
         raw = (out or err or b"").decode(errors="replace")
-        full = raw  # keep the whole output; the ARN lives AFTER the JSON object
-        # Take only the first {...} block; trailing "Profile:\n<name>" is not JSON.
-        depth = 0
-        start = raw.find("{")
-        if start < 0:
-            return {}
-        for i in range(start, len(raw)):
-            if raw[i] == "{":
-                depth += 1
-            elif raw[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    raw = raw[start : i + 1]
-                    break
-        else:
-            return {}
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return {}
-        out_map: dict[str, object] = {}
-        for src, dst, cap in (
-            ("email", "email", 254),
-            ("accountType", "account_type", 60),
-            ("startUrl", "start_url", 200),
-        ):
-            v = data.get(src)
-            if isinstance(v, str) and v:
-                out_map[dst] = v[:cap]
+        # The JSON scrape is shared with the cloud launch paths
+        # (cloud/login_target.parse_whoami_output): leading object only, string
+        # values, length-bounded. The ARN lives AFTER the JSON object.
+        out_map: dict[str, object] = dict(parse_whoami_output(raw))
+        if not out_map:
+            # Nonzero without an identity: an expired or broken session, a CLI
+            # fault -- nothing is known. A clean exit with no identity is known.
+            return None if proc.returncode else {}
         # whoami's own profile ARN, printed in the trailing (non-JSON) "Profile:"
         # block. Private (leading underscore): used only to prove this identity
         # belongs to the same account the credit numbers came from, and stripped
         # before anything is cached or served.
-        m = re.search(r"arn:aws:codewhisperer:[^\s\"']+", full)
+        m = re.search(r"arn:aws:codewhisperer:[^\s\"']+", raw)
         if m:
             out_map["_profile_arn"] = m.group(0)[:200]
         return out_map
     except (asyncio.TimeoutError, ValueError, OSError):
         logger.debug("whoami identity fetch failed", exc_info=True)
-        return {}
+        return None
     except Exception:
         logger.debug("whoami identity fetch failed (unexpected)", exc_info=True)
-        return {}
+        return None
     finally:
         if proc is not None and proc.returncode is None:
             try:
@@ -702,6 +793,25 @@ async def _fetch_whoami(kiro_bin: str) -> dict[str, object]:
                 os.remove(cleanup)
             except OSError:
                 pass
+
+
+async def fetch_local_identity() -> dict[str, object] | None:
+    """Return this machine's signed-in Kiro identity, ``{}`` or ``None``.
+
+    The one dashboard-side door to ``kiro-cli whoami``: it resolves the same
+    binary chat spawns and runs :func:`_fetch_whoami_or_none` at the configured
+    sandbox tier. Other handlers (the Remote Crew launch form's identity
+    preselect) call this instead of reaching into the ACP layer themselves, so
+    the agent-backend boundary stays where this module already crosses it.
+    ``{}`` when kiro-cli is absent (non-Kiro provider) or whoami answered with
+    no identity -- this machine has no sign-in to inherit; ``None`` when whoami
+    could not answer -- the identity is unknown, and a caller must not present
+    the default as if it had been read.
+    """
+    kiro_bin = await _resolve_kiro_bin_for_spawn()
+    if not kiro_bin:
+        return {}
+    return await _fetch_whoami_or_none(kiro_bin)
 
 
 def _identity_matches_account(api_arn: object, identity: dict[str, object]) -> bool:
@@ -793,10 +903,13 @@ async def _fetch_usage_bg() -> None:
         # handshake, so they are isolated from the maintenance/cron pools. Fails
         # closed (returns None) so we fall through to the text scrape rather than
         # showing a fabricated number.
-        api_usage = await asyncio.get_running_loop().run_in_executor(
+        api_result = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
             functools.partial(kiro_usage_api.fetch_usage_limits, expected_arn=expected_arn),
         )
+        # ``usage`` is the number; ``auth_state`` is why it is missing when it is,
+        # and is only ever consulted to pick the unavailable message below.
+        api_usage = api_result.usage
         if api_usage and api_usage.get("credits_plan") is not None:
             # API output is untrusted too: redact every string leaf before caching.
             api_usage = {k: _redact_strings(v) for k, v in api_usage.items()}
@@ -828,8 +941,9 @@ async def _fetch_usage_bg() -> None:
         # enough times to look broken. Both checks are before the spawn, so a
         # disabled or parked scrape costs nothing at all.
         if not await asyncio.to_thread(_text_scrape_enabled):
-            _log_scrape_disabled_once()
-            _cache_without_scrape(api_usage, identity, reason="scrape_disabled")
+            reason = _unavailable_reason(api_result)
+            _log_scrape_disabled_once(signin_required=reason == _REASON_SIGNIN_REQUIRED)
+            _cache_without_scrape(api_usage, identity, reason=reason)
             return
         if _scrape_in_backoff():
             _cache_without_scrape(api_usage, identity)
@@ -1641,6 +1755,12 @@ class _HistoryDeleteClaim:
     complete: bool
     slot_task: Any | None = None
     cron_owner_keys: frozenset[str] = frozenset()
+    #: The ACP session id behind *session_key*, read before the teardown that
+    #: destroys the session it names. This is what identifies the session
+    #: LEDGER, whose unit id is the ACP id rather than the slot key, and it is
+    #: captured here for the same reason every other field is: after the
+    #: teardown there is nothing left to ask.
+    acp_session_id: str | None = None
 
 
 def _history_delete_candidate_keys(key: str) -> tuple[str, ...]:
@@ -1699,6 +1819,23 @@ def _capture_history_delete_claim(state: DashboardState, key: str) -> _HistoryDe
                 path_match_verified,
                 False,
             )
+        # Best-effort and read LAST: an unreadable ACP id must not downgrade a
+        # claim the checks above already completed, because every other cleanup
+        # this claim authorizes is more important than collecting one crew log --
+        # which the retention sweep collects anyway once the session is closed.
+        # Type-checked rather than merely truthy: this value goes on to ADDRESS a
+        # directory, so anything that is not a real id must read as absent.
+        try:
+            resumable = state.sessions.resumable_sid(session_key)
+        except Exception:
+            logger.debug(
+                "History delete: ACP session id unreadable for %s; leaving its crew log "
+                "to the retention sweep",
+                session_key,
+                exc_info=True,
+            )
+            resumable = None
+        acp_session_id = resumable if isinstance(resumable, str) and resumable else None
         return _HistoryDeleteClaim(
             candidate_key,
             candidate_slot,
@@ -1708,6 +1845,7 @@ def _capture_history_delete_claim(state: DashboardState, key: str) -> _HistoryDe
             path_match_verified,
             True,
             getattr(candidate_slot, "task", None),
+            acp_session_id=acp_session_id,
         )
     return _HistoryDeleteClaim(None, None, None, None, 0, True, True)
 
@@ -1728,6 +1866,9 @@ def _resolve_history_delete_claim(
             session_key=None,
             path_match_verified=True,
             complete=False,
+            # Travels with ``session_key``: a claim that names no session must not
+            # still name a session's ledger.
+            acp_session_id=None,
         )
     try:
         matches = log._path(key).stem == log._path(claim.history_key).stem
@@ -1744,6 +1885,9 @@ def _resolve_history_delete_claim(
             session_key=None,
             path_match_verified=True,
             complete=False,
+            # Travels with ``session_key``: a claim that names no session must not
+            # still name a session's ledger.
+            acp_session_id=None,
         )
     if matches:
         return replace(claim, path_match_verified=True)
@@ -2170,6 +2314,7 @@ async def _remove_slot_for_history_key(
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
 
+    session_destroyed = False
     if slot and target_session_key is not None:
         try:
             destroyed = await state.sessions.destroy_if(
@@ -2184,6 +2329,7 @@ async def _remove_slot_for_history_key(
                     "a current slot owner; preserving it",
                     target_session_key,
                 )
+            session_destroyed = bool(destroyed)
         except Exception:
             logger.warning(
                 "History delete: conditional session destroy failed for %s",
@@ -2195,6 +2341,69 @@ async def _remove_slot_for_history_key(
     # transcript can be created or restored by another process after any owner
     # scan, so deleting those sidecars cannot be made atomic here. Preserve them:
     # stale state is reversible, while deleting a successor's state is not.
+
+    # The append-only SESSION LEDGER is not one of those sidecars, and the
+    # difference is mechanical rather than a re-reading of the rule above. What
+    # makes a work ledger unsafe to delete here is that its identity is the SLOT
+    # KEY, which is recycled -- a successor tab in the same slot legitimately
+    # inherits and resumes that record, and no check here can prove one is not
+    # about to. A session's log is keyed by the ACP SESSION ID, which never
+    # names a different conversation, so removing it cannot reach a successor's
+    # state.
+    #
+    # Gated on the teardown having SUCCEEDED, not merely on having been
+    # attempted. ``destroy_if`` refuses when the session was replaced by a
+    # successor generation, is busy, or still has a live slot owner -- and in each
+    # of those cases the session it names is preserved and may be writing right
+    # now, so removing its crew log would take a live conversation's log. The write
+    # lease is not a substitute for this check: ownership ends BETWEEN turns by
+    # design, so an idle-but-live session holds nothing for the removal to be
+    # refused by. A refused teardown therefore leaves the crew log alone and the
+    # retention sweep collects it once the session is genuinely closed.
+    #
+    # Only an id this claim PROVED is used -- captured pre-unlink, dropped on every
+    # path that disowned the slot -- so an unresolvable one removes nothing.
+    if session_destroyed and claim.acp_session_id:
+        # A key still mapping to this session id VETOES the removal. The unit is
+        # keyed by the ACP id, so a second key pointing at that id shares this very
+        # crew log, and the teardown above removed only ONE mapping -- the other holder
+        # can still resume, and its log is still needed. Two keys on one sid is a
+        # state the system itself produces: importing a transferred session twice
+        # allocates a new slot key each time and deliberately leaves the source
+        # intact (see dashboard/session_transfer.py). Reading the map to WITHHOLD a
+        # deletion is safe in the way reading it to authorize one is not -- a forged
+        # or emptied map can only make this keep more than it must.
+        try:
+            retained_key = state.sessions.find_key_by_sid(claim.acp_session_id)
+        except Exception:
+            # An unreadable map is not evidence that nothing else maps this id.
+            retained_key = "<unreadable session map>"
+        if retained_key is not None:
+            logger.info(
+                "History delete: session id for %s is still mapped; leaving its crew log "
+                "to retention",
+                key,
+            )
+        else:
+            # Every slot spelling this delete established for itself. The removal
+            # requires the unit's own header to name one of them, because the id
+            # above came from ``session_map.json`` -- inside the agent-visible tree --
+            # while the header is written once inside the fenced crew log tree and
+            # never rewritten. A mapping that named another conversation's session
+            # would aim this removal at that conversation's crew log; its header would
+            # not name this slot. The candidate spellings are included beside the
+            # live slot key so a legacy spelling of the same slot is not read as a
+            # different one.
+            proven_slots = frozenset(
+                spelling
+                for spelling in (
+                    getattr(claim.slot, "key", None),
+                    claim.session_key,
+                    *_history_delete_candidate_keys(key),
+                )
+                if isinstance(spelling, str) and spelling
+            )
+            await asyncio.to_thread(_remove_session_ledger, claim.acp_session_id, key, proven_slots)
 
     # Cron ownership is different from the independent sidecars above: every key
     # here came from the strict store scan or from linked_session_key while the
@@ -2228,6 +2437,104 @@ async def _remove_slot_for_history_key(
                 key,
                 ", ".join(released),
             )
+
+
+#: How long the delete funnel waits for the teardown entry to land before taking
+#: the lease. Short on purpose: the flush is what lets the emitter release this
+#: session's cached handle, and with it the write lease this removal must claim.
+#: A timeout is not a failure -- the entry stays owed, so the unit becomes
+#: collectable by the retention sweep even when this pass is refused.
+_LEDGER_TEARDOWN_FLUSH_SECONDS = 2.0
+
+
+def _remove_session_ledger(
+    session_id: str, history_key: str, proven_slots: "frozenset[str]"
+) -> None:
+    """Remove the append-only crew log of *session_id*. Never raises.
+
+    Imported lazily: this handler module is loaded on every startup while the
+    crew log store is only reachable behind ``KIROCREW_CREW_LOG``, so a
+    launch without the flag should not pay for the import.
+
+    *proven_slots* is every slot spelling this delete established for itself, and
+    the unit's own HEADER has to name one of them. The id alone is not enough,
+    because it arrives from ``session_map.json`` -- a file inside the agent-visible
+    tree -- so a mapping that named another conversation's session would aim this
+    removal at that conversation's ledger. The header is the independent answer: it
+    is written once at creation inside the fenced crew log tree and never rewritten,
+    so it does not move when a mapping does, and a unit belonging to another slot
+    fails the check. Slot recycling does not weaken it, because the id is what
+    selects the unit and the slot only has to prove the unit belonged to the slot
+    being deleted.
+
+    A header that cannot be proved -- unreadable, or carrying no slot, which is the
+    case for a session that never ran on a dashboard slot -- removes NOTHING and
+    leaves the unit to the retention sweep, which collects it on age once its close
+    has landed.
+
+    Best-effort, like every other step of this teardown. The transcript row is
+    already gone by the time this runs, so raising would turn a crew log that could
+    not be collected into a failed delete the user has to retry against a row that
+    is absent -- and the retention sweep collects it on age regardless.
+    ``owned`` is the ordinary answer when a queued write still holds the lease,
+    and it is not an error: that pass simply does nothing.
+    """
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.crew_log.schema import KIND_SESSION
+        from kiro_crew.crew_log.store import REMOVE_REMOVED, remove_unit, unit_header_slot
+
+        # LET THE TEARDOWN ENTRY LAND FIRST, and not as a courtesy: until it does,
+        # this removal cannot succeed at all. ``destroy`` -- the teardown checked
+        # above -- writes ``session/closed`` through the emitter's own thread, and
+        # the emitter releases this session's cached handle, with the write lease
+        # that handle carries, only once that entry lands. A removal claiming the
+        # lease ``sole`` is refused while the handle is held, so without this
+        # barrier the funnel answers ``owned`` for every session the gateway
+        # actually emitted for. Measured directly: a crew log opened through the
+        # emitter answers ``owned``, and ``removed`` only after its close lands.
+        #
+        # A timeout is not a failure and is not treated as one. The entry stays
+        # owed, so the unit becomes collectable by the retention sweep -- which
+        # needs that same close, since a unit whose newest lifecycle entry is not
+        # a close reads as OPEN whatever its age. This pass simply does nothing.
+        crew_log_emit.flush(timeout=_LEDGER_TEARDOWN_FLUSH_SECONDS)
+
+        header_slot = unit_header_slot(KIND_SESSION, session_id)
+        if header_slot is None or header_slot not in proven_slots:
+            logger.info(
+                "History delete: the session's log for %s names slot %r, which this "
+                "delete did not prove; leaving it to retention",
+                history_key,
+                header_slot,
+            )
+            return
+
+        # Accept-all guard, deliberately. The sweep's guard re-reads the crew log
+        # because ITS reason is a property of the file -- an age it sampled outside
+        # the lease. This caller's reason is not in the file at all: the session
+        # this crew log belongs to was destroyed by the teardown above, which is
+        # checked before this runs, and the header check above already proved the
+        # unit is this slot's. Re-reading the age here would answer a question
+        # nobody asked, and a close entry still queued behind the teardown would
+        # make the honest answer "not closed" and skip a crew log whose session is
+        # gone.
+        status = remove_unit(KIND_SESSION, session_id, guard=lambda _dir: True)
+    except Exception:
+        logger.warning(
+            "History delete: could not remove the session's log for %s",
+            history_key,
+            exc_info=True,
+        )
+        return
+    if status == REMOVE_REMOVED:
+        logger.info("History delete: removed the session's log for %s", history_key)
+    else:
+        logger.info(
+            "History delete: the session's log for %s not removed (%s); leaving it to retention",
+            history_key,
+            status,
+        )
 
 
 async def api_sessions_clear(request: web.Request) -> web.Response:
@@ -2841,6 +3148,45 @@ def _service_wait_ping(
         state.push_slots_update()
 
 
+class ManagedToolPolicyUnreadable(Exception):
+    """An agent's spec exists but its ``managedToolPolicy`` cannot be read.
+
+    Distinct from "this agent has no policy": an operator may have written an
+    exclusion that is unreadable from here, so the two must not share one
+    answer on the wire. A caller that cannot tell them apart has to treat an
+    unreadable deny as no deny, which silently widens it.
+    """
+
+
+def _refuse_if_any_spec_is_unreadable(agents_dir: Path, agent_name: str) -> None:
+    """Raise when a spec in *agents_dir* cannot be read, so "no match" is honest.
+
+    :func:`spec_by_declared_name` resolves an agent by parsing every spec and
+    comparing its declared ``name``. Its reader folds each refusal into "not a
+    usable spec", which a scan for a name cannot tell apart from "a spec for
+    someone else" -- so an unparseable file leaves the scan reporting no match
+    when the policy it was looking for may be inside that very file.
+
+    A file's declared name cannot be recovered without reading it, and its
+    filename does not have to carry it, so there is no sound way to narrow this
+    to "specs that could be *agent_name*". The honest answer while any spec is
+    unreadable is that this agent's policy is unknown. Fixing or removing the
+    file clears it, and the refusal is audited by the caller.
+
+    Uses :func:`read_agent_spec_strict`, the reader that keeps the failure class,
+    for exactly the reason its docstring gives: this caller needs to know WHY.
+    """
+    for path in iter_agent_spec_files(agents_dir):
+        try:
+            read_agent_spec_strict(path, operation="session_tool_policy", source="dashboard")
+        except (OSError, ValueError) as exc:
+            raise ManagedToolPolicyUnreadable(
+                f"a spec in the agents directory could not be read "
+                f"({exc.__class__.__name__}), so the policy for {agent_name!r} is "
+                f"unknown: it may be the file that declares it"
+            ) from exc
+
+
 def _read_managed_tool_policy_sync(agents_dir: Path, agent_name: str) -> dict[str, Any] | None:
     """Read one agent's ``managedToolPolicy`` from disk. Blocking.
 
@@ -2862,11 +3208,15 @@ def _read_managed_tool_policy_sync(agents_dir: Path, agent_name: str) -> dict[st
     a user-writable directory, so it goes through the hardened reader,
     labelled ``session_tool_policy`` / ``dashboard``.
 
-    ``None`` means "no policy to report", and is deliberately distinct from an
-    empty dict. The caller answers ``{}`` for both, but only a dict is an agent
-    whose config was read and understood, which is what its SEL ``ok`` record
-    attests -- an unreadable or malformed file is not an agent with no policy.
-    Collapsing the two would start logging success for files this never parsed.
+    ``None`` means "this agent has no policy to report" -- no spec file, or a
+    spec that declares none. The caller answers ``{}`` for it, without a SEL
+    ``ok`` record when nothing was parsed.
+
+    Raises :class:`ManagedToolPolicyUnreadable` when a spec EXISTS but its
+    policy cannot be determined (unparseable, valid JSON that is not an object,
+    or a ``managedToolPolicy`` of the wrong shape). That is not "no policy": the
+    operator may have written an exclusion this cannot see, so the caller must
+    not answer it with the same empty body a policy-free agent gets.
 
     Propagates :class:`kiro_crew.agent_discovery.AmbiguousAgentSpecError` when
     two specs declare *agent_name*: that is not "no policy" either, and the
@@ -2882,6 +3232,16 @@ def _read_managed_tool_policy_sync(agents_dir: Path, agent_name: str) -> dict[st
             # ``kas_agents.load_agent_spec``).
             present = [p for p in agent_spec_candidates(agents_dir, agent_name) if p.is_file()]
             if not present:
+                # No spec matched by declared name and none by filename. That is
+                # "no policy" only if every spec in the directory was READABLE:
+                # the scan above resolves a name by parsing each file, and its
+                # reader folds a refusal into "no match", so an unparseable spec
+                # is indistinguishable from one declaring a different name. A
+                # package-installed agent is namespaced on disk
+                # (``<package>-<name>.json``) and has no bare filename
+                # candidate, so the scan is the ONLY thing that could have found
+                # its policy -- and a file this cannot read may be exactly it.
+                _refuse_if_any_spec_is_unreadable(agents_dir, agent_name)
                 return None
             # The hardened reader: the agents directory is user-writable, so
             # a symlink here is not followed to a sensitive target.
@@ -2892,15 +3252,27 @@ def _read_managed_tool_policy_sync(agents_dir: Path, agent_name: str) -> dict[st
         # A ``ValueError`` subclass, so it is named BEFORE the parse-failure arm
         # below or it would be swallowed as "no policy" instead of propagating.
         raise
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as exc:
+        # The file is there and could not be read or parsed. Whatever exclusions
+        # it declares are unknown, so this is reported as unknown.
+        raise ManagedToolPolicyUnreadable(
+            f"agent spec for {agent_name!r} could not be read: {exc.__class__.__name__}"
+        ) from exc
     if not isinstance(config, dict):
         # Valid JSON that is not an object (a list, a scalar, null) parses
         # fine, but `.get` on it would raise. It is a malformed spec, so it
         # takes the same disposition as the unparseable case above.
-        return None
+        raise ManagedToolPolicyUnreadable(
+            f"agent spec for {agent_name!r} is valid JSON but not an object"
+        )
     policy = config.get("managedToolPolicy", {})
-    return policy if isinstance(policy, dict) else None
+    if isinstance(policy, dict):
+        return policy
+    # A policy of the wrong shape is a policy this cannot read, not an absent
+    # one: the operator wrote something here and its meaning is unknown.
+    raise ManagedToolPolicyUnreadable(
+        f"managedToolPolicy for {agent_name!r} is {type(policy).__name__}, not an object"
+    )
 
 
 async def api_session_tool_policy(request: web.Request) -> web.Response:
@@ -2985,8 +3357,8 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
         )
     except AmbiguousAgentSpecError as exc:
         # Two specs declare this agent's name. The policy is undefined, not
-        # empty, so the empty answer the caller fails open on is recorded as a
-        # denial naming both files rather than passed off as "no policy".
+        # empty, so it is answered with a status the caller cannot mistake for
+        # a policy-free agent, and recorded as a denial naming both files.
         _sel().log_api_access(
             caller=session_key,
             operation="session_tool_policy",
@@ -2995,10 +3367,38 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
             resources=f"agent={agent_name}",
             error=str(exc),
         )
-        return web.json_response({})
+        return web.json_response(
+            {
+                "error": f"The policy for agent {agent_name!r} could not be determined.",
+                "code": "policy_unreadable",
+                "reason": str(exc),
+            },
+            status=409,
+        )
+    except ManagedToolPolicyUnreadable as exc:
+        # The spec is present and its policy could not be determined. Answering
+        # {} here would be byte-identical to an agent that legitimately has no
+        # policy, and the caller would run a tool this cannot prove is allowed.
+        _sel().log_api_access(
+            caller=session_key,
+            operation="session_tool_policy",
+            outcome="denied",
+            source="dashboard",
+            resources=f"agent={agent_name}",
+            error=str(exc),
+        )
+        return web.json_response(
+            {
+                "error": f"The policy for agent {agent_name!r} could not be determined.",
+                "code": "policy_unreadable",
+                "reason": str(exc),
+            },
+            status=409,
+        )
     if policy is None:
-        # Missing, unreadable, malformed, or a non-dict policy: answer the same
-        # empty policy as before and, as before, do not log it as a success.
+        # This agent has no policy: no spec file, or a spec declaring none.
+        # A genuinely absent policy is an empty one, so the answer is unchanged
+        # -- and still not logged as a success, since nothing was parsed.
         return web.json_response({})
 
     _sel().log_api_access(
@@ -3058,7 +3458,25 @@ async def _reset_all_sessions(request: web.Request) -> int:
                         _timeout,
                     )
                     try:
-                        _h._sync_kill_provider(p)
+                        # The kill signals the provider's whole process group and
+                        # then waits out a bounded SIGTERM grace, so it blocks for
+                        # as long as that grace -- never inline on the event loop
+                        # (AUTOSDE: no-blocking-call-on-event-loop), which is what
+                        # every other caller of it already avoids. Awaited so the
+                        # tree is reaped before ``start_pool`` below spawns its
+                        # replacements, and concurrent across the ``gather``, so N
+                        # hung providers cost one grace rather than N in series.
+                        await asyncio.get_running_loop().run_in_executor(
+                            subprocess_executor(), _h._sync_kill_provider, p
+                        )
+                    except RuntimeError:
+                        # The executor is already shut down -- a gateway teardown
+                        # racing this restart. Run the kill on a plain daemon
+                        # thread instead: still off the loop, and far better than
+                        # skipping it, which is what leaks the tree.
+                        threading.Thread(
+                            target=_h._sync_kill_provider, args=(p,), daemon=True
+                        ).start()
                     except Exception:
                         logger.exception("Force-kill fallback also failed for %r", p)
                 except Exception:

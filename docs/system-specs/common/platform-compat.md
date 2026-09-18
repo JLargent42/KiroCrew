@@ -26,11 +26,12 @@ produces exactly those silent failures, which is why the helper is named per cal
 |------|--------------------------|-----|
 | Tail a rotating log | `open_log_file_for_tail(path)` returns a binary read descriptor (caller closes); Windows permits read/write/delete sharing so the writer can rename during a read. Only for log readers, never security pinning. | plain `open` held while a Windows writer rolls over |
 | File lock | `file_lock(fd, exclusive=)` / `acquire_lock`+`release_lock` / `try_acquire_lock` | `fcntl.flock` |
-| Liveness probe | `pid_exists(pid)` / `pid_liveness(pid)` | `os.kill(pid, 0)` (kills on Windows!) |
+| Liveness probe | `pid_exists(pid)` / `pid_liveness(pid)`; `pid_confirmed_absent(pid)` when deletion requires positive absence (Windows access/query errors preserve) | `os.kill(pid, 0)` (kills on Windows!) |
 | Kill a process | `kill_pid(pid, sig)` | `os.kill(pid, sig)` |
 | Kill a tree | `kill_process_tree(pid, sig)` | `os.killpg(os.getpgid(pid), sig)` |
 | Parent PID | `get_ppid(pid)` | `/proc` read / libproc |
-| Session process identity | `get_process_start_id(pid)`; Windows uses query-only creation FILETIME, Linux start ticks, macOS libproc microseconds | caller-supplied PID or a bare PID without its creation identity |
+| Session process identity | `get_process_start_id(pid)`; Windows uses query-only creation FILETIME, Linux start ticks, macOS libproc microseconds with a `sysctl KERN_PROC_PID` fallback for a zombie (libproc refuses one; the kernel's zombie list still carries the same `p_start` instant) | caller-supplied PID or a bare PID without its creation identity |
+| macOS zombie state | `darwin_pid_is_zombie(pid)` (`True` / `False` / `None` unreadable; a pid the kernel does not list reads `True`); `darwin_kinfo_proc(pid)` for the record with its start id; `darwin_pgroup_members(pgid)` lists a process group with each member's zombie flag | `pid_exists` as an exit oracle (a zombie is alive to it); `pgroup_exists` as an empty-group oracle (a retained zombie leader keeps it true); `proc_pidinfo` on a zombie |
 | Linux execution-boundary equality | `process_namespaces_match(pid, reference_pid)`; compares user and mount namespace inodes with incarnation checks; `None` on unreadable or unsupported platforms | absent current ancestry as proof that a process is unconfined |
 | macOS inherited sandbox state | `process_is_sandboxed(pid)`; read-only Seatbelt query with an incarnation check; `None` on errors or other platforms | treating an unavailable query as unsandboxed |
 | macOS sandbox file-read permission | `process_can_read_under_sandbox(pid, trusted_absolute_path)`; queries Seatbelt without opening the file, checks incarnation before and after, and returns `None` on unknown | treating all sandboxed processes as either private or Global; a query error as a grant |
@@ -43,6 +44,7 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Signals | `platform_compat.SIGKILL` / `SIGTERM` | `signal.SIGKILL` (undefined on Windows) |
 | Spawn isolation | `start_new_session=IS_POSIX` + `creationflags=CREATE_NEW_PROCESS_GROUP` | bare `start_new_session=True` |
 | Wait on a subprocess PIPE with a deadline | a daemon reader thread feeding a `queue.Queue`, consumed with a bounded `get` (`testing/harness.py`'s `_StdoutPump`) | `selectors.DefaultSelector()` on the pipe (select()-based on Windows, which accepts SOCKETS only, so registering a pipe RAISES there) |
+| Re-enter an edition's stable gateway launcher | `reexec_launcher(launcher, args)` after `gateway_restart.resolve_restart_launcher()` validates it; keeps the dispatch pathname, original arguments and UTF-8 environment | resolving the symlink basename away, passing Python `-m` flags to a launcher, or evaluating a shell command |
 | Re-exec the current Python module | `reexec_python_module(module, args)` | `os.execv(sys.executable, [sys.executable, ...])` (breaks when the Windows interpreter path contains spaces) |
 | Replace the current process with another program (a supervised service body) | spawn a child, record its pid + `process_start_time`, and `wait()` on it under `IS_WINDOWS` (see `pod.windows.supervise_gateway`) | `os.execve` (on Windows this SPAWNS and terminates the caller, so the pid changes and the service manager sees the unit exit while the real program keeps running orphaned) |
 | Open an exact Windows process object for later tree discovery/termination | `open_process_termination_handle(pid, expected_token)` validates the opened handle's creation identity before returning it (caller closes with `close_process_handle`); combine with `descendant_termination_handles` so the anchored root and each retained child receive a final post-exit snapshot | opening by PID and checking the token beforehand (PID reuse can occur between those operations) |
@@ -51,6 +53,7 @@ produces exactly those silent failures, which is why the helper is named per cal
 | File mode | `chmod_safe(path, mode)` / `fchmod_safe(fd, mode)` | `os.chmod` / `os.fchmod` (no `os.fchmod` on Windows) |
 | Owner-only secret (fail-loud) | `restrict_to_owner(path)` | `os.chmod(path, 0o600)` under `if IS_POSIX` (silent no-op leaves secrets world-readable) |
 | Owner-only secret directory (fail-loud, inheritable) | `restrict_dir_to_owner(path)`; `make_owner_only_dir(path)` to also create it (its tighten step is best-effort) | `restrict_to_owner(path)` on a directory (its Windows grants carry no `(OI)(CI)`, so files created inside land on the default DACL, not owner-only; its `0o600` also drops the execute bit a directory needs) |
+| Is a path on a NETWORK volume | `path_volume_is_remote(path)` (Windows: the volume ROOT's drive type through `windows_acl.volume_is_remote`, so a UNC path and a mapped drive both read remote, at no SMB round trip; `None` off Windows, where the caller has a mount table — `taskq.store.detect_network_filesystem` is the caller) | reading a failed query, `DRIVE_UNKNOWN` or a non-Windows host as "local" (`windows_acl.volume_is_local` collapses unknown onto `False` on purpose; that is the trust answer, not this one) |
 | Confirm a Linux readonly filesystem | `is_readonly_filesystem(path)`; false for other platforms or probe failure. Used to reject a private-runtime diagnostic marker planted in the writable host home. | `os.statvfs` in a cross-platform consumer, or readonly file mode alone |
 | Directory link | `symlink_or_junction(target, link)` | `os.symlink` (`WinError 1314` without elevation) |
 | Detect/remove a dir link | `is_link_or_junction(path)` / `unlink_link_or_junction(path)` | `path.is_symlink()` (misses a Windows junction) |
@@ -169,6 +172,12 @@ Native tests exercise owner-only access, descendant containment,
 nested resource jobs and breakaway refusal; injected failures run on all hosts.
 
 ## Verifying a change
+
+`rename_noreplace` uses the Linux libc wrapper when available. On older glibc
+without that symbol, it uses the same kernel operation through `syscall` with
+an architecture-specific number. Unknown architectures remain unsupported,
+and an occupied destination still refuses atomically. The fallback does not
+replace the operation with a check-then-rename sequence.
 
 CI holds all three platforms at the UNIT layer: the `backend-test` shards cover
 Linux, `backend-test-windows` covers Windows, and `backend-test-macos` covers

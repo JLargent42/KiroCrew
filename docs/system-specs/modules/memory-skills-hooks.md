@@ -39,6 +39,13 @@ Unverifiable calls return `403 member_session_unverified`; they never access
 global memory instead. See [security](security.md#overview) for the filesystem
 and caller-proof boundary.
 
+Subagent memory calls require the full `subagent:<run-id>` key's live allocation,
+including the original key reused by a continuation. Dashboard slots, restriction
+markers and retained transcripts cannot answer for a stopped child. The admitted
+protected memory mode must permit the operation. Recognition does not select a
+private store: the protected process/session proof above still supplies that
+authority.
+
 The hidden proof-signing key is staged as 32 owner-only bytes and fsynced before
 atomic publication without replacement. Concurrent creators adopt the first
 valid key. A crash before publication leaves the final name absent; corrupt
@@ -56,12 +63,18 @@ including a member selected by `default_agent`. The UI labels that memory V1.
 The owner can choose Create private memory in Crew Manager, the member's
 Workspace · Memory pane. That explicit choice creates an empty V2 store and
 preserves the V1 source; Copy memories transfers only selected records.
-New members receive V2 automatically. An existing V2 member never becomes V1
+Discovery sync registers ordinary agents with Global V1; it never allocates a
+private store or treats template discovery as owner consent. Repeated sync leaves
+existing Global V1, named V1 and V2 bindings unchanged. A reinstalled package
+agent starts on V1 rather than inheriting its archived private store. Explicit
+member creation still creates V2, and a discovered V1 agent can use the existing
+Create private memory action to opt in.
+An existing V2 member never becomes V1
 because its configuration, manifest, database or protected session record is
 missing or damaged. Such failures require recovery and cannot initialize a
 replacement or silently change the conversation's authority.
 
-Dashboard creation, discovery sync and explicit V1-to-V2 setup, plus CLI creation
+Dashboard member creation and explicit V1-to-V2 setup, plus CLI creation
 and `--provision-memory`, check the member DM's effective backend and OS sandbox
 before allocating private files or publishing its binding. Unsupported execution
 returns an actionable refusal (`409 member_memory_unavailable` on HTTP, exit 1
@@ -79,9 +92,11 @@ member archives that member; it neither pauses discovery of other members nor
 blocks another creation request, so deletion cannot serve this operator policy.
 The owner sets this central policy through the existing typed
 `PATCH /api/config/kirocrew` or configuration
-file. Dashboard create, discovery sync with new members, CLI create and explicit
-V1-to-V2 setup then refuse before allocation and before V1 provider retirement;
-they never substitute a new V1 binding. The next admission reads the current
+file. Dashboard member creation, CLI create and explicit V1-to-V2 setup then
+refuse before allocation and before V1 provider retirement; they never substitute
+a new V1 binding. Ordinary discovery sync remains available even when private
+provisioning is paused or private execution is unsupported, because it creates
+no private store. The next admission reads the current
 configuration, without requiring a gateway restart. A present non-boolean field
 loads as false, while an absent field retains the true default; API writes require
 an actual JSON boolean. Existing V2 execution, management, backup and recovery
@@ -114,8 +129,13 @@ channel transcript cannot mint one; metadata downgrade or reassignment fails
 after restart.
 Session-control creation resolves the effective agent's memory and workspace
 binding off the event loop. Resolution failures return `agent_unverifiable`
-before allocation; the final live-caller authorization still follows all awaited
-preparation.
+before allocation. Creation applies `require_memory_delegation` to the caller's
+canonical history key and the selected store before allocating a slot or pinning
+its identity. Private callers may create only same-store workers; Global callers
+retain member assignment. Unreadable identities and cross-store requests return
+`403 memory_delegation_denied`, without exposing filesystem diagnostics. After
+awaited preparation, creation rechecks the live caller object, history key, agent
+and memory store before allocation; a changed selection refuses the request.
 Async turn admission, vector-store preparation and member consolidation perform
 protected binding reads, store validation, initial SQLite/FAISS construction and
 profile reads in worker threads. Store cache generation and retirement checks
@@ -1252,11 +1272,15 @@ term-overlap one while still printing a plausible F1.
 
 ### Member memory experience and lifecycle
 
-Global Memory is **V1**. New members receive a unique empty **V2** store before
-creation is published. Existing members keep their exact V1 binding until the
+Global Memory is **V1**. Explicit member creation allocates a unique empty **V2**
+store before publication. Automatic discovery registers agents on Global V1.
+Existing members keep their exact V1 binding until the
 owner chooses private memory. Store ownership and algorithm version are recorded
 in config, the protected manifest and the database. Private stores cannot be
-shared or rebound. Choosing V2 preserves the V1 source and imports nothing
+shared or rebound. The one binding that may move is a V1 binding on a name the
+shape rule refuses, and only to `default` or to fresh V2 memory — see
+[config](config.md#named-memory-stores-memory_storespy), `unusable_legacy_binding`.
+Choosing V2 preserves the V1 source and imports nothing
 automatically. Ownership validation is specified in
 [config](config.md#named-memory-stores-memory_storespy).
 
@@ -1388,6 +1412,14 @@ No row is selected automatically. This is selective copying, not V1 migration.
 V1 retains its existing fresh-session context: bounded preferences/projects,
 decayed daily history, semantic and query-ranked episodic memory, plus
 query-ranked project-scoped lessons. Warm follow-ups do not repeat that recall.
+One five-second prompt-build deadline covers V1 semantic, episodic and lesson
+query embeddings in the shared model queue. Expiry removes queued work; each
+retrieval path falls back to its existing lexical score and stable ordering, so
+saved context is still injected. A native inference already claimed by the
+single model worker is not interruptible and may finish before the build
+returns. Sharing one budget bounds queue amplification from concurrent
+first-turn builds; the whole synchronous `ContextBuilder.build_message` call
+remains off the event loop in the bounded `mc-embed` pool.
 V2 context includes essential preference/project anchors and query-free,
 project-scoped lessons. V2 prompt construction performs no embedding search or
 episodic/semantic retrieval. Its runtime tells the agent to call `memory_recall`
@@ -1745,12 +1777,20 @@ returns its persisted receipt without another edit.
 ### Supersession retirement, and why it is bounded
 
 `_retire_stale_episodic` dispatches by algorithm version. Global V1 retains its
-original similarity/exact-phrase heuristic, including its original audit values
-and absence of a retirement count cap. The bounds below apply to private V2.
-An unchanged V2 semantic value does not trigger retirement.
+original similarity/exact-phrase heuristic and its original audit values; the
+heuristic decides WHICH episodes a write may retire. Two bounds are shared by
+both versions: the per-write ceiling below, and the trigger itself -- an
+unchanged semantic value (value-level JSON equality) retires nothing on either
+algorithm, because the episodes it would retire restate the still-current
+value. On V1 the ceiling is ONE budget across the vector arm and the text
+fallback, spent by the vector arm first (its `limit=50` pool is a search width,
+not a retirement width), and the fallback's `LIMIT` fetches only what the
+remaining budget can retire. The remaining bounds below apply to private V2.
 
 Three bounds make it acceptable, and each is pinned by
-[`test/test_episodic_retirement.py`](../../../test/test_episodic_retirement.py):
+[`test/test_episodic_retirement.py`](../../../test/test_episodic_retirement.py)
+(V2) and the V1 cases in
+[`test/test_member_memory_algorithm.py`](../../../test/test_member_memory_algorithm.py):
 
 - **An assertion linked to the full semantic key.** A candidate clause must
   start with the full key and its value assignment, for example `pref.color:
@@ -1760,7 +1800,8 @@ Three bounds make it acceptable, and each is pinned by
   ignores case and JSON quotes; word boundaries keep `redwood` from matching
   `red`. Negation, historical markers and uncertain paraphrases stay active.
   This conservative rule does not call an embedding model.
-- **A per-write ceiling**, `_MAX_EPISODIC_RETIRED_PER_WRITE` = 3. A candidate beyond the
+- **A per-write ceiling**, `_MAX_EPISODIC_RETIRED_PER_WRITE` = 3, on both versions. A
+  candidate beyond the
   cap stays **alive**: a stale episode is outranked by the newer semantic row that
   contradicts it, while a wrongly retired one is invisible to every reader, so the
   overflow direction is "keep" and the cap drops the DELETE rather than deferring it.
@@ -1789,7 +1830,9 @@ operator can undo a retirement in a SILO — the store where a wrong retirement 
 visible, because nothing else reads that file. `kirocrew memory retired` has no
 `--store` and runs on the default store alone: it opens `_memory_cmd`'s shared store,
 which is hardwired to the default path, so the two surfaces have deliberately different
-reach and the CLI is not the recovery path for a silo.
+reach and the CLI is not the recovery path for a silo. `memory export` and
+`memory import` are the exception, and the only one: they take `--store`, reach a silo,
+and resolve their own path rather than reading the one the shared open composes.
 
 ### Automatic backups (`memory_backup.py`)
 
@@ -1915,8 +1958,10 @@ no new restore intent and leaves any existing journal and live memory intact.
 
 Memory is the only data here that cannot be rebuilt from another source: config can be
 retyped and sessions replayed, but a superseded preference nobody remembers stating is
-gone. Active member V2 stores get a daily rotating hot copy. Global and named V1
-stores are copied only when the owner requests a manual backup. The heartbeat schedules its
+gone. Every active store gets a daily rotating hot copy: the default store first, then
+declared named V1 stores and actively owned member V2 stores. The default store is
+never left to a manual copy, because it is the one every install has and typically
+the largest. The heartbeat schedules its
 first pass at the first eligible tick after memory readiness, then uses its
 existing daily tick cadence and per-store freshness checks. One tracked task
 runs the serial copy pass in `maintenance_executor`; a tick never waits for a
@@ -1944,12 +1989,13 @@ self-contained file with no WAL to pair.
 - **Retention**: `memory.backup_keep` (default 7), clamped to at least 1. A retention
   policy that can empty the directory is a scheduled deletion, not retention.
   The loader preserves this value and `memory.backup_enabled` (default true)
-  across reload/save, so disabling automatic V2 backups or extending recovery
-  retention survives a gateway restart. Automatic retention never visits V1.
+  across reload/save, so disabling automatic backups or extending recovery
+  retention survives a gateway restart. Automatic retention prunes only the
+  backup directory of the store it just copied and never touches archived stores.
   Manual dashboard backups use the same configured retention in their worker.
-- **Enumeration**: the heartbeat passes `private_only=True` and visits only
-  actively owned V2 stores. The explicit all-store backup helper retains Global,
-  declared named V1 stores and active V2 stores. Neither uses a glob of `memory_stores/`: a glob
+- **Enumeration**: the heartbeat and the `kirocrew memory backup` command share one
+  helper that visits the default store, declared named V1 stores and actively owned
+  V2 stores. Neither uses a glob of `memory_stores/`: a glob
   would adopt an abandoned or restored directory the operator never declared and then
   copy it forever. Each resolved path is confirmed to belong to the store that asked for
   it, independently of strict binding resolution.
@@ -2015,6 +2061,15 @@ in the only situation it is for. `carve` dispatches ahead of it too, for the oth
 verb can need to: it opens the store NAMED on the command line, and the shared open is
 hardwired to the default store's path.
 
+**A named store's path is admitted by `_admitted_store_path`, and every new call site
+must take it.** The cause of silent recreation is `VectorMemoryStore.init`, which creates
+whatever path it is handed, so a guard at one caller protects that caller alone. Any
+component that opens a store by name — a future CLI verb, a route, a worker — is its own
+recreation hole until it resolves through `_admitted_store_path(store, cfg, may_create=)`,
+whose `may_create=False` is the read contract: a name whose database is absent raises
+rather than bringing one into being. Moving the must-exist check into the store open or
+the resolver, so the guarantee holds for callers that forget, is tracked in #11777.
+
 ### V1 fading: three independent decay mechanisms
 
 These mechanisms apply only to V1. V2 retains full history and episodic content
@@ -2054,6 +2109,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - **Bounded llama.cpp scratch memory**: the accepted context and logical batch remain 2,048 tokens, while the physical decode micro-batch (`n_ubatch`) is 512. llama.cpp splits a long input across those physical batches before applying last-token pooling, so the complete context still contributes to one vector. Against the shipped Qwen model, a maximum 6,000-character input produced byte-identical 1,024-dimensional vectors at 512 and 2,048 (`cosine=1.0`, max absolute difference `0.0`); 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` as a memory shortcut: either would reduce the semantic input the model can accept.
 - Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Before loading the bundled Linux x86_64 runtime, `_load_llama_class()` intersects the `flags` reported for every visible processor in `/proc/cpuinfo` and requires the baseline compiled into the shipped upstream wheel (AVX, AVX2, BMI2, F16C, FMA, SSE3, SSSE3). A missing or unreadable feature list refuses the native runtime before it can raise an uncatchable SIGILL; memory stays available through keyword search. The gate does not apply to an operator-set `LLAMA_CPP_LIB_PATH`, because that directory may contain a lower-baseline build. Unsupported platforms, incompatible bundled CPUs, and import failures all degrade to keyword-only memory search. See `_vendor/README.md`
 - **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel — which the desktop bundle inherits, since it pip-installs the project into its bundled interpreter), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
+- **The artifact verifier needs only the Python standard library.** `scripts/verify_vendored_payload.py` reads `_LIBS_DIR_NAME` and `_REQUIRED_VENDORED_LIBS` from the source with `ast.parse` and `ast.literal_eval`. It never imports the embedding runtime or its config dependencies. Both constants must stay literal top-level assignments; a missing or computed declaration fails the gate. Tests run the real script with `python -I -S`, checking complete archives and missing members in the wheel, sdist, or both.
 - Failed model loads (corrupt file, bad native libs) are retried only after a 300s cooldown so a broken state can't spawn a loader thread per embed call
 
 **Embedding backend abstraction** (`EmbeddingBackend` ABC): the public swap seam for future runtimes (Ollama again, remote endpoints, ONNX) and user-defined models. Surface: `model_id`, `dim`, `is_ready()`, `embed()`, `embed_batch()`, `close()`. Consumers (vector memory, knowledge library) depend only on this interface; everything llama.cpp-specific lives in `LlamaCppEmbedder`. Swap flow: `register_embedding_backend(factory)` + `reset_shared_embedder()` replaces the singleton (pass `None` to restore the default). A backend with a different `model_id`/`dim` produces incomparable vectors — the knowledge library's `embed_signature` is derived from `embedding_space_signature` and so folds BOTH in, meaning a swap (including a width change at a constant model id) automatically triggers the sig-gated knowledge re-embed; vector memory re-embeds via `migrate`.
@@ -2676,9 +2732,9 @@ the unconditional gate is the stronger check layered in front of it.
 - `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
 - `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking. `search_episodic` text-searches whenever `query_embedding` is None and does not auto-embed, so the vector section embeds the query in-process, blocking once on the model load (`_SEARCH_MODEL_LOAD_TIMEOUT_SECS`, 120 s) — a one-shot read cannot lean on the gateway's boot re-embed sweep the way a WRITE can. It degrades to keyword matching, naming the reason on **stderr** (stdout shape is unchanged), when the model is not downloaded (a one-shot CLI never kicks the download), when the store's vectors were produced by a different model, or when the model fails to load; and when the semantic pass returns nothing it retries the keyword leg once before reporting "No episodic memories found.", because the vector legs score only rows with a non-NULL embedding and deferred/imported/re-embed-pending rows are keyword-searchable only until the gateway's sweep reaches them
 - `stats` — counts, embedded coverage, FAISS accelerator status, audit event count, and a **`Reads (this process)`** block from `read_counters()` (rows + statements, then the semantic/episodic population-scan tallies). Labelled per-process because the CLI constructs its own store, so the totals describe only what this invocation read; the gateway's totals are the `reads` object on `GET /api/memory/observability`
-- `export` — vector-store collections; `--include-markdown` opts in a `markdown` collection (`preferences`/`projects` entries + per-day `history` list from `MemoryStore.markdown_snapshot()`) without changing the default payload shape
+- `export [--store <name>]` — vector-store collections; `--include-markdown` opts in a `markdown` collection (`preferences`/`projects` entries + per-day `history` list from `MemoryStore.markdown_snapshot()`) without changing the default payload shape. `--store` names one store, and as a READ it is admitted only against a database that already exists: a name with no database is refused rather than answered with an empty payload, and nothing is created. `--include-markdown` together with a named store is refused, because that tree is read through a fence this verb does not carry (`hooks.safe_read_file_bytes_nolink` refuses the `memory_stores/` subtree and answers None, which `_guarded_entry` shapes exactly like a missing file), so the payload would report an empty `content` for a `preferences.md` that is on disk and non-empty. The rows still export on their own
 - `migrate` — one-time markdown → structured migration (preferences.md → semantic, history/*.md → episodic)
-- `import <file>` — restore from JSON export with full validation
+- `import <file> [--store <name>]` — restore from JSON export with full validation. `--store` is the one verb here permitted to CREATE a named store's database, so admission, the destination's version check, the absence check and the removal of a database this run created are one hold of `memory_store_namespace_lock`. When this run creates that file and no row lands, the file is removed and the refusal says the store still has no database; when the run is interrupted, nothing is deleted and the file is named, since rows may have been committed before the abort
 - `kirocrew security audit` also scans vector memory for injection patterns
 
 ### Keyword search over the markdown layer
@@ -2983,7 +3039,7 @@ remain durable.
 
 **Migration**: `migrate_from_markdown()` reads `lessons.jsonl` and writes each entry as `lesson.*` semantic key with `source=migration, confidence=0.9`. User-explicit lessons (confidence 1.0) can't be overwritten by migration.
 
-Categories: `tool`, `preference`, `knowledge`. Injected as a `[Learned corrections]` block. V1 session context retains query-ranked, project-scoped lessons; V2 selects bounded, project-scoped lessons without a query embedding. Explicit lesson readers can use hybrid relevance and fill the caller's character budget, reporting shown and omitted counts; the JSONL path caps at `_MAX_LESSONS_IN_CONTEXT = 50`. The JSONL store retains `_MAX_LESSONS_TOTAL = 200` and prunes oldest-first beyond that.
+Categories: `tool`, `preference`, `knowledge`. Injected as a `[Learned corrections]` block. V1 session context retains query-ranked, project-scoped lessons; V2 selects bounded, project-scoped lessons without a query embedding. Explicit lesson readers can use hybrid relevance and fill the caller's character budget, reporting shown and omitted counts; the JSONL path caps at `_MAX_LESSONS_IN_CONTEXT = 50`. The JSONL store retains `_MAX_LESSONS_TOTAL = 200` and prunes oldest-first beyond that. The listing surface is bounded too — `GET /api/lessons` returns one `limit`/`offset` window and carries `total` and `truncated` so `learn_list` can say `Showing N of M`; `VectorMemoryStore.get_lessons(limit, offset)` honours the offset only on the bounded read, and the unbounded read the scorers use ignores it. Contract: [learn-cron-dashboard](learn-cron-dashboard.md).
 
 Vector scoring builds one scorer per query (`_stored_similarity_scorer`) so the query vector and its norm are derived once instead of once per lesson — the same hoisting `_sqlite_vector_search` does for episodic rows. There is a numpy path and a stdlib fallback, because numpy is guarded by `_HAS_NUMPY`; both produce the same ranking. Stored lesson vectors are un-normalized (unlike episodic vectors, which are L2-normalized for FAISS inner-product scoring), so both norms are divided out per row rather than assuming unit length. A row whose vector has a different dimensionality than the query — a row written under a previous embedding model — is incomparable and scores 0.0, matching `_sqlite_vector_search` and `HybridRetriever._cosine_similarity`, rather than being truncated against the query's leading elements.
 
@@ -3190,7 +3246,11 @@ consolidator's constructor:
   the resolved binding is not the default store.** ABSENCE means global, so a default
   user's metadata line stays byte-identical and a session carrying no such key is
   unambiguously global rather than "global as of whenever it was saved". The birth dict is
-  the only record for a session that is created and then sits idle.
+  the only transcript record for a session that is created and then sits idle.
+  For a private V2 member, authorized creation also pins the protected session
+  assignment before writing that dict. This keeps an empty newborn transcript
+  from being mistaken for unverified V1 history on its first turn or after restart.
+  A pre-existing unverified transcript or native session still refuses creation.
 - `memory_store` is in `history.SLOT_OWNED_META_KEYS`, so current slot metadata
   owns its presence or absence instead of carrying a stale historical value
   forward. Private member bindings themselves are immutable.
@@ -3647,12 +3707,22 @@ comprehension over the assembled rows, and an end-to-end test drives two agents 
 real endpoint in both orders to keep that true rather than merely currently-true — a join that
 ever shared the FILTERED result would fail whichever agent asked second.
 
+The `kirocrew-dev` family is repository-maintainer guidance, not user-project
+advice. Its `kirocrew-codebase-refactor` skill owns repository-scale structural
+campaigns: hotspot baselines, coherent module ownership, non-overlapping worker
+waves, behavior-equivalence evidence, stale-work recovery, and landed structural
+metrics. It delegates isolated implementation, test authoring, PR delivery, and
+monitoring to `kirocrew-worktree-dev`, `writing-tests`, `prepare-pr`, and
+`babysit` respectively, so those contracts remain single-owned.
+
 The bundled `kirocrew-dev/babysit` skill is an on-demand, pointer-on-trigger recipe.
 Its explicit trigger vocabulary covers babysit/watch/monitor phrasing for pull
 requests, so ordinary requests reach the recipe without placing the whole body in
 every prompt. The base prompt points long-lived pull-request readiness requests to
 this skill and prefers the structured path whenever typed provider facts fully
-determine the objective.
+determine the objective; `monitoring.prefer_structured_arming` decides whether the
+tool descriptions state that as a condition to satisfy or as the default for a
+supported pull request.
 For a supported GitHub, GitLab, Azure DevOps, or Bitbucket Cloud pull request
 with the `review_ready` objective it maps the canonical URL to one exact bounded
 `monitor_watch` call and makes retained inspection state authoritative; its
@@ -3796,6 +3866,15 @@ the message against each skill's `triggers` (negative `!`-prefixed triggers
 exclude). To keep it off the per-message filesystem/config hot path:
 - the discovered skill-file list is TTL-cached (`_iter`, `_ITER_CACHE_TTL_SECS`),
   invalidated by `create_auto_skill`;
+- the walk that rebuilds it (`_iter_skill_files`, on a worker thread) asks the
+  sensitive-path fence through `is_sensitive_resolved_path` against the
+  `realpath` it has already computed for loop detection and containment, with
+  the fence's anchors resolved on that same thread, so the ~1.4k per-scan
+  checks on an install with a few provider packages submit nothing to the
+  two-worker `mc-pathres` pool. That pool is FIFO and sized for
+  the event loop; a scan flooding it from worker threads queued the loop's own
+  resolutions behind the backlog until the loop-stall watchdog fired
+  (see [security.md](security.md));
 - the `max_triggered` cap is read from the config watcher's snapshot
   (`_max_triggered_now`) — a plain attribute read, so still no
   `KiroCrewConfig.load()` per message, and `kirocrew config set
@@ -4270,7 +4349,7 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The mutating verbs (POST, PUT, DELETE) are owner-only and SEL-audited — app tokens and non-owner subjects get a 403 before any write — and the same owner gate fronts pending approve/dismiss/dismiss-all, pin, and inject-on-trigger, so every mutating skill endpoint in `prompts.py` refuses non-owner callers (the discover-module install endpoint carries its own internal-secret refusal instead; see learn-cron-dashboard.md's Skills CRUD entry). The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **LLM tool mechanisms:**
 - MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
@@ -4723,6 +4802,12 @@ and Kiro Crew resets its context-usage accounting at that chokepoint. Separately
 `SessionManager` trips a circuit breaker after `_CIRCUIT_BREAKER_THRESHOLD` = 5
 consecutive turn FAILURES for a session key and resets the session; that counter
 tracks failures, not compactions.
+
+On the dashboard, confirmed provider-native and manual `/compact` completion
+arms `SessionManager.mark_needs_reinjection` for the effective session key.
+The next dashboard turn consumes that one-shot flag to restore the skills
+context. Failed deferred compaction does not arm it. This completion hook does
+not add skills reinjection to messaging surfaces or the task runner.
 
 #### Dynamic budget scaling (per active model context window)
 

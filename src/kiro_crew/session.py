@@ -130,6 +130,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
+from kiro_crew.member_process_records import reclaim_stale_member_bindings
 from kiro_crew.messaging.link import (
     UNBIND_REASON_SESSION_DESTROYED,
     UNBIND_REASON_UNSPECIFIED,
@@ -209,6 +210,7 @@ from kiro_crew.session_pid import (
     kill_orphan_mcps,
 )
 from kiro_crew.session_pool import WarmPoolDeps, WarmSessionPool
+from kiro_crew.session_scope_reap import reap_abandoned_agent_scopes
 from kiro_crew.stats import Stats
 from kiro_crew.watchdog import CleanupHook, SessionWatchdog
 
@@ -714,16 +716,16 @@ def _model_fallback(per_agent_model: str, global_default: str) -> "str | None":
     return global_default if global_default and global_default not in _SENTINEL_MODELS else None
 
 
-def _session_model(cfg: "KiroCrewConfig", agent: str | None) -> "str | None":
+def _session_model(
+    cfg: "KiroCrewConfig", agent: str | None, *, crew_agent: str | None = None
+) -> "str | None":
     """Resolve the model for a new session on *agent*, for EVERY surface.
 
-    ``agent`` is whatever the caller passed, and callers are not consistent: the
-    dashboard passes a resolved kiro template name, while Slack threads, cron
-    jobs and spawned agents pass a KiroCrew agent (crew) name. Both are handled
-    by trying the crew namespace first, so a crew's own ``model`` applies no
-    matter which surface starts the turn. Without this, a crew pinned to one
-    model in the Crews table still ran the template/global model from Slack or
-    cron — the same per-surface drift this tier exists to remove.
+    ``crew_agent`` carries the allocation's explicit member identity, including
+    "" for a literal template. The empty claim excludes a same-named member's
+    pin while preserving the template/global fallback. Without an explicit
+    claim, the shared identity resolver retains legacy crew-name inference for
+    callers such as Slack and cron.
 
     Returns ``None`` when nothing is pinned above the kiro layer, which leaves
     the provider factory to resolve the template pin / global itself. A crew pin
@@ -732,7 +734,8 @@ def _session_model(cfg: "KiroCrewConfig", agent: str | None) -> "str | None":
 
     Blocking I/O (globs + reads ``~/.kiro/agents/*.json``): call in an executor.
     """
-    crew = cfg.agents.get(agent) if agent else None
+    crew_name = _resolve_allocation_crew_identity(cfg, agent, crew_agent)
+    crew = cfg.agents.get(crew_name) if crew_name else None
     if crew is not None:
         crew_model = normalize_agent_model(crew.model)
         if crew_model:
@@ -952,6 +955,17 @@ class _Session:
     # Consumed one-shot by the next prompt builder to re-inject the skills
     # index so the model can still discover skills post-compaction.
     needs_context_reinjection: bool = False
+    # Set when this session's cold start consumed a replay suppression, so it
+    # started with NO conversation. Cleared by the compaction coordinator once
+    # the first confirmed reading is recorded below. Lives on the session so it
+    # dies with it: a successor that never reports leaves nothing behind.
+    floor_pending: bool = False
+    # First confirmed context reading of a session that started with no
+    # conversation: what a fresh session on this key reads before anyone has
+    # said anything. ``None`` until measured, and never for a session whose
+    # first turn replayed history. Read by the compaction coordinator to decide
+    # whether a reset could free anything at all.
+    floor_pct: float | None = None
 
     def adopt_provider(self, provider: LLMProvider) -> None:
         """Swap in a freshly-spawned *provider*, resetting conversation state.
@@ -979,6 +993,10 @@ class _Session:
         self.consecutive_failures = 0
         self.prev_turn_cancelled = False
         self.needs_context_reinjection = False
+        # A recycled provider replays history on its first turn, so its first
+        # reading is not a floor; the measurement belongs to the old provider.
+        self.floor_pending = False
+        self.floor_pct = None
         self.created_at = time.time()
         self.last_used = time.monotonic()
 
@@ -1068,7 +1086,7 @@ class SessionManager:
             session_provider_type=lambda: _load_acp_session_provider_type(),
             unlink_session_queue=lambda session: _unlink_session_queue(session),
             unlink_queued_temp_paths=lambda kwargs: unlink_queued_temp_paths(kwargs),
-            session_model=lambda cfg, agent: _session_model(cfg, agent),
+            session_model=lambda cfg, agent, crew: _session_model(cfg, agent, crew_agent=crew),
             load_config=lambda: KiroCrewConfig.load(),
             resolve_crew_identity=lambda cfg, agent, crew: _resolve_allocation_crew_identity(
                 cfg, agent, crew
@@ -1182,6 +1200,9 @@ class SessionManager:
             cleanup_stale_sandbox_profiles=lambda: cleanup_stale_sandbox_profiles(
                 data_home=data_home
             ),
+            reclaim_member_bindings=lambda cursor: reclaim_stale_member_bindings(
+                data_home=data_home, cursor=cursor
+            ),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -1195,6 +1216,7 @@ class SessionManager:
             ),
             find_orphan_mcp_candidates=lambda active_pids: find_orphan_mcp_candidates(active_pids),
             kill_orphan_mcps=lambda candidates: kill_orphan_mcps(candidates),
+            reap_agent_scopes=lambda active_pids: reap_abandoned_agent_scopes(active_pids),
             build_child_map=lambda: _build_child_map(),
             rss_mb_from_tree=lambda pid, child_map: _rss_mb_from_tree(pid, child_map),
             get_session_rss_mb=lambda pid: get_session_rss_mb(pid),
@@ -1226,6 +1248,7 @@ class SessionManager:
                     [
                         CleanupHook("idle_expiry", self._expire_idle_hook),
                         CleanupHook("orphan_mcp", self._orphan_mcp_hook),
+                        CleanupHook("reap_agent_scopes", self._reap_agent_scopes_hook),
                         CleanupHook("rss_threshold", self._rss_threshold_check),
                         CleanupHook("stuck_turn", self._stuck_turn_check),
                         CleanupHook("bg_drain_reap", self._bg_drain_reap_hook),
@@ -1639,7 +1662,7 @@ class SessionManager:
         self._provider_factory = provider_factory
         # Installed by the dashboard once its state exists (set_subagent_probe);
         # None means "no dashboard, so no children can be attached".
-        self._subagent_probe: Callable[[str], bool] | None = None
+        self._subagent_probe: "Callable[[str], bool | Awaitable[bool]] | None" = None
         self._allocation_state = SessionRegistryState(
             start_sem=asyncio.Semaphore(_MAX_CONCURRENT_COLD_STARTS)
         )
@@ -2331,20 +2354,27 @@ class SessionManager:
         key — an idle-timeout expiry, a gateway restart — silently amnesiac,
         which nobody asked for.
         """
+        folded = self._fold_key(key)
         if key in self._suppress_replay:
             self._suppress_replay.discard(key)
-            return True
-        folded = self._fold_key(key)
-        if folded in self._suppress_replay:
+        elif folded in self._suppress_replay:
             self._suppress_replay.discard(folded)
-            return True
-        return False
+        else:
+            return False
+        # The session that consumed the suppression starts with no history, so
+        # its first confirmed reading is this key's floor. Marked here, on the
+        # session itself, because this is the one place that knows the replay
+        # was actually skipped -- and the flag then dies with the session.
+        session = self._sessions.get(folded) or self._sessions.get(key)
+        if session is not None:
+            session.floor_pending = True
+        return True
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the lifecycle recycle callback."""
         self._lifecycle_boundary().set_recycle_callback(cb)
 
-    def set_subagent_probe(self, fn: Callable[[str], bool] | None) -> None:
+    def set_subagent_probe(self, fn: "Callable[[str], bool | Awaitable[bool]] | None") -> None:
         """Install the "does *key* have sub-agent work attached?" predicate.
 
         The RSS ceiling consults it before recycling an idle session: with
@@ -2354,8 +2384,14 @@ class SessionManager:
         """
         self._subagent_probe = fn
 
-    def _has_attached_subagents(self, key: str) -> bool:
+    def _has_attached_subagents(self, key: str) -> bool | Awaitable[bool]:
         """Answer the installed sub-agent probe, or False when none is installed.
+
+        The probe's answer is handed back UNCOERCED: the dashboard installs a
+        coroutine probe (its queued half reads the task store, and the sweep
+        that asks is on the gateway loop), and ``bool()`` of a coroutine is True
+        for every session while never running the probe at all. The cleanup
+        boundary awaits an awaitable answer and coerces there.
 
         A raising probe propagates: the cleanup boundary treats that as
         "attached" so the session is kept.
@@ -2363,7 +2399,7 @@ class SessionManager:
         probe = self._subagent_probe
         if probe is None:
             return False
-        return bool(probe(key))
+        return probe(key)
 
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Delegate the ordered compaction gate ladder."""
@@ -2623,6 +2659,10 @@ class SessionManager:
     def get_agent(self, key: str) -> str:
         """Return a folded session agent name."""
         return self._allocation_boundary().get_agent(key)
+
+    def get_agent_selection(self, key: str) -> tuple[str, str]:
+        """Snapshot the allocation-owned namespace and name for inheritance."""
+        return self._allocation_boundary().get_agent_selection(key)
 
     def set_approval_policy(self, key: str, policy: str) -> None:
         """Update a folded session approval policy with audit logging."""
@@ -2958,6 +2998,10 @@ class SessionManager:
     async def _orphan_mcp_hook(self) -> None:
         """Run the legacy orphan-MCP cleanup hook."""
         await self._cleanup_boundary()._orphan_mcp_hook()
+
+    async def _reap_agent_scopes_hook(self) -> None:
+        """Reclaim abandoned agent cgroup scopes during a cleanup tick."""
+        await self._cleanup_boundary()._reap_agent_scopes_hook()
 
     async def _rss_threshold_check(self) -> None:
         """Recycle idle sessions whose process trees exceed the RSS policy."""

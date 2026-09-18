@@ -52,7 +52,9 @@ __all__ = [
     "claude_components_resolve",
     "derived_agent_permissions",
     "finish_suspended_spawn",
+    "forget_cached_resolution",
     "kiro_cli_resolves",
+    "provider_error_client",
     "resolve_pin_spelling",
     "run_kiro_native_commands",
 ]
@@ -68,6 +70,22 @@ def finish_suspended_spawn(process: object, pid: int, *, label: str) -> bool:
     except AcpError:
         return False
     return True
+
+
+def provider_error_client() -> object | None:
+    """The module that owns the provider-error vocabulary, or ``None`` when absent.
+
+    The dependency adapter (``taskq/adapters/acp_provider.py``) maps
+    ``classify_provider_error``'s verdict and the ``PROVIDER_ERROR_*`` kinds onto
+    the dependency vocabulary; it reads them through this handle so one set of
+    patterns serves the formatter, the retry classifier and the adapter. Imported
+    at call time: the client is large and this is reached from the taskq path.
+    """
+    try:
+        from kiro_crew.acp import client as acp_client
+    except Exception:  # noqa: BLE001 - the adapter degrades to duck typing
+        return None
+    return acp_client
 
 
 def resolve_pin_spelling(model_id: str, advertised: object) -> str:
@@ -330,94 +348,52 @@ def codex_adapter_install_command() -> str:
     return f"npm i -g {CODEX_ACP_NPM_PKG}"
 
 
-def opencode_resolves() -> bool:
-    """Whether the OpenCode binary resolves on this host right now.
+def self_served_resolves(backend: str) -> bool:
+    """Whether *backend*'s own binary resolves on this host right now.
 
-    One seam, not the adapters' two: this harness serves ACP itself, so the thing
-    that resolves IS the thing that runs, and there is no second executable whose
-    absence would be a different verdict.
+    ONE seam for every harness in ``ACP_BACKEND_LAUNCH``, not the adapters' two: for
+    those harnesses the thing that resolves IS the thing that runs, so there is no
+    second executable whose absence would be a different verdict -- which is what
+    makes one function correct for all of them rather than three that read alike.
     """
-    from kiro_crew.acp.client import _resolve_opencode_bin
+    from kiro_crew.acp.client import _resolve_self_served_bin
 
-    binary, _searched_path = _resolve_opencode_bin()
+    binary, _searched_path = _resolve_self_served_bin(backend)
     return bool(binary)
 
 
-def opencode_cached_negative() -> bool:
-    """Has the RUNNING gateway already resolved the opencode binary as absent?
+def self_served_cached_negative(backend: str) -> bool:
+    """Has the RUNNING gateway already resolved *backend*'s binary as absent?
 
-    Same hazard and same resolution as the two adapter seams above: the path is
-    resolved once per process behind an ``_UNRESOLVED`` sentinel and never
-    invalidated, so a probe reporting "installed" after an install would disagree
-    with every spawn until a restart. Consulted, never invalidated -- a dashboard
-    GET must not mutate a global on the spawn path.
+    Same hazard and same resolution as the adapter seams above: the path is resolved
+    once per process and never invalidated, so a probe reporting "installed" after an
+    install would disagree with every spawn until a restart. Consulted, never
+    invalidated -- a dashboard GET must not mutate state on the spawn path.
+
+    An absent key means this process has not looked yet, which is not a negative.
     """
     from kiro_crew.acp import client as _client
 
-    cached = getattr(_client, "_opencode_bin_cache", None)
-    if cached is None or cached is getattr(_client, "_UNRESOLVED", object()):
+    caches = getattr(_client, "_self_served_bin_caches", None)
+    if not isinstance(caches, dict) or backend not in caches:
         return False
     try:
-        binary, _searched = cached  # type: ignore[misc]
+        binary, _searched = caches[backend]
     except Exception:
         return False
     return not binary
 
 
-def opencode_install_command() -> str:
-    """The harness's own installer, read from the spawn path's constant.
+def self_served_install_command(backend: str) -> str:
+    """The harness's own installer, read from its launch record.
 
-    Imported rather than restated for the same reason as the two above: the command
-    an operator is told to run and the binary the ladder searches for must not be
-    able to drift apart.
+    Read rather than restated for the same reason the adapters' commands are imported
+    from the spawn path: the command an operator is told to run and the binary the
+    ladder searches for must not be able to drift apart.
     """
-    from kiro_crew.acp.client import OPENCODE_INSTALL_COMMAND
+    from kiro_crew.agent_sdk.backends import launch_for
 
-    return OPENCODE_INSTALL_COMMAND
-
-
-def goose_resolves() -> bool:
-    """Whether the goose binary resolves on this host right now.
-
-    One seam, like opencode's and unlike the adapters' two: this harness serves ACP
-    itself, so the thing that resolves IS the thing that runs.
-    """
-    from kiro_crew.acp.client import _resolve_goose_bin
-
-    binary, _searched_path = _resolve_goose_bin()
-    return bool(binary)
-
-
-def goose_cached_negative() -> bool:
-    """Has the RUNNING gateway already resolved the goose binary as absent?
-
-    Same hazard and same resolution as the seams above: the path is resolved once per
-    process behind an ``_UNRESOLVED`` sentinel and never invalidated, so a probe
-    reporting "installed" after an install would disagree with every spawn until a
-    restart. Consulted, never invalidated -- a dashboard GET must not mutate a global
-    on the spawn path.
-    """
-    from kiro_crew.acp import client as _client
-
-    cached = getattr(_client, "_goose_bin_cache", None)
-    if cached is None or cached is getattr(_client, "_UNRESOLVED", object()):
-        return False
-    try:
-        binary, _searched = cached  # type: ignore[misc]
-    except Exception:
-        return False
-    return not binary
-
-
-def goose_install_command() -> str:
-    """The harness's own installer, read from the spawn path's constant.
-
-    Imported rather than restated so the command an operator is told to run and the
-    binary the ladder searches for cannot drift apart.
-    """
-    from kiro_crew.acp.client import GOOSE_INSTALL_COMMAND
-
-    return GOOSE_INSTALL_COMMAND
+    return launch_for(backend).install_command
 
 
 def pi_components_resolve() -> tuple[bool, bool]:
@@ -459,58 +435,85 @@ def pi_cached_negative() -> bool:
     return False
 
 
+def forget_cached_resolution(backend: str) -> None:
+    """Drop what the RUNNING gateway cached about *backend*'s components resolving.
+
+    The counterpart to the ``*_cached_negative`` seams above, and the reason those
+    only ever READ. Their rule -- "a dashboard GET must not mutate a global on the
+    spawn path" -- is about the VERB: a GET is replayable and unattributed, so a
+    cache clear hidden inside one is a side effect nobody asked for. An owner-gated,
+    audited POST is the request that did ask, so this function is consistent with
+    those docstrings rather than a reversal of them.
+
+    **Call this ON THE EVENT LOOP.** Not a style preference -- it is the whole of its
+    thread safety. Every reader is loop-resident code with no ``await`` between its
+    check and its read::
+
+        if self.backend not in _self_served_bin_caches:
+            _self_served_bin_caches[self.backend] = await asyncio.to_thread(...)
+        binary, search_path = _self_served_bin_caches[self.backend]
+
+        if _claude_acp_argv_cache is _UNRESOLVED:
+            _claude_acp_argv_cache = await asyncio.to_thread(_resolve_claude_acp_bin)
+        cached_claude_resolution = _claude_acp_argv_cache
+
+    Those pairs are atomic with respect to other loop tasks precisely because nothing
+    awaits between them. From a WORKER THREAD they are not: a pop landing inside the
+    first pair raises ``KeyError`` in a session spawn, and a sentinel written inside
+    the second makes ``isinstance(cached, tuple)`` false, so an installed adapter
+    reports "not found". Both are reachable from a thread and neither is reachable
+    from the loop.
+
+    A resolution already in flight cannot undo this. The sentinel reset is what makes
+    the NEXT spawn resolve; ``bump_resolution_generation`` is what stops an OLDER one
+    from publishing over it. Every publish site captures the generation before it awaits
+    and writes only if it is still current, so a resolve that began before the
+    operator's install completes, uses its own answer for its own session, and does not
+    stamp that stale miss back over the cleared cache.
+
+    Silent for a backend with no cache of its own: kiro resolves per spawn and KAS
+    shares its answer, so there is nothing of theirs to forget.
+    """
+    from kiro_crew.acp import client as _client
+
+    unresolved = getattr(_client, "_UNRESOLVED", None)
+    if unresolved is None:  # pragma: no cover - the sentinel is module-level
+        return
+
+    # FIRST, so a resolution that completes between here and the sentinel reset is
+    # already fenced rather than racing the reset itself.
+    _client.bump_resolution_generation(backend)
+
+    from kiro_crew.agent_sdk.backends import (
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_PI,
+    )
+
+    # One backend's caches, named rather than cleared wholesale: re-checking codex
+    # must not make the next claude spawn re-resolve, or the button would cost work
+    # on harnesses the operator did not ask about.
+    sentinel_globals = {
+        ACP_BACKEND_CLAUDE: ("_claude_acp_argv_cache",),
+        ACP_BACKEND_CODEX: ("_codex_acp_argv_cache",),
+        ACP_BACKEND_PI: ("_pi_acp_argv_cache", "_pi_bin_cache"),
+    }.get(backend, ())
+    for name in sentinel_globals:
+        if hasattr(_client, name):
+            setattr(_client, name, unresolved)
+
+    # The self-served harnesses share one dict keyed by backend, so forgetting one
+    # is a key deletion and the others keep their answers.
+    caches = getattr(_client, "_self_served_bin_caches", None)
+    if isinstance(caches, dict):
+        caches.pop(backend, None)
+
+
 def pi_install_command() -> str:
     """The one command that installs both pi components, from the spawn path."""
     from kiro_crew.acp.client import PI_INSTALL_COMMAND
 
     return PI_INSTALL_COMMAND
-
-
-def deepseek_resolves() -> bool:
-    """Whether the DeepSeek Harness binary resolves on this host right now.
-
-    One seam, like the sibling harness's: what resolves IS what runs. The ACP plugin
-    package has no executable of its own -- it is a plugin with peer dependencies on
-    the harness core -- so the host binary that boots its profile is the only thing
-    whose absence is a verdict.
-    """
-    from kiro_crew.acp.client import _resolve_deepseek_bin
-
-    binary, _searched_path = _resolve_deepseek_bin()
-    return bool(binary)
-
-
-def deepseek_cached_negative() -> bool:
-    """Has the RUNNING gateway already resolved the DeepSeek binary as absent?
-
-    Same hazard and same resolution as every seam above: the path is resolved once
-    per process behind an ``_UNRESOLVED`` sentinel and never invalidated, so a probe
-    reporting "installed" after an install would disagree with every spawn until a
-    restart. Consulted, never invalidated -- a dashboard GET must not mutate a global
-    on the spawn path.
-    """
-    from kiro_crew.acp import client as _client
-
-    cached = getattr(_client, "_deepseek_bin_cache", None)
-    if cached is None or cached is getattr(_client, "_UNRESOLVED", object()):
-        return False
-    try:
-        binary, _searched = cached  # type: ignore[misc]
-    except Exception:
-        return False
-    return not binary
-
-
-def deepseek_install_command() -> str:
-    """The harness's own installer, read from the spawn path's constant.
-
-    Imported rather than restated, for the reason every sibling states: the command
-    an operator is told to run and the binary the ladder searches for must not be
-    able to drift apart.
-    """
-    from kiro_crew.acp.client import DEEPSEEK_INSTALL_COMMAND
-
-    return DEEPSEEK_INSTALL_COMMAND
 
 
 def claude_adapter_install_command() -> str:

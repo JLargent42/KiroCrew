@@ -123,8 +123,8 @@ Retirement is downstream of layer 3, not of the coalescing window the pure
 decision engine gained. That window folds successive changes to one subject over
 time, which is not the mechanism the cron path depends on. What that path uses,
 and the shared engine cannot yet express, is already named in layers 3 and 4
-below: the urgency claim layer 3 calls `IMMEDIATE` and the kernel implements as
-`Severity.NMI`, for a condition where waiting observes nothing further; and the
+below: the urgency claim layer 3 and the kernel now both call `IMMEDIATE`, for a
+condition where waiting observes nothing further; and the
 per-entry `resets_on` distinction, which decides whether a new revision clears an
 entry or the entry outlives it. One fingerprint per subject can express neither.
 It has no per-entry identity to scope and no severity to raise, so an entry that
@@ -234,23 +234,35 @@ Rules:
 
 ### 3. Observation
 
-An observation is a named entry. The type already exists in the kernel as
-`Observation(key, severity, brief, epoch_scoped)` in `irq.py`, with `Severity`
-carrying `WAKE`, `TERMINAL` and `NMI`. What this spec asks for is a **rename, not
-a new type**:
+An observation is a named entry, and the kernel type is now the one this layer
+asks for. `irq.py` carries it as:
 
 ```
-Observation(key, severity, resets_on, brief="")
+Observation(key, severity, brief="", resets_on=ResetsOn.REVISION)
 ```
 
-`epoch_scoped: bool` becomes `resets_on`, and `NMI` becomes `IMMEDIATE`. Naming
-that plainly matters, because a rename has existing callers -- `PrWatchProbe` in
-`probes/gh_pr.py` constructs these today -- so the migration is a mechanical
-rewrite of live code rather than a greenfield addition. The reason for each new
-name is that the old one describes the implementation and the new one describes
-the condition: `epoch_scoped` says which bookkeeping bucket an entry falls in,
-while `resets_on` says what clears it, and `NMI` borrows an interrupt term for
-what is really an urgency claim.
+with `Severity` carrying `WAKE`, `TERMINAL` and `IMMEDIATE`. This landed as a
+**rename of the existing type, not a new one**: `epoch_scoped: bool` became
+`resets_on: ResetsOn`, and `NMI` became `IMMEDIATE`. `PrWatchProbe` in
+`probes/gh_pr.py` constructs these, so it was a mechanical rewrite of live code
+rather than a greenfield addition.
+
+Each new name describes the condition where the old one described the
+implementation. `epoch_scoped` said which bookkeeping bucket an entry fell in;
+`resets_on` says what clears it. `NMI` borrowed an interrupt term for what is
+really an urgency claim.
+
+`resets_on` is an enum rather than a renamed boolean, because the field answers
+*what clears this* and a boolean can only answer *yes or no*: read as a flag,
+`resets_on=False` would have to mean "does not reset on -- nothing", the opposite
+of what `NEVER` says. The kernel already stored the distinction as one of two
+named key spaces, so a two-member enum is also what makes the in-memory type and
+the persisted encoding the same shape.
+
+`brief` stays ahead of `resets_on` positionally, which is not the order this
+section first sketched. Both fields have defaults, so nothing is gained by moving
+`resets_on` forward, and reordering would silently redirect every existing
+three-positional call rather than fail at it.
 
 - **`key`** is a semantic string, stable across ticks, never a hash. `conflict`,
   `red:<check>`, `ready`, `comment:<id>` -- the vocabulary `PrWatchProbe` emits. A
@@ -261,12 +273,12 @@ what is really an urgency claim.
   state: deliver and retire the watch), or `IMMEDIATE` (bypasses the coalescing
   delay but not the budget, for a condition where waiting observes nothing
   further -- a conflicted pull request dispatches no checks, so a pending count
-  never drains). The kernel already implements this behaviour under the name
-  `NMI`.
-- **`resets_on`** is `REVISION` when a new revision clears the condition, or
-  `NEVER` when it belongs to the subject rather than the revision. A comment
-  survives a force-push; a failing check does not. `epoch_scoped` is the same
-  distinction expressed as a boolean over the kernel's epoch.
+  never drains).
+- **`resets_on`** is `ResetsOn.REVISION` when a new revision clears the condition,
+  or `ResetsOn.NEVER` when it belongs to the subject rather than the revision. A
+  comment survives a force-push; a failing check does not. The kernel stores a
+  `REVISION` key in its epoch space and a `NEVER` key in its sticky one, which is
+  the distinction `epoch_scoped` expressed as a boolean over the epoch.
 - **`brief`** is operator-facing text, delivered only if the entry wakes someone.
 
 A subject's fingerprint, where one is still needed, is **derived from** the
@@ -304,10 +316,10 @@ fail safe:
 
 The engine is **level-triggered**, not edge-triggered, on both paths. `irq.py`
 level-triggers on the live cron path: per-key `alerted` timestamps in its loaded
-state, `_dedupe_key` distinguishing epoch-scoped from sticky entries, a re-alert
+state, `_dedupe_key` distinguishing `REVISION` from `NEVER` entries, a re-alert
 window defaulting to six hours through `DEFAULT_REALERT_SECS`, a coalescing
-window through `coalesce_secs`, and `Severity.NMI` documented as bypassing the
-delay but not the mask. `monitoring/decision.py` now level-triggers too: it
+window through `coalesce_secs`, and `Severity.IMMEDIATE` documented as bypassing
+the delay but not the mask. `monitoring/decision.py` now level-triggers too: it
 re-asserts an unresolved actionable change once its re-alert interval has elapsed
 and coalesces a burst of successive changes to one subject, through a window on
 `MonitorState`. So re-assertion-after-a-window is available on both paths rather
@@ -327,16 +339,86 @@ what makes it safe. A notification pipeline aimed at humans needs no token
 budget because a paged human self-limits; an agent does not, which is why the
 budget half of this design is not optional.
 
-**The stall streak is engine state.** A watch whose verdict has been byte-identical
-across N settled ticks with no progress is stuck, and the engine stops it. That
+**The stall streak is engine state.** A watch whose verdict has been
+byte-identical across N settled ticks is stuck, and the engine stops it. That
 counter belongs in the persisted state the engine reads, not in a file that only
 an instruction knows to maintain -- an advisory counter maintained by prose is
-lost to exactly the long-running compaction it exists to survive. No engine state
-holds a streak of **identical verdicts** today. Streak counters do exist and are
-about something else: `quiet_streak` with `floor_ticks` counts consecutive quiet
-observations and the deliveries they force, `consecutive_provider_errors` counts
-provider failures, and `irq.py` carries its own consecutive-error backstop. None
-of them notices a watch that keeps reaching the same conclusion.
+lost to exactly the long-running compaction it exists to survive. `MonitorState`
+holds it as `stall_digest`, `stall_streak` and `stall_started_at`, and
+`decide_monitor` folds them after the effect is chosen, because the verdict a
+digest summarizes does not exist before then.
+
+Four things the shape decides, each for a reason worth keeping:
+
+- The digest is **derived** from the verdict on every tick, never persisted
+  beside a second copy of it. What the record keeps is the digest of an EARLIER
+  verdict, which nothing else holds, so the one-source-of-truth rule above
+  survives one layer up. The **decision** is inside the digest, not only the
+  entries, and that is what makes "with no progress" the same question as
+  identity: a wake, a record, a retry, a new fingerprint or a moved head all
+  change the digest, so a tick that progressed cannot match. What stays
+  invisible is the woken agent's own uncommitted work, and no condition
+  available at this layer can see that.
+- A tick counts only when it **settled the subject and the engine then did
+  nothing about it** -- a `NO_CHANGE`. `PENDING` is the domain's not-concluded
+  class -- `checks_incomplete`, `checks_pending`, `review_threads_incomplete` and
+  the rest -- so a pending tick never counts and a watch is never retired for
+  being early. `PROVIDER_ERROR` never counts either, being no evidence about the
+  subject and already carrying its own budget. **Every other tick zeroes the
+  streak**, because it means the watch was working: a wake acted, a `RECORD_ONLY`
+  held a change inside the coalescing floor, a `RETRY_PROVIDER` waited on
+  incomplete evidence, a stop already ended it. Counting a deferral is the same
+  error as counting a pending tick, and at the 15s minimum cadence a held change
+  reaches twelve identical `RECORD_ONLY` verdicts 180s into a 240s window --
+  retiring the watch before the window could release the wake it was folding.
+  Zeroing on an UNSETTLED tick is what makes reading a clock in the trip safe: a
+  streak left standing through a long pending stretch would let time alone satisfy
+  the floor, and the next unsettled terminal tick -- a non-retryable provider
+  error -- would be filed as a stall. The price is that a subject whose checks
+  flap never accumulates a streak and is retired by its runtime budget instead: a
+  later stop with an honest reason, which beats an earlier one with a false
+  reason.
+- The trip needs a **measured wall-clock floor** as well as the count, because
+  the count answers the right question in the wrong unit on its own. Cadence is
+  user-set from 15s to 86400s, and the streak's clock starts on its first counted
+  tick, so twelve ticks is eleven intervals -- 3300s at the 300s default, 165s at
+  the 15s minimum -- and 165s of an unchanged subject is a watch whose agent is
+  still working. `stall_started_at` records when the streak
+  opened and the trip reads `now - stall_started_at`, so nothing is translated
+  from ticks into seconds. Storing a ceiling derived from `cadence_secs` would
+  make the trip a pure integer comparison, at the price of a cached value derived
+  from a mutable input with nothing invalidating it: a streak opened at the
+  default would carry that ceiling into a 15s cadence and trip a quarter of the
+  way into its floor. Any such translation breaks on
+  a cadence change in one direction or the other, so there is none, and no
+  invalidation rule to get wrong. Reading the clock reopens nothing: the hazard a
+  snapshot was avoiding was a predicate an operator could make true between two
+  folds. The clock is `time.time()`, a wall clock rather than a monotonic one, and
+  neither direction reopens that hazard: backwards, the elapsed comparison goes
+  negative and only delays a trip; forwards, a jump can satisfy the floor early but
+  cannot manufacture the counted ticks the other half of the condition requires.
+- Both thresholds are **bounded by numbers already in the module** rather than
+  chosen freely, which is what lets a reader check them. The count must exceed
+  the floor's tick equivalent at the default cadence, or it never binds, and stay
+  inside the ticks a default watch gets before its runtime budget, or the stall
+  can never fire: `6 < 12 < 48`. The floor must clear the coalescing window by a
+  wide margin, or a folded burst looks like a stall, and stay well under the
+  re-alert interval, because a re-alert wakes the subject and zeroes the streak,
+  so a floor at or past it could never be reached: `240 << 1800 << 21600`.
+- The stop records `verdict_stall`, distinct from `approval_stall` (a delivery
+  failure) and from every `*_budget` reason (a spent bound), because a stop that
+  reads like a convergence or like a cost is the cycle-cap anti-pattern under a
+  new name. The engine owns that reason through `monitor_stall_reason`, the way
+  it already owns `monitor_budget_reason` -- taking the tick's `now` as a value
+  for the same reason that function does, so it cannot disagree with the fold that
+  decided the stop. Both writers of `stopped_reason` otherwise copy the
+  observation's own code and would file a stall as `checks_failed`.
+
+Streak counters do exist and are about something else: `quiet_streak` with
+`floor_ticks` counts consecutive quiet observations and the deliveries they
+force, `consecutive_provider_errors` counts provider failures, and `irq.py`
+carries its own consecutive-error backstop. None of them notices a watch that
+keeps reaching the same conclusion.
 
 #### The decision is split, and only half of it is pure
 
@@ -345,6 +427,21 @@ fingerprint against `last_wake_fingerprint`), is the budget spent
 (`monitor_budget_reason`), is this error retryable (`_provider_error_decision`
 against `_RETRYABLE_PROVIDER_ERRORS`). It takes the clock as a value through its
 `now` parameter and performs no IO at all.
+
+**A skip is a third outcome, and it reaches three places.** A shared `github:api`
+cooldown makes a probe return WITHOUT calling the API, and it borrows the shape of a
+refusal to say so (`REASON_SHARED_COOLDOWN`, `is_unattempted_probe`). That is
+neither a success nor a provider error: it is no evidence about the subject at all,
+so it moves NEITHER counter — at `shadow.apply_monitor_probe` and at the production
+counting site in `autonudge`. `_provider_error_decision` is the third place, and it
+is the one a counter fix does not reach: it reads the same budget one tick into the
+FUTURE (`consecutive_provider_errors + 1 >= max_provider_errors`), so a watch two
+real errors into a budget of three would be retired by an unrelated scope's
+cooldown, having made no call of its own. The prediction therefore refuses to spend
+an unattempted probe, while `monitor_budget_reason` above it keeps stopping a watch
+whose budget is genuinely gone — a cooldown must not become a way to outlive the
+ceiling. The kind gate stays FIRST of the three, so an unattempted probe reporting a
+non-retryable kind is still blocked.
 
 The **delivery** policy is the other half, and it is impure. It lives in
 `MonitorController.tick`, which decides whether a wake is already in flight
@@ -388,7 +485,7 @@ Required contents:
 | `coalescing` | the open window: when it opened, which keys joined |
 | `errors` | per-kind counts, so a retryable class stays bounded |
 | `budgets_spent` | turns, tokens and provider errors already charged |
-| `stall` | the verdict digest and its consecutive-match count |
+| `stall` | the verdict digest, its consecutive-match count, and when that streak opened |
 
 **The state document holds delivery bookkeeping only. It never holds subject
 state.** What the subject looks like belongs in the evidence file, which is
@@ -446,9 +543,9 @@ already share.
 ## Rules the engine enforces, not the prose
 
 An operational rule that lives only in an instruction can be violated silently.
-These are code -- or, where marked `target`, are the reason this consolidation
-exists, because deleting the instruction before the engine enforces the rule
-leaves it enforced nowhere:
+These are code, or say in their own text where an implementation still diverges
+-- deleting the instruction before the engine enforces the rule would leave it
+enforced nowhere:
 
 - An unclassified provider state is `unknown` and counts as **not passing**.
 - Superseded attempts collapse to the newest per check identity. A host keeps
@@ -481,8 +578,22 @@ leaves it enforced nowhere:
 - A stale reviewer stamp is an entry (`stale:<name>`), not a paragraph.
 - An un-dispositioned finding is an entry, so readiness cannot be declared over
   one.
-- The stall streak is engine state, so a stuck watch stops itself (`target` -- no
-  engine state holds it today).
+- The stall streak is engine state, so a stuck watch stops itself. `MonitorState`
+  carries `stall_digest`, `stall_streak` and `stall_started_at`; `decide_monitor`
+  folds them and `monitor_stall_reason` names the stop `verdict_stall`.
+- A retained stop is evidence, and an arming tool must not acknowledge an arm it
+  cannot apply. Only a SYSTEM-imposed outcome is displaceable by a re-arm; a
+  consumer-recorded one (`USER_STOP`, `SESSION_CLOSE`, a quarantined record, an
+  outcome this version does not recognise) is preserved, and clearing it is an
+  owner-only dashboard action because it destroys audit evidence.
+  `monitoring.models.retained_outcome_blocks_rearm` is the one predicate that
+  answers this, consumed both by `autonudge._stopped_row_is_replaceable` at the
+  enforcement point and by the `mcp_tools.control` preflight that refuses in band
+  before the model ends its turn. What that shared predicate buys is that the
+  RULE cannot drift between the two sites; the preflight remains advisory, since
+  it fails open on an unreadable record and the turn boundary is what enforces.
+  Two copies of the rule is what lets the ack and the applier disagree on the
+  classification itself, which is the false-acknowledgement class of bug.
 
 ## Adding a new monitored kind
 
@@ -602,8 +713,8 @@ lifecycle stages, in different shapes:
 
 | Site | Lifecycle stage | Shape | Reachable from code |
 |---|---|---|---|
-| `mcp_shared._resolve_excluded_tools` | per call, cached per session | flat name set from `managedToolPolicy.exclude` | yes |
-| the same function's fail-open returns | before the exclude list is parsed | returns an empty set | nothing to migrate; withholds every exclusion equally |
+| `mcp_shared._resolve_tool_policy` | per call, cached per session | `ToolPolicy(excluded, unresolved)` from `managedToolPolicy.exclude` | yes |
+| the same function's unresolved returns | before the exclude list is parsed | empty set plus the reason it could not be read; `tools/call` refuses, `tools/list` still lists | nothing to migrate; the refusal is audited per call |
 | `acp/kas_agents.to_client_custom_agent` | startup projection, before the session exists | `excludedTools` list relayed to the agent host | yes |
 | `acp/session_mcp.session_mcp_disabled_tools` | session projection: Claude `permissions.deny`, codex `rawInput.server`/`tool` | `(server, tool)` pairs, unioned from the agent spec AND the dashboard-written global `mcp.json` | yes |
 | `agent._WORKER_MIRRORED_SHAPES` | derive-time copy | copies the persisted key | copies rather than resolves, so a rewrite here would alter a user's stored value |
@@ -627,3 +738,85 @@ Weighed against that: the mispick this rename would prevent has not been observe
 What remains available, because none of it is name-keyed: the tool descriptions, this
 spec, and the prompts that choose between the two. A caller reading `monitor_start`'s
 description learns it is the timer without the name having to carry it.
+
+### Which of the two is the default is an installation's choice
+
+Both arming tools are reachable on a stock install and neither is gated. `GET
+/api/monitors` answers its `enabled` field from whether the service object exists
+(`handlers/autonudge.py`), not from a key, so there has never been a switch that
+turns the structured engine on or off. What was unsettable is which of the two an
+arming takes, and the reason follows from the section above: no code chooses, so
+the choice is made by the model reading the two descriptions.
+
+`monitoring.prefer_structured_arming` (boolean, default `false`) decides which
+side has to justify itself. Off, the structured path is admissible only once the
+caller has satisfied itself the objective is fully determined by typed provider
+facts. On, a supported pull request is enough and the prompt loop becomes the
+exception that needs its own reason, and `monitor_watch`'s own description says
+so too. That is the whole extent of the key: it refuses neither tool, moves no
+argument in either `inputSchema`, and cannot guarantee which path the agent then
+arms -- the text is what it changes, and the text is what its tests measure.
+
+The two positions are NOT two routes, and reading them as a swap of defaults is
+the error to avoid: both send evidence the typed provider cannot observe --
+comments, advisory review findings -- to the prompt loop. What moves is the
+burden of proof. Off leans to the loop whenever the caller is unsure whether the
+objective is fully typed-decidable, because that judgement is the precondition;
+on, being a supported pull request is the precondition and the loop needs a
+positive reason. An installation that wants the cheap path for a few days is
+asking for exactly that shift, which is why the key is worth a row in the schema
+even though it changes no code path.
+
+It is read in `mcp_tools/control.py::schemas()`, which is the only place it is
+read, and read afresh on every build: `mcp_tools.build_tool_list` rebuilds
+descriptors per call rather than caching them, so a Settings write needs no
+gateway restart. It does not reach a session already open, because kiro-cli
+caches a session's tool list for that session's life -- the same limitation
+`mcp_tools/browser.py` records for `dashboard.use_builtin_browser`. A config read
+that raises resolves to the off position, since off is what ships.
+
+The key deliberately does not make `monitor_start` REFUSE a target the structured
+engine supports. `monitor_start` takes a free-text message and no typed target,
+so a refusal would have to guess from prose which armings were structured-capable;
+and `goal-conductor` and `pipeline-conductor` patrol their own session with it as
+their primary use, which a prose-matching refusal would break. A preference that
+cannot misfire is worth more here than an enforcement that can.
+
+The descriptor is not the only prose that states the choice, and the key moves
+only the descriptor. `config/prompt.md` carries the same rule in its own words
+("Prefer bounded `monitor_watch` when typed provider facts decide the whole
+objective"), and that sentence is true in both positions, so it is left alone
+rather than made flag-aware. The reason is reach, not effort: a prompt file is one
+of many agent prompts, while the descriptor is assembled for every session
+whatever prompt it runs, so the descriptor is the only copy a single read can
+move for all of them. An installation that turns the key on therefore gets the
+default restated on the tool list, not rewritten in every prompt.
+
+#### Two costs of making the structured path the default
+
+Both are properties of the engine rather than of the key, and both are what an
+operator is actually buying, so the key's help text names them.
+
+**Half of a review-ready objective is invisible to the typed provider.** A
+structured observation carries lifecycle, checks, mergeability, review decision
+and review-thread counts, and nothing else; `docs/architecture/mcp.md` states the
+same boundary from the tool's side ("requests that need comments or advisory
+findings route directly to the finite legacy tool whose agent turn can inspect
+them"). On this repository that is not a corner case: a pull request reaches
+`readiness: passed` only once every non-PASS whole-design verdict carries a
+disposition, and those verdicts live in comment bodies. A green typed board and an
+unanswered advisory finding are indistinguishable to a probe, which is why the
+prompt loop keeps `gate=false` for that evidence in both positions of this key.
+
+**An armed structured monitor is not freely swappable, though the key is.**
+Flipping the key back restores the previous wording on the next tool-list build
+and needs nothing else. An already-armed monitor is different:
+`monitor_stop` records `MonitorOutcome.USER_STOP`
+(`autonudge._apply_monitor_user_stop`), and `_stopped_row_is_replaceable` admits
+only `BUDGET`, `SUCCESS`, `BLOCKED` and `TARGET_UNAVAILABLE` -- the
+system-imposed outcomes. A consumer-recorded stop is retained evidence, and an
+unknown outcome fails closed the same way, so the next arm on that session is
+refused with "its owner must clear it first from the dashboard's goal popover".
+The consequence for an operator who turns this key on and then wants one session
+back on the prompt loop: an agent cannot make that swap, and the remedy is the
+owner's clear or restart action, never a retry.

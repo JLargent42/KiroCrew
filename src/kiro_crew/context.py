@@ -13,7 +13,8 @@ import threading
 import time
 import unicodedata
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
+from kiro_crew.board_tag_grammar import is_grantable_tag_id
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
@@ -972,6 +974,31 @@ def _neutralize_reply_format_markers(text: str) -> str:
     return _apply_marker_spans(text, spans)
 
 
+def _board_safe_tag_name(raw: object) -> str:
+    """Admit one board tag handle onto the trusted [BOARD] context line.
+
+    ALLOWLIST, not sanitize-then-screen — the terminal form of this guard.
+    The board line carries tag IDS (machine handles, the same strings
+    ``chat_tag`` consumes); prose was never legitimate here. The admitted
+    grammar is the CLOSED set of ids a grant can exist for at all
+    (``is_grantable_tag_id``): a 12-hex id the dashboard minted, or one of the
+    code-level default workflow states. That grammar has no room for words —
+    an instruction cannot be spelled in twelve hex digits, and the defaults
+    are five known constants — so an agent-authored id planted in
+    agent-writable ``tags.json`` can neither acquire a grant (the PATCH mint
+    refuses it) nor be rendered here even if a row for it somehow existed.
+    Nothing is rewritten, so no strip can reconstruct a payload. The
+    injection heuristic below is kept as a redundant second screen, not as
+    the defense. Rejected handles are dropped by the caller.
+    """
+    value = raw if isinstance(raw, str) else ""
+    if not is_grantable_tag_id(value):
+        return ""
+    if contains_injection(re.sub(r"[-_./]", " ", value)):
+        return ""
+    return value
+
+
 # kiro-cli task_executor slices strings at fixed byte offsets (e.g. 4096).
 # Multi-byte UTF-8 chars straddling the boundary cause a Rust panic:
 #   "byte index 4096 is not a char boundary; it is inside '—'"
@@ -1066,6 +1093,44 @@ _PER_MESSAGE_CAP = 8_000  # truncate individual messages on fallback path
 # (build_message). Bounds the top-8 episodic fragments; scaled down with the
 # window at its call site but never exceeds this reference value.
 _EPISODIC_INJECT_CAP = 3_000
+# A fresh V1 prompt can query semantic, episodic, and lesson memory in order.
+# All three share one model and must share one deadline: resetting the budget per
+# section would let concurrent starts pay the queue wait repeatedly and approach
+# the gateway's 25-second loop-stall hard-exit budget. A missed vector degrades
+# to each retrieval path's existing lexical fallback.
+_PROMPT_BUILD_EMBED_TIMEOUT_SECS = 5.0
+
+
+@contextmanager
+def _prompt_build_embedding_deadline(enabled: bool) -> Iterator[None]:
+    """Carry one bounded embedding budget through a fresh prompt build."""
+    if not enabled:
+        yield
+        return
+
+    # Lazy on purpose: context.py already keeps the embedding backend behind
+    # call-time seams so imports that only inspect context do not initialize it.
+    from kiro_crew.embeddings import (
+        PRIORITY_INTERACTIVE,
+        EmbeddingWork,
+        embedding_work,
+    )
+
+    inherited_work = embedding_work.get()
+    deadline = time.monotonic() + _PROMPT_BUILD_EMBED_TIMEOUT_SECS
+    if inherited_work is not None:
+        deadline = min(deadline, inherited_work.deadline)
+    work = EmbeddingWork(
+        deadline=deadline,
+        cancelled=(inherited_work.cancelled if inherited_work is not None else threading.Event()),
+        priority=PRIORITY_INTERACTIVE,
+    )
+    token = embedding_work.set(work)
+    try:
+        yield
+    finally:
+        embedding_work.reset(token)
+
 
 # Strip Mode Identity blocks from injected context so cross-tab or history
 # content from a different mode doesn't override the current prompt's identity.
@@ -2613,6 +2678,9 @@ def _replay_rows(
         messages = _merge_replay_rows(messages, pending_messages or [], current_message)
     elif exclude_last_n > 0:
         messages = messages[:-exclude_last_n]
+    # See _recall_rows for why an image reference cannot travel in a history row.
+    from kiro_crew.image_refs import strip_image_refs
+
     kept: list[dict] = []
     conv = inj = 0
     for m in reversed(messages):
@@ -2629,7 +2697,7 @@ def _replay_rows(
             conv += 1
         else:
             continue
-        kept.append({"role": role, "content": m["content"]})
+        kept.append({"role": role, "content": strip_image_refs(m["content"])})
     kept.reverse()
     return kept
 
@@ -2656,10 +2724,24 @@ def _recall_rows(
 
     ``exclude_last_n`` drops trailing raw entries BEFORE role filtering, matching
     ``recent()``.
+
+    Rows are handed out with their image references stripped
+    (:func:`~kiro_crew.image_refs.strip_image_refs`). A row's picture
+    belonged to an earlier turn and cannot travel in a text vehicle, so the
+    reference is the only thing that would arrive: either as a path the prompt
+    builder re-inlines -- resurrecting an image a compaction already dropped --
+    or, once the file is gone, as prose naming a picture the model cannot see.
+    Stripping HERE rather than at each consumer is what makes the guarantee hold
+    for all three of them: this recall feeds both the thread-history fallback in
+    ``build_session_context`` and the transcript ``compress_thread_history``
+    hands to the LLM compressor (which returns it VERBATIM under the cap, and
+    above it would be free to narrate a picture it never saw).
     """
     messages = conversation_log.read_messages(session_key)
     if exclude_last_n > 0:
         messages = messages[:-exclude_last_n]
+    from kiro_crew.image_refs import strip_image_refs
+
     kept: list[dict] = []
     conv = inj = 0
     for m in reversed(messages):
@@ -2676,7 +2758,7 @@ def _recall_rows(
             conv += 1
         else:
             continue
-        kept.append({"role": role, "content": m["content"]})
+        kept.append({"role": role, "content": strip_image_refs(m["content"])})
     kept.reverse()
     return kept
 
@@ -4074,6 +4156,7 @@ class ContextBuilder:
         exclude_last_n: int = 0,
         folder_path: str | None = None,
         model_window: int | None = None,
+        board_tags: list[tuple[str, str]] | None = None,
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
         needs_reinjection: bool = False,
@@ -4267,26 +4350,27 @@ class ContextBuilder:
                 parts.append(
                     f"[AGENT SYSTEM PROMPT]\n{agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n"
                 )
-            session_ctx = self.build_session_context(
-                session_key,
-                agent=agent,
-                resumed=resumed,
-                workspace=workspace,
-                memory_store=memory_store,
-                compressed_history="" if compressed_history is not None else None,
-                mode=mode,
-                blocks_reads=blocks_reads,
-                provider_type=provider_type,
-                minimal_context=minimal_context or slim_resume,
-                runtime_source=runtime_source,
-                exclude_last_n=exclude_last_n,
-                model_window=model_window,
-                context_groups=context_groups,
-                query_text=text,
-                project=project,
-                member=member,
-                _v2_essentials=_essentials,
-            )
+            with _prompt_build_embedding_deadline(bool(text)):
+                session_ctx = self.build_session_context(
+                    session_key,
+                    agent=agent,
+                    resumed=resumed,
+                    workspace=workspace,
+                    memory_store=memory_store,
+                    compressed_history="" if compressed_history is not None else None,
+                    mode=mode,
+                    blocks_reads=blocks_reads,
+                    provider_type=provider_type,
+                    minimal_context=minimal_context or slim_resume,
+                    runtime_source=runtime_source,
+                    exclude_last_n=exclude_last_n,
+                    model_window=model_window,
+                    context_groups=context_groups,
+                    query_text=text,
+                    project=project,
+                    member=member,
+                    _v2_essentials=_essentials,
+                )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
                 # session context (memory / lessons / prior-session history /
@@ -4598,6 +4682,40 @@ class ContextBuilder:
                 "this directory. Prefer files and patterns from this project "
                 "when answering questions.\n\n"
             )
+
+        # Board state — the session's dashboard board tags, so the agent knows
+        # its own workflow lane and which tags it is allowed to change with
+        # chat_tag. One line, omitted entirely when the slot carries no tags.
+        # ``board_tags`` is a pre-resolved [(tag_id, policy)] list from the
+        # caller (chat_runner), which owns the live vocabulary. Canonical IDs,
+        # never the free-form ``name`` field: names are agent-writable prose,
+        # and an instruction-shaped name must never land on the trusted rail;
+        # ids are also the handles chat_tag consumes.
+        # agent-writable = policy is not "none".
+        if board_tags:
+            # Even ids are read from agent-writable tags.json, and this line
+            # lands on the model's TRUSTED context rail — the same channel as
+            # [PROJECT] and [RUNTIME]. ``_board_safe_tag_name`` stays as
+            # defense in depth: it neutralizes structural markers, control
+            # characters and newlines, and caps length, so a hostile id
+            # hand-written into tags.json cannot smuggle instructions or fake
+            # a context header. Ids that sanitize to empty are dropped.
+            _safe_names = [
+                n for n in (_board_safe_tag_name(name) for name, _policy in board_tags) if n
+            ]
+            _safe_writable = [
+                n
+                for n in (
+                    _board_safe_tag_name(name) for name, policy in board_tags if policy != "none"
+                )
+                if n
+            ]
+            if _safe_names:
+                _tag_names = ", ".join(_safe_names)
+                _writable = ", ".join(_safe_writable)
+                parts.append(
+                    f"[BOARD] tags: {_tag_names} · agent-writable: " f"{_writable or '(none)'}\n\n"
+                )
 
         # Resource pressure — inject a compact advisory ONLY when host memory is
         # tight/critical, so the model can choose the lighter path for heavy work

@@ -2119,6 +2119,17 @@ Examples:
         ),
     )
 
+    # file-delivery
+    file_delivery_parser = cli_help.add_command(sub, "file-delivery")
+    file_delivery_parser.add_argument(
+        "action",
+        choices=["approve"],
+        help=(
+            "approve: finish a flagged-file delivery consent armed from the "
+            "dashboard's Security panel (proves you are at the host)"
+        ),
+    )
+
     # stop
     stop_parser = cli_help.add_command(sub, "stop")
     stop_parser.add_argument(
@@ -2236,6 +2247,28 @@ Examples:
         _cloud_creds_opts(p)
         p.add_argument("--tag", default="", help="Instance tag (default: last launched)")
 
+    def _cloud_identity_opts(p: "argparse.ArgumentParser") -> None:
+        # ONE definition for every command that signs kiro-cli in on the crew.
+        # `cloud login`, `cloud launch` and `kirocrew setup` (which delegates to
+        # launch) all accept the same identity flags, so a managed launch can
+        # name an Identity Center identity instead of defaulting to Builder ID.
+        p.add_argument(
+            "--identity-provider",
+            default="",
+            help="IAM Identity Center start URL (your organization's access portal) for enterprise SSO",
+        )
+        p.add_argument(
+            "--license",
+            default="",
+            choices=["", "free", "pro"],
+            help="Kiro license tier (pro for Identity Center, free for Builder ID/social)",
+        )
+        p.add_argument(
+            "--idp-region",
+            default="",
+            help="IAM Identity Center region (e.g. us-east-1), NOT the EC2 instance region",
+        )
+
     cloud_sub = cloud_parser.add_subparsers(dest="cloud_action")
     _c_launch = cloud_sub.add_parser("launch", help="Provision + configure an instance")
     _cloud_creds_opts(_c_launch)
@@ -2264,6 +2297,13 @@ Examples:
         "--keep-on-failure",
         action="store_true",
         help="On bootstrap failure, keep the instance (disable rollback) for inspection",
+    )
+    _cloud_identity_opts(_c_launch)
+    _c_launch.add_argument(
+        "--no-inherit-identity",
+        action="store_true",
+        help="Do not inherit this machine's Kiro sign-in (kiro-cli whoami) as the "
+        "crew's identity; sign the crew in with Builder ID unless --identity-provider is given",
     )
 
     _c_list = cloud_sub.add_parser("list", help="List your Kiro Crew cloud instances")
@@ -2301,22 +2341,7 @@ Examples:
     _c_login.add_argument(
         "--no-browser", action="store_true", help="Print the device URL but don't open a browser"
     )
-    _c_login.add_argument(
-        "--identity-provider",
-        default="",
-        help="IAM Identity Center start URL (for enterprise SSO login)",
-    )
-    _c_login.add_argument(
-        "--license",
-        default="",
-        choices=["", "free", "pro"],
-        help="Kiro license tier (pro for Identity Center, free for Builder ID/social)",
-    )
-    _c_login.add_argument(
-        "--idp-region",
-        default="",
-        help="IAM Identity Center region (e.g. us-east-1), NOT the EC2 instance region",
-    )
+    _cloud_identity_opts(_c_login)
     _c_logout = cloud_sub.add_parser(
         "logout", help="Sign kiro-cli out on the instance (to switch Kiro account)"
     )
@@ -2620,8 +2645,14 @@ Examples:
     )
     mem_sub.add_parser("stats", help="Show memory statistics")
     mem_sub.add_parser("audit", help="Scan memory for suspicious content")
-    mem_export = mem_sub.add_parser("export", help="Export all memory to JSON")
+    mem_export = mem_sub.add_parser("export", help="Export one memory store's rows to JSON")
     mem_export.add_argument("--output", "-o", help="Output file (default: stdout)")
+    # Named for the same reason `backups`, `restore` and `carve` are: a store is a
+    # separate on-disk silo, so "all memory" was never a thing one file held. Without
+    # this flag no surface could read a named store's rows in either direction.
+    mem_export.add_argument(
+        "--store", default=None, help="Store to export (default: the default store)"
+    )
     mem_export.add_argument(
         "--include-markdown",
         action="store_true",
@@ -2695,6 +2726,9 @@ Examples:
     mem_retired.add_argument("--limit", type=int, default=20, help="How many to list")
     mem_import = mem_sub.add_parser("import", help="Import memory from JSON file")
     mem_import.add_argument("file", help="Path to JSON file (export format)")
+    mem_import.add_argument(
+        "--store", default=None, help="Store to import into (default: the default store)"
+    )
 
     # agent
     agent_parser = cli_help.add_command(sub, "agent")
@@ -2714,7 +2748,11 @@ Examples:
     agent_update.add_argument("--kiro-agent", help="New kiro agent name")
     agent_update.add_argument("--workspace", help="New workspace name")
     agent_update.add_argument(
-        "--memory-store", help="Existing memory store identity (cannot be changed)"
+        "--memory-store",
+        help=(
+            "Existing memory store identity (cannot be changed, except to 'default' "
+            "from a store name the config refuses)"
+        ),
     )
     agent_update.add_argument(
         "--provision-memory",
@@ -3195,6 +3233,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
             from kiro_crew.cli_server import _update
 
             _update(force=args.force)
+    elif args.command == "file-delivery":
+        from kiro_crew.cli_server import _file_delivery_approve
+
+        _file_delivery_approve()
     elif args.command == "stop":
         from kiro_crew.cli_server import _stop
 

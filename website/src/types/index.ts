@@ -4,10 +4,11 @@ export interface StatusData {
   sessions: number
   messages: number
   /**
-   * `null` means UNKNOWN — the WS pusher's count refresh has not succeeded
-   * yet (e.g. the lesson store is failing). StatCard renders null as a
-   * loading skeleton; publishing 0 instead would assert an authoritative
-   * false zero (issue #7204). HTTP/SSE paths always send numbers.
+   * `null` means UNKNOWN — the shared count cache has not refreshed
+   * successfully yet (e.g. the lesson store is failing). StatCard renders null
+   * as a loading skeleton; publishing 0 instead would assert an authoritative
+   * false zero (issue #7204). All three transports (WS push, /api/status, SSE)
+   * read the same cache and may send null.
    */
   cron_jobs: number | null
   subagents: number
@@ -426,6 +427,13 @@ export interface CronJob {
   skip_dates?: string[] | null
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
+  /** The installed app that owns this job, or null/absent for a person-owned
+   * one. Host-derived from the job's `created_by` stamp, which an app never
+   * supplies, so it cannot be used to claim another app's jobs. Absent on an
+   * older gateway. */
+  app?: string | null
+  /** True only when the USER paused the job; execution never sets it. */
+  user_paused?: boolean
   /** Operator-granted vault secrets injected into a script/command job's env at
    * fire time: env-var name -> vault secret NAME (values never leave the vault).
    * Absent/null when the job holds no grant. */
@@ -456,6 +464,19 @@ export interface CronJob {
 
 export interface Lesson {
   rule: string; category: string; ts: string
+  /** The `DELETE /api/lessons` selector that names exactly this row. A lesson's
+   *  identity is `(rule, repo_scope)`, so two same-rule rows in two scopes are
+   *  two lessons: `""` is the global row, a fragment is that scope's row, and
+   *  `null` is a row whose stored scope is unusable -- send NO selector for it,
+   *  the unselective delete is the only path that reaches such a row. */
+  repo_scope?: string | null
+  /** Which JSONL file the row was read from, when the list is the JSONL union of
+   *  the global file and the active workspace's. `DELETE /api/lessons` defaults to
+   *  the global file, so a workspace row's delete must carry these back or it
+   *  removes a same-text global row and leaves this one. Absent on vector rows,
+   *  where the delete reaches the store whatever `scope` says. */
+  scope?: 'global' | 'workspace'
+  workspace?: string
 }
 
 /** One row of `GET /api/memory/stores` — a declared memory store.
@@ -1235,7 +1256,7 @@ export interface PullRequestSource {
 }
 
 export interface ChatFolder {
-  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
@@ -1308,6 +1329,15 @@ export interface SubagentActivity {
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
   startedAt: number; elapsed: number; error?: string
+  /** True when `startedAt` was ASSUMED rather than observed, which is the case
+   *  for an entry minted by `upsertSlotSub` from an incremental frame: that frame
+   *  carries no start time, so the entry records its arrival instant. The agent
+   *  may already have been running for minutes, so a row MUST NOT render an
+   *  elapsed figure derived from it -- a card reading "3s" for a five-minute run
+   *  is the two-numbers-disagree confusion the idle row exists to remove. Cleared
+   *  by any frame that supplies real timing: a `subagent_snapshot` replay carries
+   *  `started`, and `subagent_done` carries `elapsed`. */
+  startedAtAssumed?: boolean
   toolCount?: number      // observed tool calls (incl. auto-approved) — running-card progress
   stalled?: boolean       // reaper flagged this subagent as idle/stalled
   /** Seconds of no stream activity measured when the reaper raised `stalled`
@@ -1478,6 +1508,11 @@ export interface PublishProviderDescriptor {
    *  available. Optional: older gateways omit it, and a row with no hint simply shows
    *  none rather than inventing one. */
   install_hint?: string
+  /** False => the published link requires authentication (content is stored privately),
+   *  so the publish flow shows neither the public-exposure warning nor the "publish
+   *  publicly" acknowledgment. Optional: older gateways omit it, and absence means
+   *  reachable -- a missing warning on a public link is the worse mistake. */
+  public_reachable?: boolean
   sharing_model: {
     supports_private: boolean
     supports_shared: boolean

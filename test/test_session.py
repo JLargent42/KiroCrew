@@ -1940,7 +1940,7 @@ class TestResetWithPid:
             patch("os.killpg") as mock_killpg,
             patch("os.getpgid", return_value=12345),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
-            patch("kiro_crew.acp.client._get_start_time", return_value=None),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=None),
         ):
             await mgr.reset("k1")
             mock_killpg.assert_called_once()
@@ -1961,7 +1961,7 @@ class TestResetWithPid:
         with (
             patch("os.kill", side_effect=ProcessLookupError),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
-            patch("kiro_crew.acp.client._get_start_time", return_value=None),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=None),
         ):
             await mgr.reset("k1")
 
@@ -1981,7 +1981,7 @@ class TestResetWithPid:
         with (
             patch("os.kill", side_effect=ProcessLookupError),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[333]),
-            patch("kiro_crew.acp.client._get_start_time", return_value=3000),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=3000),
             patch("kiro_crew.acp.client._read_basename", return_value=b"node"),
             patch("kiro_crew.acp.client._kill_escaped_children") as mock_sweep,
         ):
@@ -5704,11 +5704,11 @@ class TestIneffectiveCompactionCooldown:
         unknown mid-turn -- would settle here and be recorded nowhere, so the
         ledger would be missing exactly the compactions that were hardest to
         measure."""
-        from kiro_crew import session_ledger_emit
+        from kiro_crew.crew_log import emit as crew_log_emit
 
         seen: list[tuple[float, float]] = []
         monkeypatch.setattr(
-            session_ledger_emit,
+            crew_log_emit,
             "on_compaction_applied",
             lambda sid, *, pct_before, pct_after: seen.append((pct_before, pct_after)),
         )

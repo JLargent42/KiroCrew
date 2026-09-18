@@ -179,6 +179,7 @@ def test_the_contract_declares_every_seam_this_suite_covers():
         "internal_sandbox",
         "pod_home_remap",
         "reads_markdown_agent_specs",
+        "client_meta_settings",
         "verifies_agent_activation",
         "protocol_version",
         "client_capabilities",
@@ -368,11 +369,28 @@ def test_kas_capabilities_open_only_the_settings_channel():
     """KAS's extra capability is the settings channel and nothing else.
 
     Every other ``_meta.kiro`` capability is a callback Crew does not implement,
-    so declaring one would invite a request with no handler.
+    so declaring one would invite a request with no handler. The channel is
+    declared EMPTY here: the runtime fills it at spawn from the operator's
+    settings (``client_meta_settings``), so the constant stays the pristine shape
+    every host's handshake is compared against.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
     assert kas["_meta"] == {"kiro": {"settings": {}}}
     assert {k: v for k, v in kas.items() if k != "_meta"} == ACP_CLIENT_CAPABILITIES
+
+
+def test_only_the_host_with_a_settings_channel_has_it_filled():
+    """H6: whether ``initialize`` carries settings is a membership answer.
+
+    KAS opened ``_meta.kiro.settings`` and reads Tool Search from it; kiro-cli has
+    no such channel and takes the same setting from the cli.json overlay. A host
+    answering yes here without the channel would have its handshake rejected;
+    one answering no while it HAS the channel runs with every setting at the
+    engine's default -- which for Tool Search on KAS is the silent "loader never
+    mounted" the runtime's gate exists to prevent.
+    """
+    assert harness_for(ACP_BACKEND_KAS).client_meta_settings is True
+    assert harness_for(ACP_BACKEND_KIRO).client_meta_settings is False
 
 
 # ── Seam 3: session extras ──
@@ -390,7 +408,7 @@ async def test_kas_projects_the_agent_spec(kas_projection_stubbed, monkeypatch, 
     monkeypatch.setattr(
         kas_agents_mod,
         "build_kas_custom_agents",
-        lambda d, a, spec, *, stub_server_names, member_dispatch: projected,
+        lambda d, a, spec, *, stub_server_names, member_dispatch, session_key="": projected,
     )
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
     assert extras.custom_agents == projected
@@ -429,7 +447,7 @@ async def test_kas_projection_refuses_an_untranslatable_spec(
     from kiro_crew.acp.kas_agents import KasAgentTranslationError
     from kiro_crew.acp.session_handle import AcpRuntimeError
 
-    def _boom(d, a, spec, *, stub_server_names, member_dispatch):
+    def _boom(d, a, spec, *, stub_server_names, member_dispatch, session_key=""):
         raise KasAgentTranslationError("unreadable spec")
 
     monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _boom)
@@ -451,7 +469,7 @@ async def test_kas_projection_survives_an_unreadable_overlay(
     def _boom(overlay, agent):
         raise OSError("overlay unreadable")
 
-    def _build(d, a, spec, *, stub_server_names, member_dispatch):
+    def _build(d, a, spec, *, stub_server_names, member_dispatch, session_key=""):
         seen.append(frozenset(stub_server_names))
         return [{"name": a}]
 
@@ -475,7 +493,7 @@ async def test_kas_member_dispatch_subtracts_the_dashboard_server(
 
     seen: list[frozenset] = []
 
-    def _build(d, a, spec, *, stub_server_names, member_dispatch):
+    def _build(d, a, spec, *, stub_server_names, member_dispatch, session_key=""):
         seen.append(frozenset(stub_server_names))
         return []
 
@@ -549,10 +567,23 @@ async def test_kiro_answers_nothing():
 # ── Seam 5: notification aliases ──
 
 
-@pytest.mark.parametrize("backend", KIRO_FAMILY_BACKENDS)
-def test_both_kiro_family_hosts_share_one_vocabulary(backend):
-    """KAS is reached THROUGH kiro-cli's relay, so it speaks kiro-cli's aliases."""
-    assert harness_for(backend).notification_aliases is KIRO_FAMILY_ALIASES
+def test_kiro_keeps_its_legacy_notification_drain():
+    aliases = harness_for(ACP_BACKEND_KIRO).notification_aliases
+    assert aliases is KIRO_FAMILY_ALIASES
+    assert not aliases.mcp_readiness
+
+
+def test_kas_stages_status_and_catalog_and_requires_readiness():
+    from kiro_crew.acp.types import METHOD_KAS_MCP_STATUS, METHOD_KAS_TOOLS_CHANGED
+
+    aliases = harness_for(ACP_BACKEND_KAS).notification_aliases
+    assert aliases.session_update == KIRO_FAMILY_ALIASES.session_update
+    assert aliases.subagent_list_update == KIRO_FAMILY_ALIASES.subagent_list_update
+    assert aliases.mcp_init == KIRO_FAMILY_ALIASES.mcp_init + (
+        METHOD_KAS_MCP_STATUS,
+        METHOD_KAS_TOOLS_CHANGED,
+    )
+    assert aliases.mcp_readiness
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)

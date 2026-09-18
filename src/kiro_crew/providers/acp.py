@@ -39,15 +39,11 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_SESSION_SHARING,
+    ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
     EVENT_COMPACTION_STATUS,
+    PROVIDER_LABEL_BY_BACKEND,
     PROVIDER_LABEL_CLAUDE,
-    PROVIDER_LABEL_CODEX,
-    PROVIDER_LABEL_DEEPSEEK,
     PROVIDER_LABEL_DEFAULT,
-    PROVIDER_LABEL_GOOSE,
-    PROVIDER_LABEL_KAS,
-    PROVIDER_LABEL_OPENCODE,
-    PROVIDER_LABEL_PI,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
     acp_runtime_backends,
@@ -57,6 +53,13 @@ from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
+from kiro_crew.agent_sdk.tool_search import (
+    TOOL_SEARCH_DEFAULT_MIN_PCT,
+    TOOL_SEARCH_DEFAULT_MIN_TOKENS,
+    ToolSearchSettings,
+    clamp_min_pct,
+    clamp_min_tokens,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
@@ -76,6 +79,7 @@ from kiro_crew.providers.base import (
     resolve_billing_stats,
 )
 from kiro_crew.providers.cleanup import _is_safe_path
+from kiro_crew.recovery.ladder import InfraError
 
 logger = logging.getLogger(__name__)
 
@@ -131,30 +135,11 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
     )  # atomic: readers never see a partial file
 
 
-#: kiro-cli's own Tool Search activation thresholds. Mirrored as the defaults of
-#: ``AgentConfig.tool_search_min_pct`` / ``tool_search_min_tokens``; a test pins
-#: the two spellings together (config cannot import this module — it would be a
-#: circular import).
-TOOL_SEARCH_DEFAULT_MIN_PCT = 5
-TOOL_SEARCH_DEFAULT_MIN_TOKENS = 50_000
-
-
-def _clamp_min_pct(value: object) -> int:
-    """Coerce a configured percentage into 0..100, falling back to the default."""
-    try:
-        pct = int(value)  # type: ignore[call-overload]
-    except (TypeError, ValueError):
-        return TOOL_SEARCH_DEFAULT_MIN_PCT
-    return max(0, min(100, pct))
-
-
-def _clamp_min_tokens(value: object) -> int:
-    """Coerce a configured token count to >= 0, falling back to the default."""
-    try:
-        tokens = int(value)  # type: ignore[call-overload]
-    except (TypeError, ValueError):
-        return TOOL_SEARCH_DEFAULT_MIN_TOKENS
-    return max(0, tokens)
+# The thresholds and their clamps live in ``agent_sdk.tool_search`` so the
+# wire channel (KAS) and the overlay channel (kiro-cli) read one definition; the
+# names stay importable here because tests and the config mirror pin them.
+_clamp_min_pct = clamp_min_pct
+_clamp_min_tokens = clamp_min_tokens
 
 
 def _write_tool_search_overlay(
@@ -169,6 +154,12 @@ def _write_tool_search_overlay(
     used for effort. Workspace settings override the global
     ``~/.kiro/settings/cli.json`` so this only affects this slot's own kiro-cli
     session and never mutates the user's global kiro settings.
+
+    This file is the kiro-cli (Rust engine) channel only. KAS never opens it: its
+    Tool Search setting rides the ACP ``initialize`` request instead (see
+    :mod:`kiro_crew.agent_sdk.tool_search`), which is why the writer is
+    scoped to ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY`` and not to every kiro-family
+    host.
 
     Tool Search (https://kiro.dev/docs/cli/mcp/tool-search/) loads MCP tool
     specs on demand ("search-and-call") instead of sending every spec each
@@ -989,6 +980,7 @@ class AcpProvider(LLMProvider):
             mcp_gateway_socket=mcp_gateway_socket,
             acp_backend=self._client.backend,
             crew_agent=self._crew_agent,
+            tool_search=self._tool_search_settings(),
             **private_kwargs,
         )
         _t_spawn = time.monotonic()
@@ -1116,6 +1108,10 @@ class AcpProvider(LLMProvider):
                         mcp_gateway_socket=mcp_gateway_socket,
                         acp_backend=self._client.backend,
                         crew_agent=self._crew_agent,
+                        # Same wire settings as the first spawn: on a host that
+                        # takes Tool Search at initialize, a respawn without them
+                        # would run the replayed session with it silently off.
+                        tool_search=self._tool_search_settings(),
                         **private_kwargs,
                     )
                     try:
@@ -1316,15 +1312,37 @@ class AcpProvider(LLMProvider):
         except Exception:
             logger.warning("ACP effort overlay write failed", exc_info=True)
 
+    @property
+    def tool_search_settings(self) -> ToolSearchSettings | None:
+        """The resolved Tool Search choice this provider spawns runtimes with (H14 capability)."""
+        return self._tool_search_settings()
+
+    def _tool_search_settings(self) -> ToolSearchSettings | None:
+        """The operator's Tool Search choice, for the runtime's wire channel.
+
+        ``None`` when no toggle value was threaded in, which leaves the wire
+        silent exactly as the overlay writer is a no-op. The runtime decides per
+        host whether its handshake carries the setting and gates it on the agent
+        spec's loader grant; this method only resolves the operator's side.
+        """
+        if self._tool_search is None:
+            return None
+        return ToolSearchSettings.from_config(
+            self._tool_search, self._tool_search_min_pct, self._tool_search_min_tokens
+        )
+
     def _apply_tool_search_overlay(self) -> None:
         """Write the kiro Tool Search setting into the workspace cli.json overlay.
 
-        Tool Search is a kiro-cli feature read from this file at spawn, so the
-        write is scoped to the harnesses that read it; a no-op as well when no
-        toggle value was supplied (``self._tool_search is None``). Called before
-        every (re)spawn so resume/restart keeps the same setting.
+        Tool Search is read from this file at spawn by kiro-cli's Rust engine
+        only, so the write is scoped to ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY`` --
+        narrower than ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``, because KAS shares
+        the slash-command dialect but takes this setting over the wire instead
+        (:meth:`_tool_search_settings`). A no-op as well when no toggle value was
+        supplied (``self._tool_search is None``). Called before every (re)spawn
+        so resume/restart keeps the same setting.
         """
-        if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+        if self._client.backend not in ACP_BACKENDS_TOOL_SEARCH_OVERLAY:
             return
         if self._tool_search is None:
             return
@@ -1713,6 +1731,12 @@ class AcpProvider(LLMProvider):
             mcp_server_name=e.mcp_server_name,
             diff_old_text=e.diff_old_text,
             diff_path=e.diff_path,
+            # Typed execution-layer status (``kirocrew/status`` / the watchdog's
+            # ``waiting_input`` classification). The consumers read it here:
+            # chat_runner's tool-stall continuation takes ``wait_reason`` from
+            # it before the evidence text, and the sub-agent run loop yields
+            # its lane slot (``waiting_input`` WaitRecord) on it.
+            status=e.status,
         )
 
     @property
@@ -1982,6 +2006,19 @@ class AcpProvider(LLMProvider):
         """
         return getattr(self._client, "last_compaction_transient", False) is True
 
+    @property
+    def last_infra_error(self) -> InfraError | None:
+        """The inner client's L1 verdict on the last tool result, or None.
+
+        ``getattr`` with a None default, like ``last_compaction_transient``: on
+        the kiro path ``self._client`` is the placeholder AcpClient until
+        ``_start_kiro_runtime_impl`` swaps in the AcpSessionProvider that reads the
+        session handle, and an AcpClient never classifies tool results, so the
+        seams that do not participate answer "no verdict" rather than raising.
+        """
+        err = getattr(self._client, "last_infra_error", None)
+        return err if isinstance(err, InfraError) else None
+
     def touch_activity(self) -> None:
         self._client.touch_activity()
 
@@ -2051,18 +2088,9 @@ def provider_label(provider: Any) -> str:
         backend = getattr(getattr(provider, "client", None), "backend", "")
     else:
         return PROVIDER_LABEL_DEFAULT
+    # The claude test stays a NAME check ahead of the mapping rather than folding
+    # into it: ``is_claude_backend_name`` accepts every spelling this build treats
+    # as that harness, which is more than one mapping key can hold.
     if is_claude_backend_name(backend):
         return PROVIDER_LABEL_CLAUDE
-    if backend == ACP_BACKEND_KAS:
-        return PROVIDER_LABEL_KAS
-    if backend == ACP_BACKEND_CODEX:
-        return PROVIDER_LABEL_CODEX
-    if backend == ACP_BACKEND_OPENCODE:
-        return PROVIDER_LABEL_OPENCODE
-    if backend == ACP_BACKEND_PI:
-        return PROVIDER_LABEL_PI
-    if backend == ACP_BACKEND_GOOSE:
-        return PROVIDER_LABEL_GOOSE
-    if backend == ACP_BACKEND_DEEPSEEK:
-        return PROVIDER_LABEL_DEEPSEEK
-    return PROVIDER_LABEL_DEFAULT
+    return PROVIDER_LABEL_BY_BACKEND.get(backend, PROVIDER_LABEL_DEFAULT)

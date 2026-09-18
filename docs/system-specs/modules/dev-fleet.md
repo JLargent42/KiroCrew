@@ -337,16 +337,46 @@ name never has two workers racing to remove the same worktree. The frontend rend
 failure reason); the preview dialog maps the kept-list verdict codes to human-readable
 reasons so users can see why a worktree is a candidate or is kept.
 
-**Scan feedback:** the preview that opens that dialog (`prune-candidates`) runs `git` —
-and for merged-verdict candidates a `gh` lookup — per worktree, so on a large fleet the
-click is followed by seconds of silence before the dialog can appear. The Prune merged
-button therefore swaps its trash glyph for a spinner and sets `aria-busy` for the
-duration: disabling alone is indistinguishable from a wedged page, and a user who reads
-it as hung clicks again or reloads mid-scan.
+**Scan feedback:** the preview that opens that dialog (`prune-candidates`) runs `git` --
+and for merged- or closed-verdict candidates a `gh` lookup -- per worktree. Those
+per-worktree verdicts run concurrently, bounded by `_PRUNE_CONCURRENCY` (the same bound
+the parallel prune workers use), because a serial scan of a large fleet exceeds the
+gateway app proxy's 30s `_PROXY_TIMEOUT` and returns a 504. The scan is read-only git
+(`rev-parse`, `status`, `rev-list`/`cherry`, `merge-base`) and never takes
+`_GIT_MUTATION_LOCK`, which only the destructive removal path holds; candidate and kept
+lists are emitted in discovery order regardless of which verdict finishes first. Even
+concurrent, the scan takes time on a large fleet, so the Prune merged button swaps its
+trash glyph for a spinner and sets `aria-busy` for the duration: disabling alone is
+indistinguishable from a wedged page, and a user who reads it as hung clicks again or
+reloads mid-scan.
+
+The merged/closed head-OID check (`_fetch_pr_head_oid`) resolves the PR by
+`gh pr list --head <branch> --state all`, not `gh pr view <branch>`, so a merged PR whose
+head branch was deleted on merge still resolves its head OID and its worktree becomes a
+candidate rather than being withheld as `merged_unverified` forever. The lookup reads the
+whole PR set for the head and authorizes removal only when no `OPEN` PR is present; it
+requests one row beyond a fixed ceiling and fails closed if the head carries more PRs than
+that ceiling, so a reused branch name can never authorize removing new work.
 
 ## Pod Integration
 
-Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if unavailable):
+Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if unavailable).
+On Linux, `runtime.require_backend()` runs `systemctl --user is-system-running` once at
+pod verb entry and at each Dev Fleet removal safety gate. `kirocrew doctor` runs the same
+probe for its advisory row. Low-level `systemctl()`, `is_active()`, and `main_pid()` calls
+keep only the cheap platform, executable, and bus-address checks, so a multi-query verb does
+not pay a five-second probe before every unit command. A provably absent bus address returns
+`no_session` without spawning systemctl, and that pre-spawn check is the only source of
+backend absence. Every spawned probe failure is operational except a positive permission-denied
+match, which is `sandboxed_away`; neither can become `PodBackendAbsent`. Probe and unit operations
+resolve `systemctl` through `platform_compat.trusted_system_bin()` and pass that absolute path to
+the subprocess seam; a PATH entry can neither execute code nor forge the removal-safety verdict.
+If no trusted executable exists, the operation fails closed. Dev Fleet therefore refuses
+removal instead of treating the host as unable to contain a live pod. Spawned probes use
+`LC_ALL=C`, distinguish a reachable manager,
+an outer sandbox denial, and an unclassified failure, and retain systemctl's raw
+diagnostic. Dev Fleet runs both backend probes through `subprocess_executor()` so
+worktree removal never blocks the gateway event loop.
 
 - `runtime.active_names(cfg)` — one point-in-time systemctl/launchctl listing per fleet build
   (blocking, offloaded via `run_in_executor`), shared by every worktree row
@@ -876,6 +906,67 @@ The probe executes a **snapshot** of `npm_preflight.py` copied into an unguessab
 stdlib-only, so the copy needs no package context. Both halves matter: `-I` drops
 the cwd from `sys.path`, and the snapshot means an editable install cannot make
 the tree being synced supply the code doing the verifying.
+
+**The install rehearsal happens on the CHECKOUT's filesystem, not in `TMPDIR`.**
+`tempfile.mkdtemp()` with no `dir` takes `TMPDIR`, which on a default Linux host
+is `/tmp` — commonly a memory-backed filesystem whose inode count is capped at
+mount time and shared with every process on the box. A `node_modules` tree is tens
+of thousands of files, so unrelated litter there can starve Pull + Build while
+tens of gigabytes are still free, and the install is charged to RAM. Residency is
+a correctness property before it is a capacity one: this step exists to *rehearse*
+the real `npm ci`, and a rehearsal held on a filesystem with a different free-room
+budget answers a different question — it can pass where the real step fails for
+room, or fail where the real step would have succeeded. The scratch is taken from
+the repo ROOT rather than `website/`, which is the same filesystem in any ordinary
+checkout but keeps the directory outside both the frontend project `npm` resolves
+config against and the subtree the backend-only skip decision reads.
+
+**The repo root is used only where git hides the name.** The probe code ships with
+the installed gateway while the ignore rule covering its scratch name is a commit
+in the checkout's own history, so a fleet checkout parked on an older ref can run
+this code with no rule for it — and a probe killed in that window leaves an
+untracked directory in the checkout root, which reads as dirty and fail-closes
+`Prune merged`. So `_scratch_name_is_ignored` asks `git check-ignore` about a
+generated name and the repo hosts the scratch only on a yes. `git check-ignore` is
+the oracle rather than a read of `.gitignore`, because ignore resolution spans
+several files with precedence and negation. An unanswerable question — missing
+git, a timeout, not a repo — is read as NOT ignored: being wrong that way costs a
+rehearsal on `TMPDIR`, which is the step's previous behaviour, while the other way
+costs a checkout that silently reads dirty.
+
+**Being out of room is the verdict, never a reason to relocate.** A scratch
+creation that fails for room says the filesystem the real install targets has
+none, which is exactly the answer the step is there to produce; retrying somewhere
+roomier would certify a filesystem the install never touches. Only conditions that
+make the repo unusable as a host at all — missing, not writable, or not hiding the
+name — fall back. "Out of room" covers `ENOSPC` and `EDQUOT` together, because a
+per-user quota is how a managed host says the same thing, and the operator-facing
+sentence names neither a single filesystem nor a single budget: the install writes
+both the scratch and the package cache, which need not share a filesystem, and
+each can exhaust bytes or file slots while the other looks healthy.
+
+**Abandoned scratch directories are swept before a new one is created.** `probe`
+removes its own in a `finally`, so what survives is a run that never reached it —
+SIGKILL, an OOM kill, a reboot. `/tmp` was age-cleaned by the host; the checkout
+root is cleaned by nobody and the name is git-ignored, so without a sweeper an
+abandoned tree accumulates there invisibly. The sweep removes prefix-matching
+directories older than `_SCRATCH_STALE_SECS` (6 h), runs whenever the repo *could*
+host a scratch — including when the ignore gate then sends this probe to `TMPDIR`,
+since litter from an earlier gateway build is what an un-ignored checkout needs
+cleared — and is best-effort, because housekeeping must never be why a
+verification does not happen. Ordering it before creation is what makes it a
+remedy rather than hygiene: the room the litter holds is charged to the same
+budgets the incoming install is measured against. It takes no lock, so the age
+window is the concurrency guard, and the guard holds only while the window
+exceeds every deadline the module declares. That comparison is not left to prose:
+a test reads `probe`'s own default timeout and each fixed helper timeout out of
+the source, charges one probe with all of them back to back, and requires
+`_SCRATCH_STALE_SECS` to exceed that sum by a wide margin — 21600 s against
+1320 s today. Raising a deadline, or adding a helper, without widening the window
+fails that test rather than shipping a sweep that deletes a live probe's scratch.
+The ownership marker cannot cover this case: a running probe's scratch is
+genuinely marked and genuinely prefix-named, so age is the only thing that tells
+it from litter.
 
 **The generated runner itself carries `-I` too, and for the same reason.** `python
 -c` puts the inherited cwd at `sys.path[0]`, ahead of the standard library, and

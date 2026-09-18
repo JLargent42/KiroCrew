@@ -194,6 +194,10 @@ class NotificationAliases:
     """Methods that arrive while a session is initializing and must be staged
     until the session exists, rather than dropped as ownerless."""
 
+    mcp_readiness: bool = False
+    """Opt into the session-scoped status/catalog barrier. Hosts without these
+    snapshots keep their existing best-effort initialization drain."""
+
 
 # ── Seam 6: teardown ──
 
@@ -294,6 +298,18 @@ class HarnessAdapter(abc.ABC):
 
     @property
     @abc.abstractmethod
+    def client_meta_settings(self) -> bool:
+        """The host reads feature settings from ``initialize``'s ``_meta.kiro.settings``.
+
+        When true the runtime fills that channel at spawn (today: MCP Tool
+        Search, gated on the spawn agent's loader grant). When false the host
+        takes its settings elsewhere -- kiro-cli reads the workspace ``cli.json``
+        overlay -- and the handshake is sent exactly as :attr:`client_capabilities`
+        declares it.
+        """
+
+    @property
+    @abc.abstractmethod
     def verifies_agent_activation(self) -> bool:
         """After session start, confirm the requested agent is the active mode.
 
@@ -343,6 +359,7 @@ class HarnessAdapter(abc.ABC):
         work_dir: str | Path | None,
         mcp_gateway_overlay: Any = None,
         member_dispatch: bool = False,
+        session_key: str = "",
     ) -> SessionExtras:
         """Per-session payload for this host, for both session start paths.
 

@@ -113,10 +113,10 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "source-content digests remain server-side.",
     ),
     (
-        "Session ledger entries",
-        "session_ledger_emit.py",
-        "Message bodies written to the append-only per-session ledger under "
-        "`<home>/ledgers/sessions/` -- what the user typed and what the model "
+        "Crew log entries",
+        "crew_log/emit.py",
+        "Message bodies written to the append-only per-session crew log under "
+        "`<home>/crew-log/sessions/` -- what the user typed and what the model "
         "answered. This sink is a FILE rather than "
         "a response, so what it writes outlives the process and is read back "
         "later by folds and the session panel; that makes it an output boundary "
@@ -124,6 +124,25 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "body passes the shared exfiltration-URL then credential chain in the "
         "emitter rather than at its call sites, so a new call site cannot forget, "
         "and a redaction that fails writes the empty string instead of the input.",
+    ),
+    (
+        "Subagent wait broadcasts",
+        "subagent_manager/admission/waits.py",
+        "The wait REASON on the `subagent_waiting` frame, which reaches every dashboard "
+        "browser, the SSE relay and every app holding a `subagent:*` scope. It is the "
+        "same provider- and store-authored prose the task routes scrub and the sibling "
+        "`subagent_done` event redacts field by field, so it passes the shared "
+        "exfiltration-URL + credential chain before it leaves the process.",
+    ),
+    (
+        "Task queue panel responses",
+        "dashboard/handlers/tasks.py",
+        "Store-authored prose served by the Tasks & capacity routes: each task "
+        "event's data payload and each row's wait reason, both of which carry a "
+        "tool's or a provider's own error text verbatim. Every string, including "
+        "the ones nested in dicts and lists, passes through the shared "
+        "exfiltration-URL + credential chain before serialization; row "
+        "identifiers are left intact because the panel keys its rows by them.",
     ),
     (
         "Memory recovery responses",
@@ -205,15 +224,6 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "role ARN, and an endpoint override can carry an inline-credential URL -- "
         "so the first stderr line goes through the shared credential + "
         "exfiltration-URL chain at the source, before it is put on an `Identity`.",
-    ),
-    (
-        "Event backfill report samples",
-        "events/backfill.py",
-        "One serialized sample event per kind in the backfill validator's "
-        "report, printed to CLI stdout. Store fields folded into samples "
-        "(subagent task previews, cron names) can carry tokens the operator "
-        "pasted into a task, so each sample passes the shared two-pass "
-        "redaction before leaving the process.",
     ),
     (
         "Browser CLI install failures",
@@ -993,6 +1003,24 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "reaches this renderer already through the driver's rolling redactor.",
     ),
     (
+        "Feishu answer body",
+        "feishu/renderer.py",
+        "The answer body Feishu renders as markdown. `text()` is what `on_done` "
+        "sends, and Feishu is a buffered zero-widget channel: its body reaches "
+        "`render_options_as_text` -> `apply_options_cap`, which display-redacts the "
+        "numbered OPTIONS choices but returns the body itself unscrubbed, so the "
+        "only pass the body had was the driver's channel-neutral LITERAL stream "
+        "scan. A credential split by emphasis (`AKIA**REST`) or a link therefore "
+        "survives that scan and is reassembled when Feishu renders the markdown. "
+        "The body is screened at the send boundary through `Renderer.redact_for_"
+        "target` -- the `redact_for_display` pass over the credential + "
+        "exfiltration-URL chain, on the display form that actually ships. `text()` "
+        "is where the scrub lands because `text()` is what `on_done` sends; history "
+        "is persisted separately by `messaging.dispatch` from the driver's own "
+        "accumulated text, so this pass covers the shipped bytes without touching "
+        "the transcript.",
+    ),
+    (
         "Slack attachment titles and filenames",
         "slack/files.py",
         "The two upload sinks that are NOT the message body: an attachment's "
@@ -1413,7 +1441,8 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # handing them to facade-owned event/completion callbacks, but the split
         # adds no new transport or audience and therefore no additional posture
         # row.
-        "subagent_manager/admission.py",
+        "subagent_manager/admission/gate.py",
+        "subagent_manager/admission/pump.py",
         "subagent_manager/continuation.py",
         "subagent_manager/monitoring.py",
         "subagent_manager/run.py",
@@ -1925,6 +1954,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # -- the surface that eventually RENDERS a connector error is the egress
         # boundary and is a registered sink there, not here.
         "connections/control_plane/errors.py",
+        # Same class, one layer out: the Zoom vendor slice's `redact_zoom_secrets`
+        # scrubs Zoom-SHAPE credentials (signed `/rec/` media URLs, bare token
+        # fields the site-wide scanner does not recognize) as the error `detail`
+        # is BUILT in `zoom_operation_error`, composed BEFORE the control plane's
+        # `redacted_detail`. It owns no output and crosses no transport -- the
+        # surface that eventually renders a Zoom connector error is the egress
+        # boundary and is a registered sink there, not here.
+        "connections/vendors/zoom/errors.py",
     }
 )
 

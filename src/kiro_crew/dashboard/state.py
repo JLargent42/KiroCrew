@@ -36,6 +36,7 @@ from kiro_crew.constants import (
     SUBAGENT_COMPLETION_PREFIX,
 )
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
+from kiro_crew.dashboard.chat_tag_grants import seed_default_grants, seed_status_identity_rows
 from kiro_crew.dashboard.dashboard_persistence import DashboardPersistenceCoordinator
 from kiro_crew.dashboard.folder_repository import FOLDERS_FILE, FolderRepository
 from kiro_crew.dashboard.interaction_coordinator import (
@@ -48,7 +49,13 @@ from kiro_crew.dashboard.session_pulse_counter import increment_user_session_cou
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.dashboard.slot_buffers import SlotBufferCoordinator
 from kiro_crew.dashboard.slot_projection import SlotProjection
-from kiro_crew.dashboard.slot_queue_repository import SlotQueueRepository
+from kiro_crew.dashboard.slot_queue_repository import (
+    EMPTY_QUEUE_SIGNATURE,
+    SlotQueueRepository,
+    durable_queue_entries,
+    durable_queue_view,
+    queue_persist_signature,
+)
 from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.dashboard.websocket_hub import WebSocketHub
@@ -1773,6 +1780,31 @@ def build_tool_stall_recovery_prompt(
     return "\n".join(lines)
 
 
+def build_infra_retry_prompt(error_class: str, retry_after_secs: float | None) -> str:
+    """The L1 continuation: retry the refused call, nothing else.
+
+    Deliberately NOT a replay of the user's message: tool calls earlier in the
+    turn may have taken effect. The model is told which call failed and why,
+    and asked to issue that same call again. Opens with
+    ``REFUSAL_RECOVERY_PREFIX``: a capacity refusal IS a tool refusal carried
+    back to the model, and that is the card the dashboard already renders for
+    one -- a new marker would need its own card row and catalog copy.
+    """
+    hint = (
+        f" The server asked for a {int(round(retry_after_secs))}s pause, which has elapsed."
+        if retry_after_secs
+        else ""
+    )
+    return (
+        f"{REFUSAL_RECOVERY_PREFIX}\n"
+        "Your last tool call was refused by the MCP gateway for a transient "
+        f"infrastructure reason ({error_class}), not because of its arguments."
+        f"{hint} Re-issue exactly that tool call now with the same arguments and "
+        "continue from its result. Do not repeat any earlier tool call that "
+        "already returned a result."
+    )
+
+
 # [OPTIONS: a | b | c] — the marker ends a LINE here, so use the MULTILINE/
 # single-line canonical parser. Defined once in constants.py (shared with
 # slack/format.py and the renderer surfaces) so the ReDoS-hardened grammar can
@@ -2035,8 +2067,12 @@ class _ChatSlot:
         "_pending_consumers",
         "_pending_release_deferred",
         "_queue",
+        "_queue_persisted_sig",
+        "_queue_persist_inflight",
+        "_queue_persist_owed",
         "_last_enqueue_ts",
         "_approval_futures",
+        "_approval_stopped",
         "_trust",
         "_trust_scope",
         "_trust_reads",
@@ -2053,6 +2089,8 @@ class _ChatSlot:
         "_detail_render_lock",
         "_last_stop_reason",
         "_created_by",
+        "_created_by_sid",
+        "_lineage_minted",
         "_artifact",
         "_channel_folder_filed",
         "_resumed_count",
@@ -2107,6 +2145,7 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_tool_stall_exhausted_emitted",
         "_transient_5xx_retries",
+        "_infra_retries",
         "_fallback_candidate_idx",
         "_fallback_walked",
         "_active_fallback_model",
@@ -2114,7 +2153,27 @@ class _ChatSlot:
         "_fallback_slot_model",
         "_model_pick_gen",
         "_fallback_pick_gen",
+        "_fallback_client_pick_epoch",
+        "_refusal_fallback_primary",
+        "_refusal_fallback_candidate",
+        "_refusal_fallback_session_key",
+        "_refusal_retry_text",
+        "_refusal_fallback_attempted",
+        "_refusal_pick_gen",
+        "_refusal_client_pick_epoch",
+        "_refusal_replay_queue_id",
+        "_refusal_replay_stop_gen",
+        "_refusal_replay_session_stop_gen",
+        "_model_access_fallback_used",
+        "_model_access_recovery_pending",
+        "_model_access_recovery_stop_gen",
+        "_model_access_recovery_session_stop_gen",
+        "_model_access_recovery_session_key",
+        "_model_access_recovery_queue_id",
         "_posttoken_retry_used",
+        "_last_turn_structural_terminal",
+        "_last_turn_structural_terminal_loop_id",
+        "_last_turn_structural_terminal_loop_gen",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
         "_empty_response_retries",
@@ -2183,6 +2242,7 @@ class _ChatSlot:
         "_wait_steer_baseline",
         "_wait_contested",
         "_question_pending",
+        "_welcomed_agent",
     )
 
     def __init__(
@@ -2199,6 +2259,14 @@ class _ChatSlot:
         self.key = key
         self.title = title or key
         self.agent = agent
+        # The agent whose ``welcomeMessage`` this slot has already rendered.
+        # The hint is a ONE-SHOT per activation: the switch row emits it and
+        # the session start that the switch's own reset produces must not emit
+        # it again, so both paths clear through this single field rather than
+        # each guessing whether the other already ran. Not persisted — the row
+        # itself is, and a re-emit after a gateway restart costs one duplicated
+        # notice rather than a per-turn repeat.
+        self._welcomed_agent: str = ""
         self.model = model
         # Spawn-time withhold verdict for `model`, and the model id it was
         # computed for. Read through the `model_withheld` property, never these
@@ -2285,10 +2353,33 @@ class _ChatSlot:
         # outlive every consumer and the leak survives its own fix.
         self._pending_release_deferred: bool = False
         self._queue: list[dict[str, Any]] = []  # [{"id": uuid, "content": str}, ...]
+        # Signature of the durable queue value this slot's last committed save
+        # wrote (see slot_queue_repository.queue_persist_signature). Drift
+        # between it and the live queue is what tells the periodic flush a
+        # queued prompt is not on disk yet, so durability does not depend on
+        # every queue mutation site remembering to mark the slot dirty. Starts
+        # at the EMPTY signature: a slot with nothing queued owes no write, and
+        # an unnecessary save would rewrite the transcript and invalidate every
+        # cache keyed on its mtime.
+        self._queue_persisted_sig: str = EMPTY_QUEUE_SIGNATURE
+        # Single-flight for the immediate queue write (``start_queue_persist``).
+        # Loop-affine: set on the event loop, cleared in the future's done
+        # callback, which the loop also runs. The executor thread doing the save
+        # never reads either one, so they need no lock.
+        self._queue_persist_inflight: bool = False
+        self._queue_persist_owed: bool = False
         # Newest enqueue instant, read only while ``_queue`` is non-empty — see
         # ``_note_enqueue``.
         self._last_enqueue_ts: str = ""
         self._approval_futures: dict[str, asyncio.Future[str]] = {}  # type: ignore[type-arg]
+        # Approval ids a STOP rejected, rather than a person. A stop resolves the
+        # future with an ordinary "rejected", so the runner cannot tell the two
+        # apart at the point it records the decision, and its ledger entry would
+        # name a person who never answered. The id is added where the stop
+        # resolves the future and removed where the runner reads it, so nothing
+        # accumulates and a later human rejection on this slot cannot inherit the
+        # attribution. Ids rather than a flag, for exactly that reason.
+        self._approval_stopped: set[str] = set()
         self._trust: bool = False  # auto-approve tools for this slot
         # SafetyOverride scope key holding an EXPIRING, SEL-audited auto-approve
         # grant, for an unattended app worker with no human present to click
@@ -2349,6 +2440,24 @@ class _ChatSlot:
         #: person's own tab, a fork, a restore. Read by
         #: ``DashboardState.creator_slot_count`` for ``MAX_SLOTS_PER_CREATOR``.
         self._created_by: str = ""
+        #: The creator's ACP session id, FROZEN at mint (see ``session_control``).
+        #: Read at the child's first turn to stamp ``parent_sid`` on the immutable
+        #: ``session/opened`` crew log entry -- never re-read live, so a creator slot
+        #: closed and replaced after mint cannot corrupt this child's lineage.
+        #: In-memory only: it is never written to or restored from the transcript,
+        #: because that file is editable by an agent's file tools and the crew log
+        #: is fenced from them precisely so nothing there can be forged as
+        #: gateway-authored.
+        self._created_by_sid: str = ""
+        #: True only on a slot THIS gateway process minted through the
+        #: session-control create verb. Never persisted or restored: it is the
+        #: witness that ``_created_by`` / ``_created_by_sid`` were stamped by the
+        #: gateway at mint rather than read back from transcript metadata, and the
+        #: crew log ``session/opened.parent`` lineage is written only when it is set.
+        #: A child whose gateway restarted before its first turn writes no
+        #: ``parent`` -- ``_created_by`` alone is restored for authorization, never
+        #: promoted to lineage.
+        self._lineage_minted: bool = False
         # Artifact companion binding: set when this slot is a
         # companion chat session for an artifact (slug). At most one
         # non-archived slot per slug by convention — the frontend flow
@@ -2548,6 +2657,15 @@ class _ChatSlot:
         # ConnectionReset) retries on the interactive stream path. Distinct
         # budget from prompt-busy / pipe-death; reset on a completed turn.
         self._transient_5xx_retries: int = 0
+        # L1 gateway-capacity retries: how many times THIS cycle waited out an
+        # infrastructure refusal of a tool call (the ladder owns the budget; this
+        # is the slot-visible count the health panel classifies as recovering).
+        # Deliberately NOT _transient_5xx_retries: that one is a live budget read
+        # by the re-prompt gate, the backoff seed and the model-fallback
+        # threshold, so spending it here shortens the next real 5xx ladder and
+        # brings the fallback swap closer over a wait the primary model had no
+        # part in.
+        self._infra_retries: int = 0
         # Throttle-exhaustion model-fallback walk state (agent.fallback_model).
         # _fallback_candidate_idx / _fallback_walked are PER-CYCLE (next chain
         # position to try + candidates already tried this logical turn, for the
@@ -2575,11 +2693,118 @@ class _ChatSlot:
         # snapshotted when the fallback activated.
         self._model_pick_gen: int = 0
         self._fallback_pick_gen: int = 0
+        # The shared client's explicit-pick epoch at fallback activation. The
+        # slot-local _fallback_pick_gen is invisible to a pick made through a
+        # session alias (a channel-born slot and its dashboard twin share one
+        # wire session and one client object); the restore probe compares this
+        # shared epoch so an alias's explicit pick is not silently overwritten,
+        # mirroring _refusal_client_pick_epoch on the refusal path.
+        self._fallback_client_pick_epoch: int = 0
+        # Content-filter (refusal) fallback state (agent.refusal_fallback_model).
+        # _refusal_fallback_primary/_refusal_fallback_candidate are the models
+        # to restore/verify at the start of the NEXT genuine turn after a
+        # refusal retry swapped the live session (single-message semantics —
+        # unlike the throttle fallback above, this swap never sticks).
+        # _refusal_retry_text is the replayed message queued by the swap; the
+        # runner matches it at dispatch to tell the retry turn apart from a
+        # genuine new message (and to drop a record whose replay a Stop
+        # purged). _refusal_fallback_attempted is the one-attempt-per-user-
+        # message guard: a refusal from the fallback too is terminal.
+        self._refusal_fallback_primary: str = ""
+        self._refusal_fallback_candidate: str = ""
+        # The session binding the refusal swap ran under, captured ONCE at
+        # swap time. The restore locks on THIS key (not a re-derived one) so
+        # both seams always share one lock domain, and the drain purges the
+        # replay when the live binding differs — a cron result binding an
+        # unbound slot mid-turn must not route the replay onto the newly
+        # bound session.
+        self._refusal_fallback_session_key: str = ""
+        self._refusal_retry_text: str = ""
+        self._refusal_fallback_attempted: bool = False
+        # _model_pick_gen snapshot taken at refusal-swap time: a gen that moved
+        # means an explicit user pick landed after the swap, and the restore
+        # must respect it instead of stomping it with the old primary (same
+        # rule as _fallback_pick_gen on the throttle path).
+        self._refusal_pick_gen: int = 0
+        # Snapshot of the shared CLIENT's explicit-pick epoch at refusal-swap
+        # time: a pick through a session alias moves the client epoch without
+        # touching this slot's generation, and the restore must see it.
+        self._refusal_client_pick_epoch: int = 0
+        # The refusal replay's queue entry id plus stop-generation snapshots
+        # (slot + session) taken at ENQUEUE. The drain compares the live
+        # counters against these: any increment means a Stop landed while the
+        # replay waited, and a pending steer / user-queued follow-up means the
+        # replay was superseded — either way the drain purges the entry instead
+        # of dispatching superseded work ahead of the user's correction.
+        self._refusal_replay_queue_id: str = ""
+        self._refusal_replay_stop_gen: int = 0
+        self._refusal_replay_session_stop_gen: int = 0
+        # One-shot guard for the reactive model-access-denial fallback: a new
+        # conversation whose configured model (commonly the "auto" sentinel) is
+        # refused for entitlement, not throttled, is re-prompted at most ONCE on
+        # the first advertised model this account can run, rather than failing
+        # the first reply. One attempt only, so an account entitled to nothing
+        # falls through to the terminal entitlement error naming what was tried
+        # instead of looping. Refreshed at the start of a genuine user turn but
+        # NOT when the incoming turn is the swap's own replay (the
+        # _model_access_recovery_pending latch below carries that fact across),
+        # so a still-unentitled candidate cannot trigger a second swap.
+        self._model_access_fallback_used: bool = False
+        # Set when a model-access swap re-queues the user's ORIGINAL message as a
+        # synthetic recovery. That replay is indistinguishable from a fresh user
+        # turn at reset time (it carries the user's own words, not a synthetic
+        # marker), so this one-turn latch tells the reset to preserve
+        # _model_access_fallback_used for exactly that replay and is consumed
+        # there.
+        self._model_access_recovery_pending: bool = False
+        # _stop_generation snapshotted when that recovery is enqueued. A soft Stop
+        # (first press) does NOT clear the queue and the drain's continuation
+        # purge does not cover a message replay, so the drain compares this
+        # snapshot against the live counter at dequeue: any increment (or a
+        # pending steer / user follow-up) means the user cancelled or superseded
+        # the turn while the recovery waited, and the replay is dropped instead of
+        # dispatched.
+        self._model_access_recovery_stop_gen: int = 0
+        # Session-scoped counterpart of the snapshot above. A Stop issued on a
+        # linked channel surface advances only the session-scoped counter, not
+        # the slot one, so the dequeue drain compares this too — without it a
+        # linked-channel Stop with nothing queued would leave the cancelled
+        # replay in the queue head to dispatch.
+        self._model_access_recovery_session_stop_gen: int = 0
+        #: The session binding the model-access recovery replay's swap ran under,
+        #: captured at enqueue. The drain and consume seam compare the live key
+        #: against it and drop the replay when they differ, so a cron result
+        #: binding an unbound slot mid-episode cannot replay the original prompt
+        #: into the newly bound session.
+        self._model_access_recovery_session_key: str = ""
+        #: The queue id of the model-access recovery replay, recorded at enqueue
+        #: so the drain abort removes only THIS entry. SYNTHETIC_RECOVERY_KIND is
+        #: shared across recovery paths, so a blanket removal by kind would
+        #: destroy co-queued unrelated recoveries.
+        self._model_access_recovery_queue_id: str = ""
         # One-shot guard for the post-token (text-only) transient retry: a turn
         # that has already streamed answer tokens may be re-prompted at most
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
         # completed turn alongside _transient_5xx_retries.
         self._posttoken_retry_used: bool = False
+        # True after the slot's LAST turn ended on a STRUCTURAL terminal error
+        # (a malformed-request rejection: the backend refused the payload's
+        # SHAPE, so re-sending the identical context reproduces it). Read by the
+        # auto-nudge fire path to STOP a self-prompting loop instead of firing
+        # the same doomed context every interval; cleared at the start of every
+        # genuine new turn (see chat_runner) so a human /clear-then-message, or
+        # any turn with different context, re-arms the loop. Not persisted: a
+        # gateway restart re-derives it from the next turn's outcome, and a loop
+        # reloaded active simply fires once and re-learns the verdict.
+        self._last_turn_structural_terminal: bool = False
+        # The id of the loop whose delivered wake set the flag above, so the fire
+        # guard scopes the verdict to that loop and cannot deactivate a DIFFERENT
+        # loop armed later on the same slot. Empty when the flag is False.
+        self._last_turn_structural_terminal_loop_id: str = ""
+        # The loop's config generation the malformed turn fired under; the fire
+        # guard passes it to AutoNudgeService.update(expected_generation=...) so
+        # the stop is applied under an atomic (id, generation) fence.
+        self._last_turn_structural_terminal_loop_gen: int = 0
         # Poisoned-conversation escalation (cross-cycle). A cycle that EXHAUSTS
         # the transient-5xx ladder with ZERO output counts one pre-stream
         # exhaustion; consecutive exhausted cycles indicate the backend is
@@ -3475,6 +3700,30 @@ class _ChatSlot:
 
     def queue_promote_by_id(self, queue_id: str) -> bool:
         return self._queue_repository.queue_promote_by_id(self, queue_id)
+
+    def durable_queue_entries(self) -> list[dict[str, Any]]:
+        """The queued user prompts a metadata writer may persist right now."""
+        return durable_queue_entries(self._queue)
+
+    def durable_queue_view(self) -> tuple[list[dict[str, Any]], int]:
+        """Persistable queued prompts and the candidate count, from one read.
+
+        Used where the two are SUBTRACTED (the save's over-cap report), so the
+        difference describes one observation of the queue rather than two.
+        """
+        return durable_queue_view(self._queue)
+
+    @property
+    def queue_persist_pending(self) -> bool:
+        """True while a queued user prompt differs from what is on disk.
+
+        A queued prompt is the user's own words with NO other copy: the
+        transcript row for it is written by the drain, not by the enqueue, so
+        until a save carries the queue itself the only record is this process's
+        memory. The periodic flush reads this beside ``_dirty`` so an enqueue
+        (or any in-place queue mutation) reaches disk on the next pass.
+        """
+        return queue_persist_signature(self.durable_queue_entries()) != self._queue_persisted_sig
 
     @property
     def task(self) -> asyncio.Task[Any] | None:
@@ -4608,7 +4857,18 @@ class DashboardState:
         update_can_arm: bool = False,
         version_display: str = "",
     ) -> dict[str, Any]:
-        """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
+        """Core status fields shared by /api/status, SSE, and WebSocket pushes.
+
+        ``cron_jobs`` and ``lessons`` are supplied by the caller and never
+        computed here: the only production caller is
+        ``status_counts.cached_status_snapshot``, which loads both counts off
+        the event loop through the shared count cache. Computing them inline
+        would run ``_count_lessons`` (a JSONL read plus a SQLite ``COUNT(*)``)
+        and ``crons.count_enabled_from_disk`` (a ``crons.json`` parse) on the
+        loop thread -- the ``no-blocking-call-on-event-loop`` freeze class this
+        emitter path exists to avoid. ``None`` means the count is unknown and
+        renders as a loading skeleton, never an authoritative 0.
+        """
         uptime = int(time.time() - self.start_time)
         branch, commit = self._build_info
         return {
@@ -4620,8 +4880,8 @@ class DashboardState:
             "start_time": self.start_time,
             "sessions": self.sessions.count,
             "messages": self.messages_received,
-            "cron_jobs": cron_jobs if cron_jobs is not None else len(self.crons.list_jobs()),
-            "lessons": lessons if lessons is not None else self._count_lessons(),
+            "cron_jobs": cron_jobs,
+            "lessons": lessons,
             "subagents": self.subagents.count if self.subagents else 0,
             "update_available": update_available,
             # Can THIS install replace its own code without the user leaving the
@@ -5483,7 +5743,7 @@ class DashboardState:
             slot.channel_origin = True
         if linked_session_key:
             slot.linked_session_key = linked_session_key
-        elif self.sessions:
+        elif self.sessions and not app:
             # No caller-supplied binding, but a channel-stem name means this slot
             # displays a conversation that runs on the channel's own session.
             # Resolving it HERE rather than in each caller is what makes the
@@ -5497,6 +5757,11 @@ class DashboardState:
             # only a real channel key may become a binding, so a malformed map
             # answer leaves the slot unbound (a supported state) rather than
             # routing the user's replies to a session no channel reads.
+            #
+            # Never for an APP-owned slot: a channel thread is the person's
+            # conversation, and the name is app-supplied, so resolving it here
+            # would let an app that knows a stem mint a slot bound to — and
+            # writing metadata into — a transcript it does not own.
             if is_channel_session_key(name):
                 resolved = self.sessions.channel_key_for_stem(name)
                 if isinstance(resolved, str) and is_channel_session_key(resolved):
@@ -6010,8 +6275,17 @@ class DashboardState:
         """
         return int(getattr(self, "_folders_generation", 0) or 0)
 
-    async def mutate_folders(self, mutate: Callable[[list[dict[str, Any]]], tuple[bool, _T]]) -> _T:
-        """Serialize a folder mutation and confirm its off-loop persistence."""
+    async def mutate_folders(
+        self,
+        mutate: Callable[[list[dict[str, Any]]], tuple[bool, _T]],
+        on_committed: Callable[[], None] | None = None,
+    ) -> _T:
+        """Serialize a folder mutation and confirm its off-loop persistence.
+
+        ``on_committed`` runs under the repository lock only after the write
+        is proven, so callers can attach side effects that must not outlive a
+        rolled-back or no-op transaction.
+        """
 
         def _mark_committed() -> None:
             # This runs under the repository lock and only after the write is
@@ -6019,6 +6293,8 @@ class DashboardState:
             # re-fetch a tree that never changed, and concurrent commits must
             # not collapse two monotonic generation bumps into one.
             self._folders_generation = self.folders_generation() + 1
+            if on_committed is not None:
+                on_committed()
 
         return await _FOLDER_REPOSITORY.mutate(
             lambda: self._folders,
@@ -6063,10 +6339,16 @@ class DashboardState:
                     # Keep rows the active list dropped verbatim so the seed/
                     # back-fill save below (and every later save) round-trips
                     # them back instead of erasing a hand-edited-but-typo'd row
-                    # at boot with no user action.
+                    # at boot with no user action. An ``id`` that is not a
+                    # non-empty string is such a row: every reader keys on the
+                    # id (set membership, dict keys, ``str(t["id"])``), and an
+                    # unhashable or non-string one would raise there, so it is
+                    # preserved on disk but not activated.
                     self._tags, unparsed = self._partition_preserving(
                         raw,
-                        lambda t: isinstance(t, dict) and bool(t.get("id")),
+                        lambda t: isinstance(t, dict)
+                        and isinstance(t.get("id"), str)
+                        and bool(t["id"]),
                         "tag entr(ies)",
                         self._TAGS_FILE,
                     )
@@ -6095,12 +6377,54 @@ class DashboardState:
             if "status" not in t:
                 t["status"] = t.get("id") in seed_ids
                 mutated = True
+        seeded_default_vocab = False
         if not file_existed and not self._tags:
             # Fresh install (no tags.json on disk) — seed the default vocabulary.
             self._tags = [dict(t) for t in self._DEFAULT_TAGS]
             mutated = True
+            seeded_default_vocab = True
+
+        # One-time seed of the agent tag-write grants store, from TRUSTED CODE
+        # CONSTANTS only: the default workflow-state tag ids. Never derived
+        # from tags.json (agent-writable — promoting its fields into the
+        # protected store would launder a forged grant through the upgrade;
+        # a forgery hazard). Custom grants are minted by the dashboard CRUD.
+        # Default grants are minted ONLY on the boot that also seeds the
+        # default vocabulary: an UPGRADED install may have deleted those tags,
+        # and granting their ids anyway would let an agent restore the id in
+        # agent-writable tags.json and inherit the authority after restart
+        # (a forgery hazard). Everyone else gets an EMPTY store.
+        #
+        # ORDERING (crash atomicity, same rule as the create endpoint): the
+        # grants are seeded BEFORE the vocabulary commit. A crash between the
+        # two then leaves grant rows for ids no vocabulary entry references —
+        # inert, and the next boot (still a fresh install: no tags.json) seeds
+        # the vocabulary while ``seed_default_grants`` keeps the store that
+        # already verifies. The reverse order leaves a durable seeded
+        # vocabulary whose next boot reads as an upgraded install and seeds an
+        # EMPTY store, demoting every default workflow state to human-only.
+        try:
+            seed_default_grants(
+                [t["id"] for t in self._DEFAULT_TAGS if t.get("status")]
+                if seeded_default_vocab
+                else []
+            )
+        except Exception:
+            logger.warning("agent-tag grant seed failed", exc_info=True)
         if mutated:
             self.save_tags()
+
+        # Upgraded installs (store present or vocabulary pre-existing) still
+        # need STATUS IDENTITY for the default workflow-state ids: without a
+        # row, set_state reads a default status tag as non-status and skips
+        # exclusive-peer stripping, so two workflow states persist. Identity
+        # rows are policy "none" — they constrain and grant nothing, so a
+        # restored id in agent-writable tags.json inherits no authority.
+        # Ids from code constants only; existing rows are never touched.
+        try:
+            seed_status_identity_rows([t["id"] for t in self._DEFAULT_TAGS if t.get("status")])
+        except Exception:
+            logger.warning("status-identity row seed failed", exc_info=True)
 
         # Column layout: flat list of {id, name, tag_ids, mode, order}.
         # Empty list = single implicit "all sessions" column (legacy UX).
@@ -6111,10 +6435,12 @@ class DashboardState:
                 if isinstance(raw, list):
                     # Preserve dropped columns verbatim so a later save
                     # round-trips them rather than erasing a hand-edited-but-
-                    # typo'd column.
+                    # typo'd column. Same id rule as the tag rows above.
                     self._tag_boards, unparsed_cols = self._partition_preserving(
                         raw,
-                        lambda c: isinstance(c, dict) and bool(c.get("id")),
+                        lambda c: isinstance(c, dict)
+                        and isinstance(c.get("id"), str)
+                        and bool(c["id"]),
                         "sidebar column(s)",
                         self._TAG_BOARDS_FILE,
                     )

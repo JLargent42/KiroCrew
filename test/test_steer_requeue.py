@@ -225,8 +225,8 @@ class TestSteerConsumedClears:
         state = _make_state(tmp_path)
         return state.get_or_create_slot("test")
 
-    def test_no_site_writes_the_steer_entry(self, tmp_path, monkeypatch):
-        """`message/steered` has no emitter, and that is deliberate.
+    def test_no_site_writes_a_steer_entry(self, tmp_path, monkeypatch):
+        """The session vocabulary carries no steer type, and that is deliberate.
 
         The fact is knowable only from this echo, while the assistant text the steer
         INTERRUPTED reaches the log from the handler's segment cut, which runs when
@@ -236,11 +236,26 @@ class TestSteerConsumedClears:
         Cutting the segment from here instead flushes post-steer text above the steer
         row in the transcript, which is worse.
 
-        This guards the decision rather than the mechanism: re-adding an emit at
-        either site without a resolver that owns both facts reddens this test.
+        This guards the decision rather than the mechanism, on both halves: the
+        emitter exposes no steer entry point to call, and settling still works
+        without one. Adding an emitter back at either site, without a resolver that
+        owns both facts, reddens this test.
+
+        `subagent/steered` is a different type and is exempt: its site accepts the
+        steer and holds both the child's id and the mode at that moment, so there is
+        no second observer to wait for and no seq it could contradict. It is named
+        here as an exact set rather than skipped by a substring, so a second
+        steer-named entry point -- for either family -- still reddens this.
         """
-        from kiro_crew import session_ledger_emit
+        from kiro_crew.crew_log import emit as crew_log_emit
         from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
+
+        assert {name for name in dir(crew_log_emit) if "steer" in name.lower()} == {
+            "on_subagent_steered"
+        }, (
+            "the emitter's steer-named entry points changed; a message steer has no "
+            "site that can order one correctly"
+        )
 
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -249,16 +264,14 @@ class TestSteerConsumedClears:
         slot._steer_delivery_ids = {"fix the bug": "d-settled", "late arrival": "d-pending"}
         slot._acp_client = MagicMock()
 
-        seen: list[int] = []
-        monkeypatch.setattr(session_ledger_emit, "session_id_of", lambda _c: "acp-1")
-        monkeypatch.setattr(
-            session_ledger_emit, "on_message_steered", lambda *a, **kw: seen.append(1)
-        )
+        appended: list[tuple] = []
+        monkeypatch.setattr(crew_log_emit, "session_id_of", lambda _c: "acp-1")
+        monkeypatch.setattr(crew_log_emit, "_write", lambda *a, **kw: appended.append((a, kw)))
 
         _settle_consumed_steers(slot, "<user_message>\nfix the bug\n</user_message>", state)
 
         assert slot._pending_steers == ["late arrival"], "settling itself still works"
-        assert seen == [], "the steer entry has no emitter until a resolver owns both facts"
+        assert appended == [], "the echo wrote a crew log entry it cannot order"
 
     def test_snapshot_settles_only_contained_steers(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.chat_runner import _settle_consumed_steers

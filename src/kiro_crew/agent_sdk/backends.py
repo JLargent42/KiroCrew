@@ -73,6 +73,10 @@ with no row here.
      - disposition
    * - ``ACP_BACKENDS_KNOWN``
      - pre-session registry query (membership gate on the ``acp_backend`` kwarg)
+   * - ``ACP_BACKENDS_SELF_SERVED_ACP``
+     - driver-internal (whether this harness's whole launch is a value
+       :data:`ACP_BACKEND_LAUNCH` already holds, so the spawn path, the install
+       probe and the driver seams resolve it from that row)
    * - ``ACP_BACKENDS_SESSION_MCP_ARRAY``
      - driver-internal (which channel carries the MCP server list)
    * - ``ACP_BACKENDS_META_IDENTITY``
@@ -130,6 +134,10 @@ with no row here.
      - driver-internal (whether ``settings.local.json`` is re-seeded on switch)
    * - ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``
      - driver-internal (whether ``_kiro.dev/commands/execute`` exists)
+   * - ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY``
+     - driver-internal (whether the workspace ``cli.json`` Tool Search keys are written)
+   * - ``ACP_BACKENDS_CLIENT_META_SETTINGS``
+     - driver-internal (whether ``initialize`` carries ``_meta.kiro.settings``)
    * - ``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD``
      - pre-session registry query (whether the dashboard may skip a session reset)
    * - ``ACP_BACKENDS_STRUCTURED_REFUSAL``
@@ -149,6 +157,13 @@ with no row here.
    * - ``ACP_BACKENDS_RESUME_WITHOUT_LOAD``
      - driver-internal (which ACP verb restores a session, and which capability
        key advertises it)
+   * - ``ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY``
+     - driver-internal (whether the session's project checkout scopes the broker
+       overlay lookup, read only through :func:`overlay_project_scope` while
+       ``kiro_crew.acp`` composes the ``session/new`` MCP array). Deliberately not
+       a semantic question: it describes where a HOST reads agent specs from, and
+       no consumer above the boundary asks it -- what a consumer would ask about
+       is the resulting server list, which it already receives
 
 The two non-set tables ``SessionCapabilities`` also translates are
 :func:`model_registry_namespace` (the model-id namespace) and
@@ -159,8 +174,9 @@ seam). Both already existed; neither gained a member here.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from enum import Enum
-from typing import FrozenSet, Mapping, Set
+from typing import Any, FrozenSet, Mapping, Set
 
 from kiro_crew.constants import env_flag_enabled
 
@@ -964,6 +980,91 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # because none of them reads ``~/.kiro/agents`` at all.
 ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS})
 
+# Backends whose agent spec comes from the USER-LEVEL directory alone, so a
+# checkout's same-named spec is not the agent their session is running.
+#
+# Every other host resolves the nearer layer too: kiro-cli reads
+# ``<project>/.kiro/agents/`` itself for ``--agent``, and a MIRRORED host receives
+# the array ``acp/session_mcp.py`` translates, which is project-nearest-first. KAS
+# is the exception -- ``acp/kas_agents.load_agent_spec`` is handed
+# ``paths.kiro_agents_dir()`` and reads nothing else, which
+# ``agent_discovery.project_agent_files`` already states, so a project-only agent
+# selected on a KAS session is refused at session start rather than projected.
+#
+# What membership decides is the SCOPE of the broker-overlay lookup
+# (``mcp_gateway.session_servers``). That overlay is keyed by agent name and is
+# also written from the user-level directory, so for every OTHER host a
+# checkout-declared name means the overlay holds no stubs for this session. For a
+# member the reverse holds: the user-level agent IS the one running, so scoping
+# its lookup would suppress the stubs for servers the session really has and run
+# them outside the pool, outside caller-identity attribution and outside broker
+# governance. Read through the runtime's own scope helper, never as "is KAS": a
+# host added later that reads the user level alone joins here.
+ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY = frozenset({ACP_BACKEND_KAS})
+
+
+def overlay_project_scope(backend: str, work_dir: Any) -> dict[str, Any]:
+    """The overlay-lookup scope keywords for *backend*'s session.
+
+    The ONE decider, so every call site that resolves the overlay -- ``AcpClient``
+    and ``AcpRuntime`` alike -- answers from
+    :data:`ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY` rather than from its own
+    spelling. A host reading the user level alone joins the set and both paths
+    change together; the alternative, one path keyed on the set and the other
+    hardcoding the session's checkout, silently mis-scopes the next such host,
+    which is the defect this function exists to make unreachable.
+
+    Returned as keywords to SPLAT, because the checkout is not the whole scope:
+    which spec FORMATS this session's agent resolution SEES is the other half. A
+    project spec shadows the user-level overlay only in a form that resolution
+    honours, and the two halves must name the same file.
+
+    ``markdown_specs`` and ``dispatchable_only`` are two facets of ONE question --
+    which resolver decides this session's agent spec -- so they are computed here
+    together rather than derived from each other at a call site.
+
+    A MIRRORED host's array is composed by Crew from a spec ``acp.session_mcp``
+    resolves through ``_project_spec_path_for``: it scans both forms and matches on
+    ``agent_discovery.project_agent_name``, which falls back to the filename stem.
+    So the overlay lookup must match the same way -- both forms, no parse
+    requirement. That is not a formality: when that resolver matches a project file
+    it returns that file's read and does NOT fall back to the user level, so a
+    MALFORMED project spec leaves the projection with no spec at all, no ``tools``
+    allowlist and no project servers. Keeping the user-level stubs on top of that
+    would put servers in the session that nothing in force declares.
+
+    kiro-cli instead resolves ``--agent`` from the checkout ITSELF, discovers the
+    JSON form there (measured on 2.22.0, and pinned by the
+    ``KIROCREW_E2E_REAL_KIRO_CLI``-gated test), and reports a malformed spec as an
+    error offering no such mode -- so it runs the user-level agent, whose stubs must
+    therefore be kept. Hence JSON only, and a parse required.
+
+    :data:`ACP_BACKENDS_MARKDOWN_AGENT_SPECS` -- a host reading the markdown form
+    from a checkout itself -- is deliberately NOT OR-ed in: its only member also
+    reads the user level alone and leaves above, so the term would have no caller
+    able to reach it. ``test_agent_sdk_capabilities`` pins that containment, so a
+    host which breaks it fails there naming this function.
+
+    The import is deferred because the mirror registry imports THIS module at its
+    own top level. It is not wrapped: an import that does not resolve is a
+    packaging fault, and answering "kiro-shaped" for a mirrored host because of one
+    would silently reinstate the stub-shadowing this scope exists to prevent.
+
+    ``work_dir`` is passed through untouched (``str``, ``Path`` or ``None``) so
+    the caller keeps whichever form it already holds.
+    """
+    if backend in ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY:
+        return {}
+    from kiro_crew.providers.mirrors.registry import has_mirror
+
+    mirrored = has_mirror(backend)
+    return {
+        "work_dir": work_dir,
+        "markdown_specs": mirrored,
+        "dispatchable_only": not mirrored,
+    }
+
+
 # ── The preview switch: codex-acp on AcpRuntime ──
 #
 # ``ENV_CODEX_ACP_RUNTIME`` is the ONE thing that moves codex-acp from AcpClient
@@ -1284,10 +1385,11 @@ def model_registry_namespace(backend: str) -> str:
 # slash commands go through ``session/prompt`` and are interpreted by the adapter
 # (or degrade to prompt text) instead of returning -32601 for the whole call.
 #
-# The same membership decides who reads the workspace ``cli.json`` overlay: the
-# kiro-family harnesses take effort and Tool Search from that file at spawn, and
-# writing it for a harness that never reads it leaves a stale file in the user's
-# workspace that no later clear can reach.
+# The same membership decides who reads the workspace ``cli.json`` overlay for
+# EFFORT: the kiro-family harnesses take ``chat.modelDefaults`` from that file at
+# spawn, and writing it for a harness that never reads it leaves a stale file in
+# the user's workspace that no later clear can reach. Tool Search has its own,
+# narrower set below -- the two hosts read that setting from different places.
 # opencode is not a member: it has no ``_kiro.dev`` verb, and it publishes its own
 # command list as an ``available_commands_update`` on ``session/update`` instead.
 # pi is not a member for the same reason: pi-acp publishes its built-ins the same
@@ -1295,6 +1397,23 @@ def model_registry_namespace(backend: str) -> str:
 # deepseek is not a member and publishes no command list either: it carries commands
 # internally and its ACP surface rejects them, so it exposes none over the wire.
 ACP_BACKENDS_KIRO_SLASH_COMMANDS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that read the MCP Tool Search setting from the workspace ``cli.json``
+# overlay (``toolSearch.*`` keys). Only kiro-cli's Rust engine does. KAS shares
+# the slash-command dialect above but never opens that file: on the relay path
+# nothing forwards it, so a Tool Search value written there for a KAS session is
+# dead -- the setting looks on in the dashboard while the engine runs with it off.
+# KAS takes the setting from the handshake instead (the set below).
+ACP_BACKENDS_TOOL_SEARCH_OVERLAY = frozenset({ACP_BACKEND_KIRO})
+
+# Backends that take feature settings from the ACP ``initialize`` request, under
+# ``clientCapabilities._meta.kiro.settings``. KAS is the only member: it opened
+# that channel (``KAS_CLIENT_CAPABILITIES``), and the runtime fills it at spawn
+# with the settings the harness declares it reads -- today Tool Search, gated on
+# the spawn agent's spec granting the ``tool_search`` loader, because KAS defers
+# every MCP spec when told to and does not check that a loader exists. kiro-cli
+# is not a member: it has no such channel and reads the overlay file instead.
+ACP_BACKENDS_CLIENT_META_SETTINGS = frozenset({ACP_BACKEND_KAS})
 
 # Backends that reconcile an edited agent config into their RUNNING sessions: a
 # file watcher on ``~/.kiro/agents`` and ``mcp.json`` restarts only the changed
@@ -1651,6 +1770,116 @@ ACP_BACKEND_PERMISSION_SETTING: dict = {
 ACP_BACKEND_GATE_PROBE_COMMAND: dict = {
     ACP_BACKEND_PI: "kiro-crew-gate",
 }
+
+
+@dataclass(frozen=True)
+class SelfServedLaunch:
+    """The launch facts of one harness that serves ACP from its own binary.
+
+    ``binary`` is the name searched for on PATH, ``acp_args`` is what follows it on
+    the argv, ``bin_env_var`` is the operator override read before the search,
+    ``install_command`` is what an absent verdict tells the operator to run, ``label``
+    is the harness's display name, and ``protocol_version`` is the handshake dialect.
+
+    ``missing_hint`` is the one field that is prose rather than a value, and it earns
+    its place: what an operator would OTHERWISE try to install differs per harness (an
+    npm adapter that does not exist; a plugin package that is not the host), and that
+    sentence is what stops the wrong install. It is appended to the shared not-found
+    message rather than replacing it.
+
+    Frozen because the table is module state every spawn reads: a mutation from one
+    session would follow every session after it.
+    """
+
+    label: str
+    binary: str
+    acp_args: tuple
+    bin_env_var: str
+    install_command: str
+    protocol_version: int
+    missing_hint: str
+
+    @property
+    def spawn_label(self) -> str:
+        """What the spawn is logged under: the binary name and its own args."""
+        return " ".join((self.binary, *self.acp_args)).strip()
+
+
+#: Harness id -> the fixed facts of LAUNCHING it, for the harnesses whose own binary
+#: serves ACP.
+#:
+#: One row replaces what was a separate site per harness in six places: the binary
+#: name, the argv tail, the override variable, the install command, the protocol
+#: version and its row in the version table (all ``acp/client.py``), plus the three
+#: resolver seams in ``agent_sdk/drivers/acp.py``, the install probe in
+#: ``agent_sdk/backend_install.py`` and the display label in
+#: ``agent_sdk/tool_gate.py``. Every field is the SAME KIND of thing for all members;
+#: a harness whose launch needs a decision rather than a value is not one.
+#:
+#: It lives in this leaf, beside the routing and permission tables, because H8 keeps
+#: harness vocabulary in one module and because the install probe reads it without
+#: importing ``kiro_crew.acp``.
+#:
+#: Membership is deliberately narrow. claude-agent-acp, codex-acp and pi-acp are Node
+#: adapters resolved through a different ladder -- ``node_modules`` rungs, a vendored
+#: entry, and two independently-absent components for pi -- and kiro-cli's argv
+#: carries the agent spec, so none of the four is a member and none of their spawn
+#: arms reads this table. What a member's arm still owns for itself is its ROUTING:
+#: opencode's config read-back, goose's mode seed and deepseek's absence of either
+#: are not launch facts and are not here.
+ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
+    ACP_BACKEND_OPENCODE: SelfServedLaunch(
+        label="OpenCode",
+        binary="opencode",
+        acp_args=("acp",),
+        bin_env_var="OPENCODE_BIN",
+        install_command="npm i -g opencode-ai",
+        protocol_version=1,
+        missing_hint="No adapter package is needed: this harness serves ACP itself.",
+    ),
+    ACP_BACKEND_GOOSE: SelfServedLaunch(
+        label="goose",
+        binary="goose",
+        acp_args=("acp",),
+        bin_env_var="GOOSE_BIN",
+        install_command=(
+            "curl -fsSL https://raw.githubusercontent.com/block/goose/main/"
+            "download_cli.sh | bash"
+        ),
+        protocol_version=1,
+        missing_hint="No adapter package is needed: this harness serves ACP itself.",
+    ),
+    ACP_BACKEND_DEEPSEEK: SelfServedLaunch(
+        label="DeepSeek Harness",
+        binary="dsh",
+        acp_args=("--profile", "acp"),
+        bin_env_var="DSH_BIN",
+        install_command="npm i -g @deepseek-ai/dsh",
+        protocol_version=1,
+        missing_hint=(
+            "The ACP plugin package alone does not serve ACP: it is a plugin, and "
+            "this binary is the host that boots the profile it lives in."
+        ),
+    ),
+}
+
+#: The harnesses whose whole launch is described by :data:`ACP_BACKEND_LAUNCH`.
+#:
+#: A driver-internal membership, not a consumer-facing capability: it answers "is this
+#: harness's argv a value the table already holds?", which only the spawn path, the
+#: install probe and the driver seams ask. Derived from the table's keys rather than
+#: written a second time, so the two cannot disagree.
+ACP_BACKENDS_SELF_SERVED_ACP: FrozenSet[str] = frozenset(ACP_BACKEND_LAUNCH)
+
+
+def launch_for(backend: str) -> SelfServedLaunch:
+    """The launch record for *backend*, raising ``KeyError`` when it has none.
+
+    Raising rather than answering a default is the point: a caller that reaches here
+    for a Node adapter or for kiro-cli has taken the wrong arm, and a stand-in record
+    would spawn the wrong binary instead of saying so.
+    """
+    return ACP_BACKEND_LAUNCH[backend]
 
 
 def routing_for(backend: str) -> "Routing":

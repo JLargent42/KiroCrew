@@ -48,6 +48,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
+    PROVIDER_LABEL_BY_BACKEND,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_CODEX,
     PROVIDER_LABEL_DEEPSEEK,
@@ -67,6 +68,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_PRIVATE_MEMORY_MCP,
     ACP_BACKENDS_SIDE_READONLY,
+    ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
     BASELINE_SELECTABLE_BACKENDS,
     selectable_backends,
 )
@@ -447,23 +449,54 @@ def test_every_known_backend_has_a_label() -> None:
     The label indexes resume compatibility, session-map persistence, and
     session-file cleanup routing. A harness with no label of its own persists as
     a Kiro session, and the map then prunes its id for want of a Kiro transcript.
+
+    Read from the PRODUCTION mapping rather than a copy of it here. A copy asked a
+    weaker question -- whether this file had been updated -- and answered it with a
+    list that had to be edited for every harness; the mapping being closed over
+    ``ACP_BACKENDS_KNOWN``, and every label being distinct, are the properties that
+    actually carry the routing.
     """
-    labels = {
-        ACP_BACKEND_KIRO: PROVIDER_LABEL_DEFAULT,
-        ACP_BACKEND_CLAUDE: PROVIDER_LABEL_CLAUDE,
-        ACP_BACKEND_KAS: PROVIDER_LABEL_KAS,
-        ACP_BACKEND_CODEX: PROVIDER_LABEL_CODEX,
-        ACP_BACKEND_OPENCODE: PROVIDER_LABEL_OPENCODE,
-        ACP_BACKEND_PI: PROVIDER_LABEL_PI,
-        ACP_BACKEND_GOOSE: PROVIDER_LABEL_GOOSE,
-        ACP_BACKEND_DEEPSEEK: PROVIDER_LABEL_DEEPSEEK,
-    }
+    labels = dict(PROVIDER_LABEL_BY_BACKEND)
     assert set(labels) == set(ACP_BACKENDS_KNOWN), (
-        "a known backend has no PROVIDER_LABEL_* of its own, so it would persist "
-        "under the kiro label — add one in acp/types.py and a branch in "
-        "providers.acp.provider_label"
+        "a known backend has no label in PROVIDER_LABEL_BY_BACKEND, so it would "
+        "persist under the kiro label — add a row in acp/types.py"
     )
     assert len(set(labels.values())) == len(labels), "two backends share a label"
+    assert labels[ACP_BACKEND_KIRO] == PROVIDER_LABEL_DEFAULT, (
+        "kiro-cli's own row must be the default label, or a kiro session persists "
+        "under a name the cleanup routing does not recognise"
+    )
+    # The named constants are the vocabulary the rest of the tree spells these with,
+    # so the mapping must agree with them rather than carry its own strings.
+    for backend, label in (
+        (ACP_BACKEND_CLAUDE, PROVIDER_LABEL_CLAUDE),
+        (ACP_BACKEND_KAS, PROVIDER_LABEL_KAS),
+        (ACP_BACKEND_CODEX, PROVIDER_LABEL_CODEX),
+        (ACP_BACKEND_OPENCODE, PROVIDER_LABEL_OPENCODE),
+        (ACP_BACKEND_PI, PROVIDER_LABEL_PI),
+        (ACP_BACKEND_GOOSE, PROVIDER_LABEL_GOOSE),
+        (ACP_BACKEND_DEEPSEEK, PROVIDER_LABEL_DEEPSEEK),
+    ):
+        assert labels[backend] == label
+
+
+def test_provider_label_resolves_every_known_backend_through_the_mapping() -> None:
+    """H11: the function and the mapping cannot disagree.
+
+    The branch chain this replaced could answer for a harness the mapping had no row
+    for, and the other way round. Driving the real function over every known id is
+    what closes that: a row missing from the mapping shows up as the DEFAULT label
+    here, which is the failure mode the ratchet above describes.
+    """
+    from unittest.mock import MagicMock
+
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+
+    for backend in sorted(ACP_BACKENDS_KNOWN):
+        runtime = MagicMock()
+        runtime.acp_backend = backend
+        provider = AcpSessionProvider(MagicMock(), runtime)
+        assert providers_acp.provider_label(provider) == PROVIDER_LABEL_BY_BACKEND[backend]
 
 
 def test_opencode_is_selectable_and_answerable() -> None:
@@ -635,15 +668,25 @@ def test_only_overlay_readers_are_written_to() -> None:
     gated on anything wider leaves a stale overlay in the user's workspace that no
     later clear can reach — and the overlay names an effort level, so a harness
     that DOES read the file later inherits a level nobody set for it.
+
+    The two overlay keys have DIFFERENT reader sets, so each writer names its own:
+    the effort write keeps the slash-dialect set it always had, while Tool Search
+    is written only for kiro-cli's Rust engine -- KAS takes that setting over the
+    wire (measured: the relay forwards no ``toolSearch.*`` key from this file), so
+    a Tool Search write gated on the wider set is a dead file that makes the
+    dashboard's "deferred" badge lie.
     """
-    for fn in (
-        providers_acp.AcpProvider._apply_effort_overlay,
-        providers_acp.AcpProvider._apply_tool_search_overlay,
-    ):
+    expected = {
+        providers_acp.AcpProvider._apply_effort_overlay: "ACP_BACKENDS_KIRO_SLASH_COMMANDS",
+        providers_acp.AcpProvider._apply_tool_search_overlay: "ACP_BACKENDS_TOOL_SEARCH_OVERLAY",
+    }
+    for fn, membership in expected.items():
         source = inspect.getsource(fn)
         assert (
-            "ACP_BACKENDS_KIRO_SLASH_COMMANDS" in source
+            membership in source
         ), f"{fn.__name__}: overlay write is not scoped to the overlay's readers"
+    assert ACP_BACKENDS_TOOL_SEARCH_OVERLAY < ACP_BACKENDS_KIRO_SLASH_COMMANDS
+    assert ACP_BACKEND_KAS not in ACP_BACKENDS_TOOL_SEARCH_OVERLAY
 
 
 def test_codex_spawn_keeps_its_own_branch() -> None:

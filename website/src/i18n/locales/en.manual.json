@@ -1,4 +1,9 @@
 {
+  "appChatLaunch": {
+    "unsent": "{{error}}\n\nMessage not sent. Copy it to try again:\n{{message}}",
+    "cancelled": "Send cancelled because you switched sessions.",
+    "targetUnavailable": "Could not open the target session."
+  },
   "appStoreSources": {
     "all": "All sources",
     "source": "Source",
@@ -140,6 +145,9 @@
     }
   },
   "app": {
+    "app_job_failed": "A scheduled job of this app failed - see Schedule",
+    "app_job_running": "A scheduled job of this app is running",
+    "app_job_succeeded": "A scheduled job of this app just succeeded",
     "bonus_credits": "Bonus credits",
     "builder_id": "Builder ID",
     "check_logs_for_details": "Check logs for details.",
@@ -148,13 +156,13 @@
     "disk_unavailable": "Disk: unavailable",
     "expand_sidebar": "Expand sidebar",
     "gateway_connected": "Gateway connected",
-    "gateway_offline": "Gateway offline",
     "gateway_restarting_reconnecting": "Gateway is restarting — reconnecting…",
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
     "iam_identity_center": "IAM Identity Center",
     "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
     "kiro_credit_usage_scrape_disabled": "Kiro credit usage — live fetch is opted out (dashboard.usage_text_scrape_enabled)",
+    "kiro_credit_usage_signin_required": "Kiro credit usage — no live Kiro sign-in could be read; sign in again to restore it",
     "kiro_credit_usage_unavailable": "Kiro credit usage — unavailable",
     "memory_unavailable": "Memory: unavailable",
     "metrics_are_stale_latest_fetch_failed": "Metrics are stale, latest fetch failed",
@@ -1355,6 +1363,7 @@
       "cmd_search_sessions": "Search Sessions",
       "fallback_sessions": "Search sessions for “{{query}}”",
       "group_apps": "Apps",
+      "group_folders": "Folders",
       "group_commands": "Commands",
       "group_settings": "Settings",
       "leave_scope": "Back to all commands",
@@ -1384,6 +1393,7 @@
       "no_match_show_recent": "No sessions match “{{query}}” — show recent instead",
       "kind": {
         "app": "App",
+        "folder": "Folder",
         "command": "Command",
         "setting": "Setting",
         "view": "View"
@@ -1403,6 +1413,9 @@
     }
   },
   "components": {
+    "fileChangeChips": {
+      "diff_unavailable_file_exceeds_snapshot_limit": "Diff unavailable: file is too large to compare (over {{limit}} characters)."
+    },
     "queueStack": {
       "hidden_attachments_one": "+{{count}} attachment",
       "hidden_attachments_other": "+{{count}} attachments",
@@ -1595,7 +1608,9 @@
       "searching_ctrl_enter_held": "Searching… — Ctrl+Enter won’t send yet; press Esc, then Ctrl+Enter sends the message",
       "no_matches_ctrl_enter_sends": "No matching files — Ctrl+Enter sends the message",
       "no_matches_enter_sends": "No matching files — Enter sends the message",
-      "search_failed": "Couldn’t search files. Try again."
+      "search_failed": "Couldn’t search files. Try again.",
+      "outside_project_enter_sends": "This path ends up outside the project, so there is nothing to complete — Enter sends the message",
+      "outside_project_ctrl_enter_sends": "This path ends up outside the project, so there is nothing to complete — Ctrl+Enter sends the message"
     },
     "kiroAccountModal": {
       "account_details_unavailable": "Account details unavailable",
@@ -1603,6 +1618,7 @@
       "checking_credit_usage": "Checking credit usage",
       "credit_usage_api_key_auth": "Credit usage isn’t available for API key authentication",
       "credit_usage_scrape_disabled": "Live credit usage isn’t available: the free usage API returned no plan for this account, and the billed /usage fallback is off by default. Set dashboard.usage_text_scrape_enabled to true in config.json to fetch it — each refresh spends a small number of credits.",
+      "credit_usage_signin_required": "Live credit usage isn’t available: no live Kiro sign-in credential could be read, so the free usage API was never asked. Sign in to Kiro again — for example by running kiro-cli login — to restore it. Enabling dashboard.usage_text_scrape_enabled will not help here, because the billed /usage fallback needs the same sign-in.",
       "credit_usage_unavailable": "Credit usage unavailable",
       "days_until_expiration": "Days until expiration: {{count}}",
       "estimated_overage_cost": "Estimated overage cost",
@@ -1646,6 +1662,7 @@
       "reads_tooltip": "{{productName}} looks things up on its own, but asks before making changes",
       "reads_desc": "{{productName}} looks things up on its own, but asks before making any changes",
       "trust_label": "Trust",
+      "chat_mode_hint": "chat mode",
       "trust_tooltip": "In this chat, {{productName}} works without asking you first",
       "trust_desc": "In this chat, {{productName}} works without asking you first",
       "yolo_label": "YOLO",
@@ -1695,6 +1712,9 @@
         "capability_backend": "Keep a program of its own running on this computer, in the background, while {{productName}} is open",
         "capability_shell": "Run commands on this computer, from a list the app ships with that you have not seen",
         "capability_note": "Trusting the app grants all three, whether or not it uses them all. {{productName}} cannot limit it to less.",
+        "session_approval_heading": "This app also asks to control your chats",
+        "session_approval_desc": "Sending messages or choosing response options in your chats, approving or denying tool prompts, and switching a chat's approval mode.",
+        "session_approval_modes": "Chat approval modes it can set",
         "revocable": "You can take this back at any time in Settings → Security → Trusted third-party apps. The app stops working when you do.",
         "source": "Published at",
         "not_reviewed": "{{productName}} lists this app but has not reviewed its code, and the name above comes from the app itself.",
@@ -2000,6 +2020,9 @@
       "video": "Video: {{name}}"
     },
     "fileRenderers": {
+      "binary_file_download_hint": "It isn't text, so there's nothing to show here. Download a copy to open it in another app.",
+      "binary_file_open_hint": "It isn't text, so there's nothing to show here. Open it in its app, or download a copy.",
+      "binary_file_title": "This file can't be previewed",
       "media_preview_failed": "Playback failed — the browser cannot decode this file.",
       "office_structure_unavailable": "Showing plain text — headings, lists and tables lost their layout. Download the original to see it formatted.",
       "office_open_hint": "Preview isn't available for this file. Open it in its app, or download a copy.",
@@ -2025,6 +2048,12 @@
       "default_agent_hint": "Pre-selected for new chats created here.",
       "enter_to_submit": "Enter to submit",
       "folder_settings": "Folder settings",
+      "icon": "Icon",
+      "icon_cleared_hint": "Empty keeps the default folder icon — Auto-generate picks a new one.",
+      "icon_default_hint": "Leave empty to keep the default folder icon.",
+      "icon_placeholder": "One emoji",
+      "icon_regenerate": "Auto-generate",
+      "icon_regenerate_pending": "An icon will be picked from the folder name after you save, when possible.",
       "inherit_named": "Inherit ({{agent}})",
       "inherited_dir": "Leave empty to inherit the nearest parent folder’s directory.",
       "inherited_placeholder": "Inherited: {{path}}",
@@ -2068,6 +2097,7 @@
     "followUpBar": {
       "click_to_add_to_input_double_click_to_select_and": "Click to add to input (double-click to select and send)",
       "click_to_add_to_input_editable_before_sending": "Click to add to input (editable before sending)",
+      "tooltip_arrow_sends_now": "↑ sends now",
       "click_to_add_to_selection": "Click to add to selection",
       "click_to_remove_from_input": "Click to remove from input",
       "click_to_remove_from_input_double_click_to_send": "Click to remove from input (double-click to send)",
@@ -2321,6 +2351,7 @@
       "adding": "Adding…",
       "adding_2": "Adding...",
       "already_in_library": "Already in Library",
+      "binary_file_cannot_be_added": "This file isn't text, so it can't be added to artifacts.",
       "cannot_read_file": "Cannot read file",
       "diff_failed_to_compute": "Couldn't compute the diff — git failed for this file",
       "diff_no_baseline_not_git": "This file isn't in a git repository, so there is no baseline to diff against",
@@ -2328,6 +2359,7 @@
       "discard_comment_button": "Discard comment",
       "discard_unsaved_comment": "Discard your unsaved comment?",
       "download_failed": "Download failed",
+      "download_blocked_credentials": "Download blocked: this file's content was flagged by the credential scan. Remove the secret and try again.",
       "edit": "Edit",
       "failed_to_add_source": "Failed to add source",
       "file_too_large_to_add": "File is too large to add",
@@ -2358,6 +2390,10 @@
       "diff_status_failed": "Couldn’t check this file’s git changes."
     },
     "markdownRenderer": {
+      "download_failed": "Couldn't download the diagram. Try again.",
+      "diagram_actions": "More actions",
+      "download_svg": "Download SVG",
+      "download_png": "Download PNG",
       "click_to_browse_shift_click_to_open_in_file_explorer": "Click to browse / Shift+click to open in File Explorer",
       "click_to_browse_shift_click_to_reveal_in_finder": "Click to browse / Shift+click to reveal in Finder",
       "click_to_browse_shift_click_to_show_in_file_manager": "Click to browse / Shift+click to show in file manager",
@@ -2811,7 +2847,8 @@
       "this_chat_s_browser_session": "This chat's browser",
       "to_open_another_site_unlock_the_view_s_address_bar": "Click the padlock above the page to type another address there; the monitor button (top right) brings the preview bar back.",
       "your_page_is_in_pick_it_in_the_sidebar": "Your page is in {{session}} — pick it in the frame's sidebar.",
-      "links_with_a_query_or_hash_part_go_in_the_frame_s_own_address_bar": "Links with a ? or # part can't go through this address bar — open the site's plain address first, then click the padlock above the page and type the full link into the frame's own address bar."
+      "links_with_a_query_or_hash_part_go_in_the_frame_s_own_address_bar": "Links with a ? or # part can't go through this address bar — open the site's plain address first, then click the padlock above the page and type the full link into the frame's own address bar.",
+      "dashboard_policy_blocks_embedding_http_page": "The browser would allow this page, but this dashboard only embeds http:// pages served from 127.0.0.1 or localhost. That is a gateway policy, not a browser block."
     },
     "welcomeView": {
       "autopilot": "Autopilot",
@@ -3225,6 +3262,9 @@
       "label": "changes need a restart",
       "tooltip": "This setting cannot change while {{productName}} is running. The saved value is kept and applies the next time {{productName}} restarts (Settings → About, or the terminal where you launched it).",
       "schema_unavailable": "Couldn't check whether this setting needs a restart."
+    },
+    "pierreEditorImpl": {
+      "highlighting_unavailable_with_reason": "Syntax highlighting is unavailable until you reload. Content remains readable. Last failure: {{classification}} (generation {{generation}}, attempt {{attempt}}): {{reason}}"
     }
   },
   "hooks": {
@@ -3398,7 +3438,10 @@
       "installed_version": "Installed (v{{version}})",
       "removing": "Removing…",
       "starting_install": "Starting install…",
-      "retry": "Retry"
+      "retry": "Retry",
+      "enable_and_allow_chat_control": "Enable and allow chat control",
+      "session_approval_confirm_title": "Allow “{{name}}” to control your chats?",
+      "session_approval_reconsent_notice": "{{name}} is disabled because it newly asks to control your chats. Review the permission on this page before enabling it."
     },
     "appsPage": {
       "action_failed": "Failed to {{action}} {{name}}",
@@ -3698,7 +3741,8 @@
         "model_effective": "Running on {{model}} (backend selects the model)",
         "workflows": "Workflows",
         "workspace_empty": "No files in this workspace yet",
-        "workspace_truncated": "Large workspace — showing the first 10,000 files",
+        "workspace_truncated": "Large workspace: showing up to 10,000 files; all folders remain available",
+        "workspace_directory_truncated": "files hidden",
         "output_load_failed": "Couldn't load the output",
         "retry": "Retry",
         "cancel_failed": "Couldn't cancel the subagent",
@@ -3945,6 +3989,7 @@
         "content_placeholder": "Search in files…",
         "content_searching": "Searching…",
         "ctx_add_to_chat": "Add to chat",
+        "ctx_download": "Download",
         "filter_placeholder": "Filter files…",
         "git_status_failed": "Couldn't read the git status",
         "mode_content": "Content",
@@ -3960,6 +4005,9 @@
       },
       "filesHome": {
         "no_project_dir": "No project directory is set for this chat",
+        "open_terminal": "Open terminal in the project directory",
+        "open_terminal_hint": "A command line that starts in this project’s folder.",
+        "project_actions": "Project actions",
         "refresh": "Refresh",
         "select_file_hint": "Select a file from the tree to open it in a new tab",
         "title": "Files",
@@ -4110,6 +4158,7 @@
     },
     "chatSidebar": {
       "adopt_failed": "Could not open this session here.",
+      "no_sessions_match_folders": "No sessions match — only a folder name did",
       "adopt_target_unknown": "This session is no longer open on {{name}}.",
       "answered_by": "answered by {{agent}}",
       "archive_session_one": "Archive {{count}} session",
@@ -4129,6 +4178,13 @@
       "loop": "Loop {{count}}/{{total}}",
       "loop_2": "Loop · {{count}}",
       "loop_interrupted": "interrupted",
+      "loop_waiting_on_you": "Waiting on you",
+      "loop_waiting_monitor": "Monitor paused",
+      "loop_waiting_cycle": "Paused at {{count}}/{{total}}",
+      "loop_waiting_cycle_2": "Paused at cycle {{count}}",
+      "loop_waiting_title": "The last reply asked you to choose. Open the session to answer.",
+      "loop_waiting_title_cycle": "Paused at cycle {{count}} of {{total}} — the last reply asked you to choose. Open the session to answer.",
+      "loop_waiting_title_cycle_2": "Paused at cycle {{count}} — the last reply asked you to choose. Open the session to answer.",
       "opening_session_locally": "Opening this session here…",
       "not_open_here_yet": "On {{name}} — click to open here",
       "on_instance": "On {{name}}",
@@ -4154,8 +4210,6 @@
       "connected_to": "Connected to {{label}}",
       "session_failed_to_switch_one": "{{count}} session failed to switch",
       "session_failed_to_switch_other": "{{count}} sessions failed to switch",
-      "started_in_channel": "This conversation started in {{channel}}.",
-      "started_in_direct_message": "This conversation started in a direct message.",
       "session_source": "Session",
       "new": "New",
       "new_chat": "New chat",
@@ -4456,7 +4510,7 @@
       "feature_previews_moved": "Feature Previews moved to Settings > Developer",
       "tabs": {
         "agentBackend": {
-          "description": "Which agent new sessions start — Kiro CLI, Claude Code, or KAS",
+          "description": "Which agent new sessions start",
           "label": "Agent Backend"
         },
         "archive": {
@@ -4941,6 +4995,10 @@
       "skillsTab": {
         "adds_new_requirements_to": "Adds new requirements to {{target}} — {{description}}",
         "delete_confirm": "Delete “{{name}}”?",
+        "update_failed_title": "Save failed",
+        "saving": "Saving…",
+        "delete_failed_error": "Could not delete “{{name}}”: {{error}}",
+        "readonly_skill_error": "This skill is managed on disk and cannot be changed from this page.",
         "dismiss_confirm": "Dismiss “{{name}}”?",
         "dismiss_all": "Dismiss All",
         "dismiss_all_confirm": "Dismiss all {{count}} pending skills?",
@@ -5403,11 +5461,15 @@
         "auto_download_save_failed": "Couldn't save the automatic download setting.",
         "auto_update_setting_unavailable": "Couldn't load the auto-update setting. The switch shows the default until it loads.",
         "copy_failed_select_the_command_and_copy_it_manually": "Copy failed. Select the command and copy it manually.",
-        "update_info_unavailable": "Couldn't read this build's version and update channel from the app."
+        "update_info_unavailable": "Couldn't read this build's version and update channel from the app.",
+        "app_lane_label": "App",
+        "app_lane_title": "The desktop app you installed. Its own version, separate from the service below.",
+        "gateway_lane_label": "Gateway",
+        "gateway_lane_title": "The background service that runs your agents and serves this dashboard. The branch and commit chips are its build."
       },
       "developerPanel": {
         "feature_previews": "Feature Previews",
-        "feature_previews_desc": "Unreleased features and pages. The pages stay hidden from the sidebar and from Search Everywhere until you turn them on here; the switches themselves do show up in Settings search. Per-device, and unpolished on purpose."
+        "feature_previews_desc": "Unreleased features and pages. The pages stay hidden from the sidebar and from Search Everywhere until you turn them on here; the switches themselves do show up in Settings search. Unpolished on purpose, and per-device unless a card says otherwise."
       },
       "computerUsePanel": {
         "computer_use_lets_the_agent_read_any_app_window": "Computer use lets the agent read any app window and send clicks and keystrokes into it. Most clicks are delivered straight to the app and leave your pointer alone, but the agent can ask to move the real pointer when a target needs it. Password fields are never read; nothing else limits which apps it may drive.",
@@ -5574,6 +5636,12 @@
         "fallback_disabled": "Disabled",
         "fallback_auto": "Auto (recommended)",
         "failed_to_save_fallback_model": "Failed to save fallback model",
+        "refusal_fallback": "Content-filter fallback",
+        "refusal_fallback_desc": "When your current model's content filter declines a message, retry it once on this model. Your primary model returns on the next message.",
+        "refusal_fallback_model": "Content-filter fallback model",
+        "refusal_fallback_auto_hint": "Auto retries on the model the provider suggests in its refusal, when it names one. The retry is announced in chat. Disabled shows the refusal as before.",
+        "refusal_fallback_auto": "Auto (model named in the refusal)",
+        "failed_to_save_refusal_fallback_model": "Failed to save content-filter fallback model",
         "session_card_source_links": "PR and Issue Chips on Session Cards",
         "session_card_source_links_desc": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
         "failed_to_load_tips_preference": "Failed to load tips preference.",
@@ -5891,7 +5959,30 @@
         "distribution_error_misconfigured_detail": "The central policy declaration on this host could not be parsed, so no ceiling is being fetched.",
         "distribution_refresh_rejected_detail": "The last policy refresh was rejected by the source.",
         "distribution_refresh_unreachable_detail": "The last policy refresh could not reach the source.",
-        "denied_commands_load_failed": "Could not load the denied-command rules. The lists below are empty because the read failed, not because there are no rules."
+        "denied_commands_load_failed": "Could not load the denied-command rules. The lists below are empty because the read failed, not because there are no rules.",
+        "file_delivery_section": "Flagged-file delivery",
+        "file_delivery_title": "Where flagged files may be delivered",
+        "file_delivery_desc": "{{productName}} refuses to deliver a file whose contents the credential scanner flags. Use this when a file of your own — like a VPN key {{productName}} generated for you — was blocked on its way to you. Allowing delivery here lets it hand such a file to this computer and your dashboard's Files view. No detector is relaxed, and every delivery made under it is recorded in the security event log.",
+        "file_delivery_destination_help": "That means the file lands in the outbox folder on this computer and shows in your dashboard's Files view — nowhere a third party can see. It is never sent to Slack or a chat channel.",
+        "file_delivery_state_confirmed": "Allowed",
+        "file_delivery_state_not_confirmed": "Not allowed",
+        "file_delivery_state_armed": "Waiting for approval",
+        "file_delivery_waiting": "Waiting on this machine",
+        "file_delivery_copy_command": "Copy the approval command",
+        "file_delivery_copy": "Copy",
+        "file_delivery_copied": "Copied",
+        "file_delivery_copy_failed": "Could not copy the command. Select it and copy by hand.",
+        "file_delivery_armed_expired": "That request expired before it was approved. Allow delivery again to start over.",
+        "file_delivery_since": "Since {{time}}",
+        "file_delivery_confirm": "Allow delivery",
+        "file_delivery_confirm_help": "This starts a request you finish in a terminal on this machine — nothing is delivered until then, and you can withdraw it at any time.",
+        "file_delivery_armed_help": "One more step, on this machine: run this command in a terminal on the computer running {{productName}} to finish allowing delivery. This confirms a person is at the machine — a browser session alone cannot allow it.",
+        "file_delivery_armed_expires": "This request expires in about {{duration}}.",
+        "file_delivery_withdraw": "Withdraw",
+        "file_delivery_never_grantable": "Uploads to Slack or a chat channel can never be allowed here, and are not offered: an allowance can never cover a destination a third party can see.",
+        "file_delivery_load_failed": "Could not read which destinations are allowed.",
+        "file_delivery_arm_status_failed": "Could not check whether an approval is in progress.",
+        "file_delivery_save_failed": "Could not save that change."
       },
       "skillsPanel": {
         "failed_to_save_skills_setting": "Failed to save skills setting",
@@ -6309,7 +6400,14 @@
           "crew_media_members": "The Crew Members page, with one member selected and its activity panel open."
         },
         "crew_members": "Crew Members",
-        "crew_members_desc": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on."
+        "crew_members_desc": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
+        "decisions": "Decisions (Jev)",
+        "decisions_desc": "Jev is a small, cheap decision model. This preview lets {{productName}} ask it one yes-or-no or pick-one question at three moments: which skills to load for your message, whether a skill it has just learned repeats one you already have, and whether a scheduled job's result says anything new. Shadow-only in this release — nothing Jev answers changes what {{productName}} does; each answer is written to a log on this machine so the two can be compared. This switch is saved on the machine that runs {{productName}}, not in this browser, so it applies on every device you open it from.",
+        "decisions_egress": "While this is on, the text of your messages and the descriptions of your skills leave this machine. They are sent over the internet to the decision service this {{productName}} is set up to use. Nothing is sent while this is off.",
+        "decisions_backend_required": "The {{productName}} running this dashboard is older than this switch: its settings have no decisions section yet, so there is nothing to turn on. Update it first.",
+        "decisions_points": "Each check below shows the mode it runs in.",
+        "decisions_config_unavailable": "Could not read the settings, so this switch is not offered. Reload to try again.",
+        "decisions_save_failed": "Could not save this setting. The switch is showing the saved value again."
       },
       "kiroSignInCard": {
         "title": "Kiro sign-in",
@@ -6337,6 +6435,7 @@
       "failed_to_load_app": "Failed to load app"
     },
     "membersPage": {
+      "drawer_delegated_working": "Delegated work running",
       "setup_in_crew_manager": "Set up private memory"
     }
   },

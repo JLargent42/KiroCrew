@@ -124,6 +124,21 @@ _MAX_MAINT_WORKERS = 4
 # closes/spawns we hold threads for; excess work queues here.
 _MAX_SUBPROCESS_WORKERS = 8
 
+# Windows-only: the thread that owns a ``kiro-cli`` readiness spawn's PRIVATE
+# event loop, so ``CreateProcess`` -- which CPython performs synchronously
+# inside the subprocess transport's constructor, before that transport's first
+# await -- runs there instead of on the gateway loop.  Deliberately NOT
+# :func:`subprocess_executor`: the offloaded loop awaits the Windows descendant
+# scan, which submits back into that pool, so sharing one pool would let
+# concurrent spawns deadlock waiting on workers their own scans need.  Two is
+# enough -- ``_probe_lock`` serializes the readiness probes, leaving the much
+# rarer update spawn as the only concurrent caller -- and a bound matters here
+# because a started run_in_executor future cannot be cancelled: a spawn wedged
+# behind an endpoint-protection filter driver holds its worker for the caller's
+# full timeout (10s for a probe, 120s for an update), so excess work queues
+# here rather than occupying threads the rest of the gateway shares.
+_MAX_KIRO_SPAWN_WORKERS = 2
+
 # Cron jobs can be long (default 300s timeout) and several can be due in the
 # same tick (the scheduler fires each as an independent task).  Give them their
 # own bounded pool so they queue among THEMSELVES rather than evicting the fast
@@ -287,7 +302,7 @@ _MAX_PATH_RESOLVE_WORKERS = 2
 _MAX_PATH_PROBE_WORKERS = 8
 _MAX_PATH_TRANSFER_WORKERS = 8
 # ONE worker, and the count is the contract rather than a capacity guess. An
-# append-only ledger assigns ``seq`` by reading the file's own tail under its
+# append-only crew log assigns ``seq`` by reading the file's own tail under its
 # lock, and a turn's entries thread under the ``seq`` its ``turn/started``
 # returned -- so the entries of one unit must reach the file in the order their
 # call sites produced them. A single worker draining a FIFO queue is what
@@ -299,6 +314,7 @@ _MAX_LEDGER_WORKERS = 1
 _lock = threading.Lock()
 _pool: ThreadPoolExecutor | None = None
 _subprocess_pool: ThreadPoolExecutor | None = None
+_kiro_spawn_pool: ThreadPoolExecutor | None = None
 _cron_pool: ThreadPoolExecutor | None = None
 _discovery_pool: ThreadPoolExecutor | None = None
 _embed_pool: ThreadPoolExecutor | None = None
@@ -376,6 +392,35 @@ def subprocess_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _subprocess_pool
+
+
+def kiro_spawn_executor() -> ThreadPoolExecutor:
+    """Return the process-wide Kiro CLI readiness-spawn pool, creating it on first use.
+
+    Threads are named ``mc-kirospawn``.  Windows-only in practice: a worker here
+    owns one ``kiro_prerequisite._run_process`` call's private event loop, so the
+    ``CreateProcess`` that CPython runs synchronously inside the subprocess
+    transport's constructor happens on this thread rather than on the gateway
+    loop.
+
+    Separate from :func:`subprocess_executor` for a reason stronger than
+    isolation: the offloaded loop awaits
+    ``platform_compat.descendant_termination_handles_async``, which submits into
+    THAT pool.  One shared pool would let ``_MAX_SUBPROCESS_WORKERS``
+    concurrent spawns each hold a worker while waiting on a scan queued behind
+    them -- a deadlock, not merely contention.  See
+    :data:`_MAX_KIRO_SPAWN_WORKERS` for why it is bounded at two.
+    """
+    global _kiro_spawn_pool
+    if _kiro_spawn_pool is None:
+        with _lock:
+            if _kiro_spawn_pool is None:
+                _kiro_spawn_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_KIRO_SPAWN_WORKERS,
+                    thread_name_prefix="mc-kirospawn",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _kiro_spawn_pool
 
 
 def cron_executor() -> ThreadPoolExecutor:
@@ -531,13 +576,13 @@ def path_transfer_executor() -> ThreadPoolExecutor:
 
 
 def ledger_executor() -> ThreadPoolExecutor:
-    """Return the process-wide append-only ledger writer pool, creating it on first use.
+    """Return the process-wide append-only crew log writer pool, creating it on first use.
 
     Threads are named ``mc-ledger``, and there is exactly ONE of them
     (:data:`_MAX_LEDGER_WORKERS`) because the order entries reach a unit's file
     is part of the format, not an optimization -- see that constant.
 
-    Serves :mod:`kiro_crew.session_ledger_emit`, whose storage call takes the
+    Serves :mod:`kiro_crew.crew_log.emit`, whose storage call takes the
     per-ledger lock, reads a bounded tail to assign ``seq`` and ``fsync``s the
     appended line. Those otherwise run on the gateway's own event loop: a
     ``flock`` that waits and an ``fsync`` that enters the kernel, once per tool
@@ -548,7 +593,7 @@ def ledger_executor() -> ThreadPoolExecutor:
     :func:`path_resolve_executor` has one: an ``fsync`` on a wedged or full
     filesystem holds its worker until the kernel returns, and a started
     ``run_in_executor`` future cannot be cancelled. Here that can only delay
-    other ledger writes -- which are fail-soft and never block a turn -- while on
+    other crew log writes -- which are fail-soft and never block a turn -- while on
     the maintenance pool it would occupy a worker the orphan-reaping sweeps need
     to recover from an event-loop wedge.
     """
@@ -984,10 +1029,11 @@ def shutdown_maintenance_executor() -> None:
     global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool, _recall_pool
     global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool, _path_resolve_pool
     global _path_probe_pool, _path_transfer_pool
-    global _ledger_pool
+    global _ledger_pool, _kiro_spawn_pool
     with _lock:
         pool, _pool = _pool, None
         subprocess_pool, _subprocess_pool = _subprocess_pool, None
+        kiro_spawn_pool, _kiro_spawn_pool = _kiro_spawn_pool, None
         cron_pool, _cron_pool = _cron_pool, None
         discovery_pool, _discovery_pool = _discovery_pool, None
         embed_pool, _embed_pool = _embed_pool, None
@@ -1004,6 +1050,8 @@ def shutdown_maintenance_executor() -> None:
         pool.shutdown(wait=False, cancel_futures=True)
     if subprocess_pool is not None:
         subprocess_pool.shutdown(wait=False, cancel_futures=True)
+    if kiro_spawn_pool is not None:
+        kiro_spawn_pool.shutdown(wait=False, cancel_futures=True)
     if cron_pool is not None:
         cron_pool.shutdown(wait=False, cancel_futures=True)
     if discovery_pool is not None:

@@ -45,6 +45,7 @@ from typing import Any, Iterator, Literal, MutableMapping, NamedTuple
 
 from kiro_crew import agent_state, platform_compat
 from kiro_crew.agent_discovery import (
+    _declared_project_agent_name,
     _read_agent_spec,
     project_agent_files,
     project_agent_name,
@@ -259,11 +260,48 @@ def agents_spec_lock(agents_dir: Path) -> Iterator[None]:
     (not the spec's own fd) for the same reason update_config_locked uses one:
     atomic replace swaps the inode, so a lock on the spec fd would not
     serialize across the rename.
+
+    Both failure modes are REPORTED here before they propagate, because several
+    callers catch this as best-effort work at ``logger.debug``. Without a report
+    at a level an operator sees, a gateway that skipped its agent-spec install
+    reads in the log exactly like one that completed it. An unwritable lock path
+    (a read-only ``~/.kiro/agents`` mount) refuses at ``os.open``, before any lock
+    is attempted; ``platform_compat.file_lock`` bounds the acquire itself.
     """
     lock_path = agents_dir / ".kirocrew-agents.lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        with platform_compat.file_lock(fd, exclusive=True, wait=True):
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        # Naming the path AND the errno is the point: "Read-only file system" on
+        # this specific path is what tells the operator to move KIRO_HOME, and it
+        # is not something retrying can recover.
+        logger.warning(
+            "cannot open the agent-spec lock %s (%s) — agent-spec writes cannot be "
+            "serialized, so this install is being skipped; point KIRO_HOME at a "
+            "writable directory if the filesystem is read-only",
+            lock_path,
+            exc.strerror or exc,
+        )
+        raise
+    try:
+        with contextlib.ExitStack() as stack:
+            # ``enter_context`` rather than a ``with`` around the yield, so this
+            # ``except`` covers the ACQUIRE ALONE. A caller-body OSError (an
+            # atomic spec write hitting ENOSPC, an unlink hitting EACCES) reaches
+            # the same handler if the yield sits inside it, and would then be
+            # logged as a lock problem -- sending an operator after a stuck holder
+            # while the real fault is the disk or the permission.
+            try:
+                stack.enter_context(platform_compat.file_lock(fd, exclusive=True, wait=True))
+            except OSError as exc:
+                # The bounded-acquire refusal. A stuck holder calls for a
+                # DIFFERENT operator action (find the process still holding it)
+                # than an unwritable path, so it must not be reported with the
+                # same remedy as above. BlockingIOError is a caller's own
+                # non-waiting choice, not a fault to report.
+                if not isinstance(exc, BlockingIOError):
+                    logger.warning("agent-spec lock %s: %s", lock_path, exc)
+                raise
             yield
     finally:
         os.close(fd)
@@ -6104,6 +6142,14 @@ handle immediately.
 #:   same-workspace session, losing filing the user did by hand.
 #: * ``chat_folder_move`` — WITHHELD. Reparents an existing folder tree, and no
 #:   conductor step needs it.
+#: * ``chat_tag_list`` / ``chat_tag_create`` / ``chat_tag_update`` — WITHHELD,
+#:   not because any fails the invariant (a read, a create that dedups on name,
+#:   and a metadata edit that loses no assignment) but because no conductor step
+#:   needs them; a verb is granted for a step, not for being harmless.
+#: * ``chat_tag_assign`` — WITHHELD. Writes another session's ``tags``: the PUT
+#:   goes to ``/api/chat/slots/<target>/tags`` where the target is the session
+#:   named in the ARGUMENTS — the same shape as ``chat_folder_move_session``.
+#:   Ingested content could re-label any persistent same-workspace session.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
@@ -7007,6 +7053,28 @@ intervene when a worker loops or stalls, adjudicate blocked items, govern host
 resources and per-item credit budgets, and report verified greens to the
 person as plain-language digests.
 
+**You track exactly TWO columns per work item: is this session still working,
+and is this PR / this item solved.** That is the whole state, so the failure you
+chase is one shape — an item with no owner, or an owner that is not working.
+Everything a red PR is ABOUT belongs to the worker that owns it: which lane is
+red, whether a cancellation was fail-fast or teardown, which head a verdict was
+bound to, whether a rebase is curative. You send INTENT — *you own this item end
+to end, the deliverable is a green board, diagnose and decide it yourself* — and
+you do NOT read PR boards, item bodies or full worker reports to re-derive a
+worker's reasoning. Verifying a CLAIMED GREEN against the bar is measurement and
+stays yours; re-deriving a diagnosis is duplication, and the worker is closer to
+the code than you are. When a worker is stuck and its status line does not say
+what it needs, ask it in one line rather than reading its history.
+
+**Decide; do not escalate.** Scope calls, design judgements inside one item and
+dispositions on reviewer findings are yours. Four classes go to the person, and
+only these four: dismissing a human's recorded review, overriding a fenced or
+security-class finding, a disagreement between two maintainers about the same
+code, and content you cannot verify yourself. Append every decision as ONE LINE
+to the pipeline's `decisions.md`, and append a lesson to the run's retrospective
+in the cycle it happens — never saved for the end of the run, because by then the
+reasoning is precisely what has been lost.
+
 **You never do a work item's work yourself.** A file to write, a build to run,
 a fix to make — each one belongs to a worker session you dispatch, verify and
 report on. You have no dedicated file-writing tool (the shell tool stays
@@ -7566,16 +7634,46 @@ def _file_identity(path: Path) -> str | None:
     return f"{st.st_mtime_ns}-{st.st_size}-{st.st_ino}"
 
 
-def _project_shadow_of(agent: str, work_dir: str | Path | None) -> Path | None:
+def _project_shadow_of(
+    agent: str,
+    work_dir: str | Path | None,
+    *,
+    markdown_specs: bool = True,
+    dispatchable_only: bool = False,
+) -> Path | None:
     """A checkout's own spec for *agent*, or ``None``.
 
-    ``<work_dir>/.kiro/agents/*.json`` is the ONLY project location kiro-cli resolves
+    ``<work_dir>/.kiro/agents/`` is the ONLY project location kiro-cli resolves
     ``--agent`` against (see ``docs/reference/kiro-cli/custom-agents``, and
     :func:`agent_discovery.project_agent_files`, which states the same rule for every
     other consumer). There is no parent walk to match: a spec one directory up is not
     dispatchable, so it is not a shadow. The declared ``name`` beats the filename, which
     is why the comparison goes through :func:`agent_discovery.project_agent_name` rather
     than the stem -- a file called anything at all can declare ``kirocrew-worker``.
+
+    Two keywords narrow WHICH project files count, and the default of each is the
+    behaviour this function had before they existed. Both matter to a caller asking
+    "would the host dispatch this", and neither matters to one asking "does the
+    checkout make any claim on this name" -- a governance refusal, say, for which a
+    file in any form and any state is a claim.
+
+    ``markdown_specs=False`` narrows to the JSON form, for a host that dispatches
+    that alone. The narrowing happens INSIDE the scan, not to its result:
+    ``project_agent_files`` sorts by stem and this returns the first declared-name
+    match, so a differing-stem pair (``a.md`` and ``z.json``, both declaring ``foo``)
+    yields the markdown file first. Filtering afterwards would answer "no shadow"
+    while a dispatchable ``z.json`` sat right there. The same-stem pair needs no such
+    care: ``iter_agent_spec_files`` already drops ``<stem>.md`` when ``<stem>.json``
+    exists.
+
+    ``dispatchable_only=True`` additionally skips a spec that does not PARSE.
+    :func:`agent_discovery.project_agent_name` falls back to the filename stem for a
+    malformed file, so a broken ``foo.json`` otherwise matches ``foo`` and shadows a
+    perfectly good user-level agent of that name -- while kiro-cli, which reports it
+    as an error and offers no such mode, runs the user-level one. The distinction is
+    :func:`agent_discovery._declared_project_agent_name`, whose ``None`` means exactly
+    "does not parse" and which already applies the filename fallback for a spec that
+    parses without a ``name`` field.
 
     Never raises: an unreadable checkout answers "no shadow", and the caller's own
     fail-closed rule covers what it cannot see.
@@ -7584,6 +7682,12 @@ def _project_shadow_of(agent: str, work_dir: str | Path | None) -> Path | None:
         return None
     try:
         for spec in project_agent_files(work_dir):
+            if not markdown_specs and is_markdown_spec(spec):
+                continue
+            if dispatchable_only:
+                if _declared_project_agent_name(spec) == agent:
+                    return spec
+                continue
             if project_agent_name(spec) == agent:
                 return spec
     except OSError:

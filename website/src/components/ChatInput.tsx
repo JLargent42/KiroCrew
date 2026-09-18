@@ -11,6 +11,7 @@ import { useScrollEdges } from '../hooks/useScrollEdges'
 import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
 import { createPortal } from 'react-dom'
+import { InstantTip, useInstantTip } from './InstantTip'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useBranding } from '../hooks/useBranding'
 import { useAppSelector, useAppDispatch } from '../store'
@@ -27,6 +28,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import { useComposerSpellcheck } from '../hooks/useComposerSpellcheck'
+import { useComposerSendMode } from '../hooks/useComposerSendMode'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { pickToolLabel } from '../utils/toolLabel'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
@@ -114,7 +116,7 @@ const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/
 // test_accept_list_covers_every_accepted_extension pins this set against the
 // server's, from the Python side, since a vitest cannot read the Python constant.
 const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
@@ -136,7 +138,7 @@ import { useComposerVoiceSlice, type ComposerVoiceInputProps } from '../chat-cor
 import SkillPickerMenu from './SkillPickerMenu'
 import { skillsCacheStaleTime } from '../lib/skillsCache'
 import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog'
-import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
+import { matchFileToken, matchPathToken, matchSkillToken, PATH_TOKEN_RE, replaceTokenAtCaret } from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
 import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
@@ -518,9 +520,22 @@ interface ChatInputProps {
    * inherited case, so a served model does not read as something the user
    * chose. A pinned chip has nothing to explain. */
   modelIsInheritedDefault?: boolean
-  onAgentClick?: (rect: DOMRect) => void
-  onModelClick?: (rect: DOMRect) => void
-  onProjectClick?: (rect: DOMRect) => void
+  /**
+   * Picker openers (agent, model, project, and `onSessionControlClick` below).
+   * Each hands the host the chip's click-time rect AND the chip element itself:
+   * the host owns the picker's portal and must keep it glued to the chip while
+   * it is open (the composer moves under an open menu when the mobile keyboard
+   * closes, the composer grows, or a container scrolls), which needs a live
+   * element to re-read, not a one-time snapshot (#10616). Hosts feed both into
+   * `useAnchoredTriggerRect`.
+   */
+  onAgentClick?: (rect: DOMRect, trigger?: HTMLElement) => void
+  /** `composerHadFocus` is whether the message editor held focus when the chip
+   *  was pressed, read before the press moved focus onto the chip. The picker
+   *  uses it to hand focus back to the editor after a pick, and only then: a
+   *  user who was not typing does not get the composer focused under them. */
+  onModelClick?: (rect: DOMRect, trigger?: HTMLElement, composerHadFocus?: boolean) => void
+  onProjectClick?: (rect: DOMRect, trigger?: HTMLElement) => void
   /** App-contributed session controls (contributes.sessionControls in app.json). */
   sessionControls?: {
     key: string
@@ -537,7 +552,7 @@ interface ChatInputProps {
     /** Replaces the tooltip when the app explains its state. */
     statusTooltip?: string
   }[]
-  onSessionControlClick?: (key: string, rect: DOMRect) => void
+  onSessionControlClick?: (key: string, rect: DOMRect, trigger?: HTMLElement) => void
   contextPct?: number
   contextUsedTokens?: number
   contextWindowTokens?: number
@@ -601,7 +616,8 @@ interface ChatInputProps {
   automationSnapshotFailed?: boolean
   /** Session routing mode; crew/member cannot host direct monitor turns. */
   sessionMode?: string
-  /** Send-key mode. Default 'enter'. */
+  /** Send-key mode. Omitted means the user's stored Settings -> Chat ->
+   *  Composer preference; pass it only to override that (e.g. mobile). */
   sendOnEnter?: SendMode
   /** Follow-up options from assistant message */
   followUpOptions?: string[]
@@ -703,16 +719,11 @@ interface ChatInputProps {
 }
 
 /** Accent pill under a downscaled attachment chip. Hover (or focus) shows a
- *  styled tooltip with the resize details, portal-rendered above the chip so
- *  the strip's overflow-x-auto can't clip it. */
+ *  styled tooltip with the resize details through the shared `InstantTip`
+ *  (portal-rendered above the chip so the strip's overflow-x-auto can't clip
+ *  it; see that module for the show/hide gesture semantics). */
 function ResizeBadge({ resize }: { resize: ResizeInfo }) {
-  const [tip, setTip] = useState<{ top: number; left: number } | null>(null)
-  const ref = useRef<HTMLButtonElement>(null)
-  const show = () => {
-    const r = ref.current?.getBoundingClientRect()
-    if (r) setTip({ top: r.top - 8, left: r.left })
-  }
-  const hide = () => setTip(null)
+  const { tip, tipHandlers, tipId } = useInstantTip()
   return (
     <>
       {/* In flow under the thumbnail, not overlaid on it. The tile is a fixed
@@ -726,22 +737,14 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
           chip grow instead of the pill wrapping. */}
       <button
         type="button"
-        ref={ref}
         aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
         className="px-1.5 py-[1px] rounded-full border-0 text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
-        onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}
+        {...tipHandlers}
       >{i18nT('components.chatInput.resized')}</button>
-      {tip && createPortal(
-        <div
-          role="tooltip"
-          className="fixed z-[9999] -translate-y-full rounded-lg border border-border-strong bg-bg-elevated px-2.5 py-1.5 text-[11px] leading-snug shadow-lg pointer-events-none whitespace-nowrap"
-          style={{ top: tip.top, left: tip.left }}
-        >
-          <div className="text-text">{i18nT('components.chatInput.resized_to_fit_model_limits')}</div>
-          <div className="text-muted">{resize.fromW}×{resize.fromH} → {resize.toW}×{resize.toH}</div>
-        </div>,
-        document.body,
-      )}
+      <InstantTip tip={tip} tipId={tipId} className="w-max max-w-[calc(100vw-1rem)]">
+        <div className="text-text">{i18nT('components.chatInput.resized_to_fit_model_limits')}</div>
+        <div className="text-muted">{resize.fromW}×{resize.fromH} → {resize.toW}×{resize.toH}</div>
+      </InstantTip>
     </>
   )
 }
@@ -948,7 +951,7 @@ function ChatInput({
   automationCreationReady,
   automationSnapshotFailed,
   sessionMode,
-  sendOnEnter = 'enter',
+  sendOnEnter: sendOnEnterProp,
   followUpOptions,
   followUpPicked,
   onFollowUpSelect,
@@ -1097,6 +1100,11 @@ function ChatInput({
   // Read the composer-spellcheck preference here rather than as a prop, so every
   // render site of this component honours it and none can forget to pass it.
   const spellCheck = useComposerSpellcheck()
+  // Same for the send-key mode: the stored preference is the fallback, not a
+  // hardcoded 'enter'. A host omitting the prop (session-grid pane, side panel)
+  // would otherwise send on plain Enter for a user who chose Ctrl/Cmd+Enter.
+  const storedSendMode = useComposerSendMode()
+  const sendOnEnter = sendOnEnterProp ?? storedSendMode
   const uiLang = useLanguage().resolved
   const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
 
@@ -1268,6 +1276,12 @@ function ChatInput({
 
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const composerAnchorRef = useRef<HTMLElement | null>(null)
+  // Whether the editor held focus when the model chip was pressed. Taken on
+  // `mousedown`, which runs BEFORE the browser's default action moves focus
+  // onto the chip — by `click` the editor has already lost it. Consumed and
+  // cleared by the chip's `click`, so a keyboard activation (no mousedown; the
+  // chip itself is focused) reads false rather than a stale press.
+  const modelChipPressedFromComposerRef = useRef(false)
   const lexicalControlRef = useRef<ComposerControl | null>(null)
   const [lexicalLoadFailed, setLexicalLoadFailed] = useState(false)
   const [lexicalFailedNoticeDismissed, setLexicalFailedNoticeDismissed] = useState(false)
@@ -1489,7 +1503,7 @@ function ChatInput({
     if (!voiceRecording || !cancel) return
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return
-      if (slashMenuOpenRef.current || filePickerOpenRef.current || skillPickerOpenRef.current) return
+      if (slashMenuOpenRef.current || filePickerOpenRef.current || skillPickerOpenRef.current || pathPickerOpenRef.current) return
       if (document.querySelector('[role="dialog"]')) return
       e.preventDefault()
       e.stopPropagation()
@@ -1623,6 +1637,18 @@ function ChatInput({
     : 'components.chatInput.continue_thread')
   const [slashMenuOpen, setSlashMenuOpen] = useState(false)
   const [filePickerOpen, setFilePickerOpen] = useState(false)
+  // Shell-style `./` / `../` completion. Its own open/query pair rather than a
+  // flag on the @ picker's, because the two carry different tokens and only one
+  // token can end at the caret — see `pathTokenAt` below.
+  const [pathPickerOpen, setPathPickerOpen] = useState(false)
+  const [pathQuery, setPathQuery] = useState('')
+  // The path token ending at the caret, or null. Gated on a project dir: `./`
+  // names nothing without the root it resolves against, so with no project the
+  // menu stays shut rather than opening on a listing that cannot be produced.
+  const pathTokenAt = useCallback(
+    (before: string) => (project ? matchPathToken(before) : null),
+    [project],
+  )
   const [fileQuery, setFileQuery] = useState('')
   const [skillPickerOpen, setSkillPickerOpen] = useState(false)
   const [skillQuery, setSkillQuery] = useState('')
@@ -2030,8 +2056,16 @@ function ChatInput({
       setSkillPickerOpen(false)
       setSkillQuery('')
     }
+    const pathQueryAtCaret = pathTokenAt(before)
+    if (pathQueryAtCaret !== null) {
+      setPathPickerOpen(true)
+      setPathQuery(pathQueryAtCaret)
+    } else {
+      setPathPickerOpen(false)
+      setPathQuery('')
+    }
     if (selection && voiceCaretRef) voiceCaretRef.current = selection
-  }, [onChange, onFileSelect, typedCommandMenus, voiceCaretRef])
+  }, [onChange, onFileSelect, pathTokenAt, typedCommandMenus, voiceCaretRef])
   const pasteBlocksRef = useRef(pasteBlocks)
   pasteBlocksRef.current = pasteBlocks
   // --- Prompt undo/redo history (per slot) ---
@@ -2076,6 +2110,8 @@ function ChatInput({
   filePickerOpenRef.current = filePickerOpen
   const skillPickerOpenRef = useRef(false)
   skillPickerOpenRef.current = skillPickerOpen
+  const pathPickerOpenRef = useRef(false)
+  pathPickerOpenRef.current = pathPickerOpen
 
   // Auto-focus textarea when the active session changes (autoFocusKey).
   // Track the previous key in a ref so the effect only acts on real key
@@ -2252,6 +2288,7 @@ function ChatInput({
       setSlashMenuOpen(false)
       setFilePickerOpen(false); setFileQuery('')
       setSkillPickerOpen(false); setSkillQuery('')
+      setPathPickerOpen(false); setPathQuery('')
     }
     // Exit history mode when value diverges from the recalled message
     // (user edited it, or the send pipeline cleared it).
@@ -2268,6 +2305,7 @@ function ChatInput({
     setSlashMenuOpen(false)
     setFilePickerOpen(false); setFileQuery('')
     setSkillPickerOpen(false); setSkillQuery('')
+    setPathPickerOpen(false); setPathQuery('')
   }, [slotId])
 
   // Record undo snapshots as the controlled value changes.
@@ -2802,6 +2840,7 @@ function ChatInput({
     if (
       !sentMessages?.length ||
       slashMenuOpenRef.current || filePickerOpenRef.current || skillPickerOpenRef.current ||
+      pathPickerOpenRef.current ||
       ime.isComposing(e) ||
       e.metaKey || e.ctrlKey || e.altKey || e.shiftKey
     ) return
@@ -3839,6 +3878,30 @@ function ChatInput({
         />
       )}
 
+      {/* Path completion is not gated on `onFileSelect`: a completed `./path`
+          is text the user typed, not a staged attachment, so there is nothing to
+          hand to the host. It IS gated on a project dir, which is the root every
+          `./` resolves against. */}
+      <FilePickerMenu
+        pathMode
+        query={pathQuery}
+        anchorRef={composerAnchorRef}
+        open={pathPickerOpen}
+        project={project}
+        sendOnEnter={sendOnEnter}
+        onSelect={({ relativePath, kind }) => {
+          // A shell completes a directory to `dir/` and waits for the next
+          // segment; a file completion is finished, so it gets the trailing
+          // space. Re-seeding the query on a directory keeps the menu open on
+          // the new level — the programmatic insert never reaches the composer's
+          // own onChange, so the token has to be handed over here.
+          applyPickedToken(PATH_TOKEN_RE, kind === 'dir' ? relativePath : `${relativePath} `)
+          if (kind === 'dir') setPathQuery(relativePath)
+          else { setPathPickerOpen(false); setPathQuery('') }
+        }}
+        onClose={() => { setPathPickerOpen(false); setPathQuery('') }}
+      />
+
       {typedCommandMenus && <SkillPickerMenu
         query={skillQuery}
         anchorRef={composerAnchorRef}
@@ -4073,6 +4136,9 @@ function ChatInput({
             const skillQ = fileQ === null ? matchSkillToken(before) : null
             if (typedCommandMenus && skillQ !== null) { setSkillPickerOpen(true); setSkillQuery(skillQ) }
             else { setSkillPickerOpen(false); setSkillQuery('') }
+            const pathQ = pathTokenAt(before)
+            if (pathQ !== null) { setPathPickerOpen(true); setPathQuery(pathQ) }
+            else { setPathPickerOpen(false); setPathQuery('') }
             recordCaret()
           }}
           onKeyDown={handleKeyDown}
@@ -4788,7 +4854,7 @@ function ChatInput({
                       ? 'text-warn'
                       : 'text-muted hover:text-text'
               }`}
-              onClick={e => onSessionControlClick?.(sc.key, e.currentTarget.getBoundingClientRect())}
+              onClick={e => onSessionControlClick?.(sc.key, e.currentTarget.getBoundingClientRect(), e.currentTarget)}
               // Marks the chip as part of its own popover for dismissal
               // purposes: mousedown fires before click, so without this the
               // host's outside-click closes the popover and the chip's toggle
@@ -4811,7 +4877,7 @@ function ChatInput({
                writes, so it would make the shelf ignore the user's typeface. */
             <button
               className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
-              onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect())}
+              onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
               disabled={isRunning}
               // Inherited default: explain what the ` . default` marker means, on
               // hover (title) AND keyboard focus / screen readers (aria-label),
@@ -4842,7 +4908,7 @@ function ChatInput({
           <div className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted">
           <button
             className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-            onClick={e => onProjectClick(e.currentTarget.getBoundingClientRect())}
+            onClick={e => onProjectClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
             disabled={isRunning}
             title={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
             aria-label={isRunning ? i18nT('components.chatInput.stop_the_current_response_to_switch_project') : projectChipTitle}
@@ -5013,7 +5079,15 @@ function ChatInput({
           {onModelClick && modelName && (
             <button
               className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-              onClick={e => onModelClick(e.currentTarget.getBoundingClientRect())}
+              onMouseDown={() => {
+                const editor = composerControl()?.getRootElement()
+                modelChipPressedFromComposerRef.current = !!editor && editor.contains(document.activeElement)
+              }}
+              onClick={e => {
+                const composerHadFocus = modelChipPressedFromComposerRef.current
+                modelChipPressedFromComposerRef.current = false
+                onModelClick(e.currentTarget.getBoundingClientRect(), e.currentTarget, composerHadFocus)
+              }}
               disabled={isRunning}
               data-testid="composer-model-chip"
               // Inherited default: mirror the agent chip -- ` · default` marker on

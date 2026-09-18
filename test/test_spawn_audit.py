@@ -943,6 +943,19 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/dev_fleet/npm_preflight.py::_extract",
         "apps/builtins/dev_fleet/npm_preflight.py::_install_already_proven",
         "apps/builtins/dev_fleet/npm_preflight.py::probe",
+        # _scratch_name_is_ignored decides WHERE the probe's scratch may live, and
+        # is the fourth spawn of the same probe -- so it is already inside the
+        # sandbox server.py applied to the sync step, exactly as the three above.
+        # It spawns `<git> -C <repo> check-ignore -q --no-index <name>` from the
+        # same sources: the binary is the sync's _trusted_bin git (never a PATH
+        # search), the repo is the operator-configured checkout, the four flags are
+        # literals, and <name> is `_SCRATCH_PREFIX` plus a fixed literal suffix --
+        # a module-level constant, not a path any caller supplies and not a path
+        # that exists. It only READS: `check-ignore` resolves the ignore rules and
+        # answers in its exit code, writing nothing. An unanswerable exit is read
+        # as "not ignored", so a blocked or failing spawn can only make the probe
+        # fall back to TMPDIR, never widen what it may touch.
+        "apps/builtins/dev_fleet/npm_preflight.py::_scratch_name_is_ignored",
         # _frontend_build_already_current is the STRONGER build-skip predicate
         # that wraps _install_already_proven (listed directly above) and adds one
         # read-only spawn: `<git> -C <repo> rev-parse <ref>:website`. Same three
@@ -1222,6 +1235,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cloud/ssm.py::_kill_tree_windows",
         "cloud/ssm.py::_run_install_command",
         "cloud/ssm.py::open_port_forward",
+        # Local identity probe: `<resolved kiro-cli> whoami --format json`, a
+        # fixed argv with no shell and no agent-reachable input — the binary
+        # comes from `kiro_cli.resolve_kiro_cli` (the same resolution every
+        # other kiro-cli spawn uses), stdin is DEVNULL and the output is only
+        # parsed, never executed. Same classification as the whoami probes
+        # in `cloud/ssm.py` above.
+        "cloud/login_target.py::discover_local_identity",
         "dashboard/chat_voice.py::api_voice_voices",
         # Computer-use permission probe: `<our own kirocrew binary> computer
         # doctor --json`, a fixed argv (module constants) with no shell and no
@@ -1323,6 +1343,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "imessage/rpc.py::start",
         "mcp_core.py::_get_ppid",
         "mcp_gateway/backend.py::spawn_backend",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``), used here only to drive the one-shot
+        # ``_ping_async`` coroutine from a synchronous CLI path -- ``kirocrew
+        # doctor`` and ``kirocrew stop`` have no event loop of their own. The
+        # coroutine opens a local endpoint (``AF_UNIX`` socket or named pipe) and
+        # exchanges two frames with a daemon that is already running; no child
+        # process is created and there is no argv to sandbox. Same classification
+        # as the other ``asyncio.run`` sites in this list.
+        "mcp_gateway/daemon_control.py::_ping",
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",
@@ -1489,6 +1518,16 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "session_pid.py::_our_orphan_pids",
         "session_pid.py::find_orphan_mcp_candidates",
         "session_pid.py::kill_orphan_mcps",
+        # The abandoned-agent-scope reaper's two systemctl calls are gateway
+        # maintenance against this install's own units, not agent work. The binary
+        # comes only from platform_compat.trusted_system_bin("systemctl")'s fixed
+        # system directories; a miss returns without spawning, so PATH and agent
+        # input cannot choose it. Argv is fixed `--user show` / `--user stop`
+        # apart from a unit name enumerated from this install's own per-instance
+        # `kirocrew-agents-<token>.slice` cgroup tree. The unit is one separate
+        # list-argv element, shell is never enabled, and no cwd is passed.
+        "session_scope_reap.py::_scope_active_enter_us",
+        "session_scope_reap.py::_systemctl_stop",
         "slack/gateway.py::_auto_apply_update",
         # Wheel/cli.sh auto-update: runs the signed installer command
         # (composed locally from a validated channel name and https-pinned

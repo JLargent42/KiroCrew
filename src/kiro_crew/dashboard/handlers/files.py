@@ -75,8 +75,14 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.doc_blocks import extract_blocks
 from kiro_crew.doc_parser import extract_text
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 from kiro_crew.github_runner import validate_provider_executable
-from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
+from kiro_crew.hooks import (
+    FileTooLargeError,
+    is_unc_shape,
+    safe_read_file_bytes,
+    safe_read_prefix,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
@@ -91,12 +97,12 @@ from kiro_crew.sandbox import (
 from kiro_crew.security import (
     BINARY_MIME_ALLOWLIST,
     is_sensitive_path,
+    is_sensitive_resolved_path,
     redact_credentials,
     redact_exfiltration_urls,
     redact_path_segments,
     sandbox_credential_targets,
 )
-from kiro_crew.slack.handler import is_tracked_channel
 from kiro_crew.validation import (
     FILE_READ_SCHEMA,
     MODEL_ID_RE,
@@ -134,6 +140,13 @@ _SUBAGENT_SESSION_PREFIX = "subagent:"
 
 
 logger = logging.getLogger(__name__)
+
+
+def is_tracked_channel(channel_id: str) -> bool:
+    """Load the Slack probe only when a file delivery needs it."""
+    from kiro_crew.slack.handler import is_tracked_channel as probe
+
+    return probe(channel_id)
 
 
 def _subagent_parent_session_key(state: DashboardState, session_key: str) -> str:
@@ -1197,6 +1210,8 @@ _ALLOWED_TEXT_EXT = {
     ".yaml",
     ".yml",
     ".xml",
+    # draw.io / diagrams.net XML source.
+    ".drawio",
     ".csv",
     ".tsv",
     ".log",
@@ -2534,6 +2549,36 @@ class _TextRead(NamedTuple):
     content: str
 
 
+#: How much of a file the binary sniff reads before deciding, in BYTES. 8 KiB is
+#: the window the Files app already uses (``_is_binary_file`` in
+#: ``apps/builtins/file_explorer/server.py``); the two surfaces disagreeing about
+#: what "binary" means is a worse outcome than either window being wrong.
+_FILE_READ_SNIFF_BYTES = 8192
+
+#: Extensions that are binary by format, answered BEFORE the NUL sniff.
+#:
+#: The sniff alone is not sufficient: a NUL-free binary format reads as text and
+#: opens an editable buffer over bytes a save would corrupt -- a GNU thin `.a`
+#: archive stores only ASCII member-header references, so its first 8 KiB can
+#: hold no NUL at all. The sniff still runs after this check and remains what
+#: catches an extension-LESS binary, which is why neither half is redundant.
+#:
+#: Kept byte-identical to ``BINARY_EXTS`` in
+#: ``src/kiro_crew/apps/builtins/file_explorer/server.py`` -- the Files app and
+#: this endpoint must answer "is this binary" the same way, and
+#: ``test_dashboard_file_io.py`` fails if the two sets ever diverge.
+_FILE_READ_BINARY_EXTS = frozenset(
+    {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tiff", ".pdf",
+        ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+        ".so", ".dylib", ".dll", ".exe", ".class", ".jar", ".war", ".o", ".a",
+        ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv", ".webm",
+        ".sqlite", ".db", ".duckdb",
+        ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    }
+)
+
+
 def _read_request_path(raw: str, read_cap: int) -> _TextRead:
     """Validate, no-follow open and read a request path in ONE transaction.
 
@@ -2556,9 +2601,14 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
     What stays endpoint POLICY, per the prefix's own contract: the ``isdir``
     probe, because a READ distinguishes a directory from a missing path in its
     404 (it runs inside the transaction for the same reason the open does), and
-    the text decode -- a ``TextIOWrapper`` over the checked descriptor, so
-    ``read_cap`` still counts CHARACTERS. Counting bytes instead would mis-set
-    ``X-Truncated`` on multi-byte content.
+    the bounded byte snapshot used for both the binary verdict and text decode.
+    One snapshot prevents an in-place rewrite between two reads from pairing a
+    text verdict with binary bytes. The snapshot is ``read_cap * 4`` bytes (a
+    UTF-8 character is at most four bytes), decoded whole and sliced to
+    ``read_cap`` CHARACTERS, so multi-byte content does not mis-set
+    ``X-Truncated`` and a character split at the byte bound can only fall
+    beyond the slice. A file that itself ends mid-codepoint decodes to a
+    trailing U+FFFD, exactly as it did before this change.
 
     Pass ``read_cap`` 0 for the verdict only: HEAD answers from the stat and must
     open nothing.
@@ -2585,9 +2635,26 @@ def _read_request_path(raw: str, read_cap: int) -> _TextRead:
         # symlink_refused (the final component became a link inside this
         # transaction), read_failed, file_too_large: the read did not happen.
         return _TextRead("read_failed", checked.path, "")
+    # Binary BY FORMAT, decided before any byte is decoded: a NUL-free binary
+    # (a GNU thin `.a` holds only ASCII member references) would otherwise read
+    # as text and open an editable buffer that a save turns into corruption.
+    if PurePath(checked.path).suffix.lower() in _FILE_READ_BINARY_EXTS:
+        with contextlib.suppress(Exception):
+            checked.file.close()
+        return _TextRead("binary", checked.path, "")
     try:
-        with io.TextIOWrapper(checked.file, encoding="utf-8", errors="replace") as text:
-            return _TextRead("file", checked.path, text.read(read_cap))
+        # Read one bounded byte snapshot for both the binary verdict and the
+        # content. Two descriptor reads would let an in-place rewrite pair a
+        # text verdict from the sniff with binary bytes from the later decode.
+        # The decode is deliberately lossy (``errors="replace"``), which is
+        # right for a text file with one bad byte and actively wrong for a .zip
+        # or a .sqlite. The sniff is what catches a binary with NO extension, so
+        # it runs even though the check above already answered every known one.
+        with contextlib.closing(checked.file):
+            data = checked.file.read(read_cap * 4)
+        if b"\x00" in data[:_FILE_READ_SNIFF_BYTES]:
+            return _TextRead("binary", checked.path, "")
+        return _TextRead("file", checked.path, data.decode("utf-8", errors="replace")[:read_cap])
     except OSError:
         with contextlib.suppress(Exception):
             checked.file.close()
@@ -2802,6 +2869,20 @@ async def api_file_read(request: web.Request) -> web.Response:
     try:
         if outcome.kind == "read_failed":
             raise OSError(f"file_read could not read {path}")
+        if outcome.kind == "binary":
+            _sel().log_tool_invocation(
+                session_key="dashboard", tool_name="file_read", outcome="success", resources=path
+            )
+            # Empty content rather than decoded garbage, and the verdict as a
+            # HEADER as well as a body field: a .json TEXT file is served as
+            # ``application/json`` too, so the content type cannot tell this
+            # envelope apart from a file whose own body is JSON. The header and
+            # the empty body are the whole contract -- the panel's card names
+            # the file by its path and offers the download, nothing more.
+            return web.json_response(
+                {"binary": True, "content": ""},
+                headers={"X-File-Binary": "true"},
+            )
         content = outcome.content
         truncated = len(content) > read_cap
         content = content[:read_cap]
@@ -3163,7 +3244,9 @@ async def api_file_download(request: web.Request) -> web.Response:
             outcome="denied", resources=path, error="content_redacted",
         )
         return web.json_response(
-            {"error": "file content was redacted; download aborted"}, status=400,
+            {"error": "file content was redacted; download aborted",
+             "code": "content_redacted"},
+            status=400,
         )
 
     safe_name = urllib.parse.quote(os.path.basename(path), safe="")
@@ -4375,6 +4458,412 @@ async def api_file_search(request: web.Request) -> web.Response:
     })
 
 
+# ── Path completion (/api/path-complete) ──────────────────────────────────────
+#
+# The chat composer's shell-style `./` / `../` completion. A sibling of
+# ``api_file_search`` above rather than a mode of it, for two reasons that are
+# not cosmetic:
+#
+# * ``/api/file-search`` answers "which files ANYWHERE under this root fuzzily
+#   match these characters"; completion answers "what is IN this one directory".
+#   A recursive fuzzy hit cannot be turned back into the path the user is typing
+#   -- the entry name alone is not the path -- so the row set has to come from a
+#   single directory level.
+# * ``?project=`` on the search endpoint is any path on the host, by design.
+#   Completion must be the opposite: the caller names a KNOWN project directory
+#   (the same allow-list ``api_project_git`` / ``api_project_tree`` use) and the
+#   ``../`` segments are resolved and then re-checked for containment, so no
+#   token typed in the composer can enumerate a directory outside the project.
+
+#: Rows returned by one completion request. The composer popup shows a handful;
+#: this bounds the response for a directory with thousands of entries, which is
+#: also where a shell's own completion stops being useful.
+_PATH_COMPLETE_MAX_ENTRIES = 50
+
+#: Either separator ends a segment of a typed path token. Both, on every platform:
+#: a backslash IS a separator on Windows, so a token carrying one must be SPLIT
+#: rather than appended as a single literal name that the OS then re-interprets at
+#: the open -- which is how `..\..\etc` escaped a root that had already been
+#: checked. The composer's own grammar is POSIX-style, so on POSIX this only
+#: refuses to treat a backslash as part of a filename, which no completion token
+#: means it to be.
+_PATH_TOKEN_SEPARATORS = re.compile(r"[/\\]+")
+
+#: Directory entries EXAMINED per request, independent of how many survive the
+#: prefix filter. The listing is one level deep, so this is the only ceiling
+#: needed -- it bounds ``node_modules``-sized directories, where the scan (not
+#: the response) is the cost.
+_PATH_COMPLETE_MAX_SCAN = 5000
+
+
+def _completion_segments(root: str, rel: str) -> list[str] | None:
+    r"""Lexically resolve the typed prefix to segments under *root*.
+
+    ``None`` means it does not name anything under the root: an absolute,
+    drive-absolute or UNC-shaped prefix, or a ``..`` run that ends up outside it.
+    This is the WHOLE containment decision and it touches no filesystem, which is
+    what lets everything below refuse to resolve a caller-supplied string at all.
+
+    The walk starts from the root's OWN segments rather than from empty, so a
+    ``..`` run is judged on where it ends rather than refused for existing: going
+    up and back down into the same project (``../<project-name>/src/``) is what a
+    shell does and stays inside, while a run that ends anywhere else does not.
+    Comparison is by segment, so no component is resolved to decide it.
+
+    Both separators end a segment, on every platform -- see
+    ``_PATH_TOKEN_SEPARATORS`` for why a Windows-style token must be split here
+    rather than left for the OS to re-interpret after the check. A Windows
+    component is also refused when trailing dots or spaces would be STRIPPED from
+    it, for the same reason in miniature: ``".. "`` is not ``".."`` to this
+    function but is to Win32, so accepting it would let the check and the OS
+    disagree about one string. That rule applies to ORDINARY names only -- ``.``
+    and ``..`` are parent references handled first, and ``".."`` would itself be
+    stripped to nothing. Padded names are unopenable on Windows anyway, so the
+    refusal costs nothing real; on POSIX they are ordinary filenames and are kept.
+    """
+    if is_unc_shape(rel) or os.path.isabs(rel) or ntpath.splitdrive(rel)[0]:
+        return None
+    base = [part for part in _PATH_TOKEN_SEPARATORS.split(root) if part]
+    walked = list(base)
+    for raw in _PATH_TOKEN_SEPARATORS.split(rel):
+        if raw in ("", "."):
+            continue
+        if raw == "..":
+            if not walked:
+                return None
+            walked.pop()
+            continue
+        # Ordinary names only: `.` and `..` are handled above, and `".."` would
+        # itself be stripped to nothing by the rstrip below.
+        if platform_compat.IS_WINDOWS and raw.rstrip(". ") != raw:
+            return None
+        walked.append(raw)
+    if walked[: len(base)] != base:
+        return None
+    return walked[len(base):]
+
+
+def _open_completion_dir(root: str, segments: list[str]) -> int:
+    r"""Open ``root/<segments>`` without ever following a link. Worker-thread only.
+
+    Nothing here resolves a path, and that is the point. ``os.path.realpath`` on
+    Windows opens the final path, so resolving a caller-influenced path whose link
+    target is ``\\host\share`` IS an outbound SMB authentication -- and a screen
+    that runs before the resolve only narrows the window in which a same-UID
+    writer can swap a link into it. Refusing to follow a link at all removes the
+    window instead of narrowing it: whatever is planted, the open fails.
+
+    POSIX opens each component RELATIVE to the descriptor for the one above it,
+    which is atomic. Windows has no ``dir_fd``, so components are re-opened by
+    path; the property there is carried by ``pin_directory`` refusing a reparse
+    point AT each name, so a junction swapped in mid-walk is rejected rather than
+    traversed.
+
+    Raises ``FileNotFoundError`` when nothing is there and another ``OSError``
+    (``ELOOP``/``ENOTDIR``, or Windows ``NotADirectoryError``) when the name is a
+    link or not a directory. Release with ``os.close``.
+    """
+    fd = platform_compat.pin_directory(root)
+    walked = root
+    try:
+        for segment in segments:
+            walked = os.path.join(walked, segment)
+            if platform_compat.IS_POSIX:
+                nxt = os.open(
+                    segment,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=fd,
+                )
+            else:
+                nxt = platform_compat.pin_directory(walked)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _scan_completion_dir(
+    dir_fd: int, target: str, root: str, prefix: str
+) -> list[dict]:
+    """Rows for one already-pinned directory. Worker-thread only.
+
+    *target* is the descriptor's own real path (see ``fd_real_path`` in
+    :func:`_complete_path_listing`), never the spelling the caller typed, so the
+    per-entry fence below judges canonical names.
+
+    Read through *dir_fd* on POSIX so every name resolves against the directory
+    that was actually inspected rather than against its path a second time.
+    Windows has no ``dir_fd`` support in ``scandir``; there the pin itself is what
+    holds the directory in place (its handle omits ``FILE_SHARE_DELETE``, so
+    neither it nor any directory above it can be renamed while it lives).
+    """
+    # A shell hides dot entries until the user types the dot; so does this.
+    want_hidden = prefix.startswith(".")
+    lowered = prefix.lower()
+    rows: list[dict] = []
+    scanned = 0
+    with os.scandir(dir_fd if platform_compat.IS_POSIX else target) as entries:
+        for entry in entries:
+            if scanned >= _PATH_COMPLETE_MAX_SCAN:
+                break
+            scanned += 1
+            if entry.name.startswith(".") and not want_hidden:
+                continue
+            if lowered and not entry.name.lower().startswith(lowered):
+                continue
+            # Built from the pinned directory's path rather than read off the
+            # entry, because a descriptor-based scan reports each entry's path
+            # as its bare name.
+            full = os.path.join(target, entry.name)
+            try:
+                # A link is never OFFERED, because it can never be entered: the
+                # walk above refuses to follow one, so completing into it would
+                # fail on the next keystroke. That one rule replaces every
+                # question about where a link points -- out of the project, at a
+                # `\\host\share`, or through a chain into either -- and it
+                # answers them without resolving anything, which is what the
+                # resolution was needed for.
+                if entry.is_symlink() or (
+                    platform_compat.IS_WINDOWS and platform_compat.is_link_or_junction(full)
+                ):
+                    continue
+                # With no link anywhere in the walked path or at this name, `full`
+                # IS the canonical path, so the sensitivity fence needs no
+                # resolution to be exact -- and must not do one (see
+                # ``_complete_path_listing``).
+                if is_sensitive_resolved_path(full):
+                    continue
+                # No-follow metadata, atomically: the entry is known not to be a
+                # link, and a following ``stat`` would be one more chance for a
+                # swap to be resolved instead of refused. ``lstat`` on a
+                # non-link answers exactly what ``stat`` would.
+                is_dir = entry.is_dir(follow_symlinks=False)
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            rows.append({
+                "path": full,
+                "name": entry.name,
+                "kind": "dir" if is_dir else "file",
+                "size": 0 if is_dir else st.st_size,
+                "mtime": int(st.st_mtime),
+            })
+
+    # Alphabetical, directories first: the next thing a user completing a path
+    # types is usually another separator.
+    rows.sort(key=lambda r: (r["kind"] != "dir", r["name"].lower()))
+    return rows[:_PATH_COMPLETE_MAX_ENTRIES]
+
+
+def _complete_path_listing(
+    project: str, rel: str, prefix: str
+) -> tuple[str, str, list[dict]]:
+    """List one directory level for path completion. Worker-thread only.
+
+    Every filesystem touch for the request lives here (the project dir's own
+    canonicalization, the component walk, ``scandir`` and the per-entry ``stat``),
+    same shape as ``_resolve_project_git``: a project on a stalled mount must not
+    block the loop on any of them.
+
+    Returns ``(status, root, rows)`` with status ``"ok"``, ``"sensitive"``,
+    ``"outside"`` (the token resolved out of the project), ``"refused"`` (a link
+    or a non-directory sat at the target when it was opened, or the opened
+    descriptor could not be identified) or ``"missing"`` (nothing is there). The
+    last two are one answer to the caller and two different audit facts, which is
+    why they are separate statuses.
+
+    Nothing caller-supplied is ever RESOLVED. Containment is decided lexically by
+    :func:`_completion_segments` -- an absolute, drive-absolute or UNC-shaped
+    ``rel``, or a ``..`` run that pops above the root, names nothing under it --
+    and the directory is then reached by :func:`_open_completion_dir`, which opens
+    one component at a time and refuses to follow a link at any of them. So the
+    target is under the root by construction rather than by a check, and a link a
+    same-UID writer plants mid-walk is refused rather than followed. That is why
+    ``realpath`` appears nowhere below: on Windows it opens the final path, so
+    resolving a caller-influenced path whose link target is a share is itself an
+    outbound SMB authentication, and any screen placed before it can only narrow
+    the window rather than close it.
+    """
+    # The project dir is server-held (it came from the known-project allow-list),
+    # so canonicalizing IT is not a caller-influenced resolution -- and it is what
+    # makes the walk below start from a link-free base.
+    root = os.path.realpath(os.path.expanduser(project))
+    # The NON-resolving fence, here and for every entry below. ``is_sensitive_path``
+    # canonicalises what it is handed (``_candidate_forms`` -> ``realpath``), which
+    # on Windows follows a junction aimed at a share -- so the fence itself would be
+    # the outbound SMB authentication the rest of this function exists to avoid, and
+    # it would run BEFORE the no-follow open that is supposed to have removed the
+    # window. ``is_sensitive_resolved_path`` matches the candidate lexically and
+    # resolves only its own anchors (``$HOME``, the override roots), which are
+    # server-held. Its contract wants a canonical input and gets one: ``root`` is
+    # realpath'd, every component below it is proven not to be a link by the walk,
+    # and a link entry is never offered -- so these paths have no link left to
+    # follow, which is what "canonical" means here.
+    if is_sensitive_resolved_path(root):
+        return "sensitive", root, []
+    segments = _completion_segments(root, rel)
+    if segments is None:
+        return "outside", root, []
+
+    # The walk raises for a link, a reparse point or a non-directory at any
+    # component, and separately for a component that is simply not there. Both
+    # complete nothing, but only the first says something happened that the audit
+    # trail should carry.
+    try:
+        dir_fd = _open_completion_dir(root, segments)
+    except FileNotFoundError:
+        return "missing", root, []
+    except OSError:
+        return "refused", root, []
+    try:
+        # What the kernel says the OPEN descriptor really is. A path string is not
+        # a single name on Windows: an 8.3 alias (``SSH~1``) is a second name the
+        # filesystem keeps for the same directory, so no lexical fence can see that
+        # ``./SSH~1/`` IS ``.ssh`` -- and adding another string rule would only
+        # rename the problem. ``fd_real_path`` is the documented containment witness
+        # for exactly this shape (the descriptor is already held, so the name has no
+        # component left to swap), and it fails CLOSED: a host that cannot answer
+        # leaves nothing to validate, so the request is refused rather than served
+        # on the caller's spelling.
+        witness = pinned_fs.fd_real_path(dir_fd)
+        if witness is None:
+            return "refused", root, []
+        # Containment again, on the canonical name this time: the lexical pass
+        # judged the string the caller typed, and only this judges the directory it
+        # turned out to name.
+        if not (witness == root or witness.startswith(root + os.sep)):
+            return "outside", root, []
+        if is_sensitive_resolved_path(witness):
+            return "sensitive", witness, []
+        # Entries are built from the WITNESS, so the per-entry fence sees canonical
+        # names too -- a row under an aliased directory would otherwise carry the
+        # alias straight past it.
+        rows = _scan_completion_dir(dir_fd, witness, root, prefix)
+    except OSError:
+        return "missing", root, []
+    finally:
+        os.close(dir_fd)
+    return "ok", root, rows
+
+
+async def api_path_complete(request: web.Request) -> web.Response:
+    """GET /api/path-complete?path=…&dir=…&q=… — one directory level of a project.
+
+    ``path`` is matched against the gateway's own known project directories and
+    the matched SERVER-HELD value is what gets resolved, so this route cannot
+    enumerate arbitrary host directories. ``dir`` is the caller's relative
+    directory prefix (``./``, ``../src/``) and ``q`` the partial entry name
+    being typed. A ``dir`` that resolves outside the project root is answered
+    with the ordinary empty result set -- not an error, and not a distinguishing
+    field: the composer shows "no matches" while the user is still typing the
+    token, and the refusal is recorded in the SEL audit rather than handed to a
+    caller that has nothing to do with it.
+
+    Rows carry the same shape as ``/api/file-search`` so the picker renders both
+    unchanged, and like that endpoint they are NOT redacted -- the name the
+    picker inserts has to be the real one for the path to resolve.
+    """
+    state: DashboardState = request.app["state"]
+    caller = request.get("user", "dashboard")
+    raw = request.query.get("path", "").strip()
+    if not raw:
+        return web.json_response(
+            {"error": "path required", "code": "path_required"}, status=400
+        )
+    project = await asyncio.to_thread(
+        _match_known_project_for, _slot_project_snapshot(state), raw
+    )
+    if project is None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="denied",
+            resources=raw,
+            error="not a known project directory",
+        )
+        return web.json_response(
+            {"error": "Unknown project directory", "code": "unknown_project_dir"},
+            status=403,
+        )
+
+    rel = request.query.get("dir", "").strip()
+    prefix = request.query.get("q", "").strip()
+
+    # A NUL cannot occur in a path on any supported platform, and the resolver
+    # would raise ValueError rather than OSError for one -- a 500 on caller
+    # input. It is the same answer as any other unresolvable token: nothing to
+    # complete.
+    if "\0" in rel or "\0" in prefix:
+        return web.json_response({"results": [], "root": ""})
+
+    # The resolved directory is caller-INFLUENCED (``dir`` is joined onto the
+    # allow-listed root), so the listing takes a probe slot exactly as the
+    # search walk does rather than a shared default-executor worker.
+    try:
+        status, root, rows = await _run_path_probe(
+            _complete_path_listing, project, rel, prefix, transfer=True
+        )
+    except _PathProbeBusy:
+        return _probe_busy_response(
+            resource=project, operation="path_complete", caller=caller
+        )
+
+    if status == "sensitive":
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="denied",
+            resources=root,
+            error="sensitive path",
+        )
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
+    if status == "outside":
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="denied",
+            resources=f"{root} dir={rel}",
+            error="outside project root",
+        )
+        # The one fact the picker cannot work out for itself: an out-of-project
+        # token and an empty directory are both zero rows, and only this side knows
+        # which. A boolean rather than a named scope, because there is one thing to
+        # say and no second value to leave room for; it exists BECAUSE it has a
+        # consumer -- the composer's empty-state copy -- and the alternative was the
+        # client re-deriving a containment verdict this endpoint already reached.
+        return web.json_response({"results": [], "root": "", "outside": True})
+    if status == "refused":
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="denied",
+            resources=f"{root} dir={rel}",
+            error="not a real directory at the completion target",
+        )
+        return web.json_response({"results": [], "root": root})
+    if status == "missing":
+        _sel().log_api_access(
+            caller=caller,
+            operation="path_complete",
+            outcome="allowed",
+            resources=f"{root} dir={rel} q={prefix} results=0",
+            error="no such directory",
+        )
+        return web.json_response({"results": [], "root": root})
+
+    _sel().log_api_access(
+        caller=caller,
+        operation="path_complete",
+        outcome="allowed",
+        resources=f"{root} dir={rel} q={prefix} results={len(rows)}",
+    )
+    return web.json_response({"results": rows, "root": root})
+
+
 # ── Content search (/api/file-grep) ───────────────────────────────────────────
 #
 # The side-panel Files rail's Content mode: "which files CONTAIN this text".
@@ -5322,9 +5811,65 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
     return dirs, files
 
 
+#: A Windows drive root -- ``C:``, ``C:\\`` or ``C:/`` -- with nothing after it.
+#: Only such a path has a parent the filesystem cannot name: ``ntpath.dirname``
+#: answers ``C:\\`` for ``C:\\``, which the browser reads as "no parent" and
+#: hides its Back control on, stranding the user on one drive.
+_WIN_DRIVE_ROOT_RE = re.compile(r"[A-Za-z]:[\\/]?")
+
+
+def _is_windows_drive_root(path: str) -> bool:
+    return platform_compat.IS_WINDOWS and _WIN_DRIVE_ROOT_RE.fullmatch(path) is not None
+
+
+def _browse_drives_sync() -> list[dict[str, str]]:
+    """Enumerate the mounted Windows drive roots, as browse-dirs rows.
+
+    Blocking -- callers run it on the transfer pool, like the other listings.
+    ``os.listdrives`` exists on every supported interpreter (``requires-python
+    >= 3.12``); it is reached through ``getattr`` only because typeshed declares
+    it under ``sys.platform == "win32"``, so a direct attribute fails mypy on
+    the Linux CI runner. The caller has already refused non-Windows hosts.
+    """
+    roots = list(getattr(os, "listdrives")())
+    return [{"name": r, "path": r} for r in roots]
+
+
+def _browse_parent(base: str) -> str:
+    """The Back target for *base*: its dirname, or ``""`` for a Windows drive root.
+
+    Shared by ``/api/browse-dirs`` and ``/api/browse-files`` so both listings
+    describe a drive root the same way. ``""`` is the caller's cue that the level
+    above is the virtual drive list (``?drives=1``), not a directory; a consumer
+    without a drive list (the folder panel) reads it as "top", exactly as it
+    read the old ``C:\\`` == ``C:\\`` answer. A POSIX ``/`` keeps ``dirname``'s
+    answer of ``/`` -- equal to itself, which every consumer already reads as
+    "top".
+    """
+    if _is_windows_drive_root(base):
+        return ""
+    return os.path.dirname(base)
+
+
 async def api_browse_dirs(request: web.Request) -> web.Response:
-    """GET /api/browse-dirs?path=... — list subdirectories for directory browser."""
+    """GET /api/browse-dirs?path=... — list subdirectories for directory browser.
+
+    ``?drives=1`` (Windows only) lists the mounted drive roots instead, as the
+    virtual level above every ``X:\\``; the response carries ``path: ""`` --
+    the one listing that is not a directory -- and ``parent: ""`` so the picker
+    knows it is at the top. On other platforms the flag is a 400: there is no
+    such level to show.
+    """
     caller = request.get("user", "dashboard")
+    if request.query.get("drives") == "1":
+        if not platform_compat.IS_WINDOWS:
+            return web.json_response({"error": "Drive listing is only available on Windows", "code": "drives_windows_only"}, status=400)
+        try:
+            drives = await _run_path_probe(_browse_drives_sync, transfer=True)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource="drives", operation="browse_dirs", caller=caller)
+        _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="allowed", resources="drives")
+        return web.json_response({"path": "", "parent": "", "dirs": drives})
     raw = request.query.get("path", "").strip()
     # Off-loop: realpath then the isdir probe, on a caller-supplied root (the
     # shared resolver answers $HOME for an unnamed one). is_sensitive_path below
@@ -5344,7 +5889,7 @@ async def api_browse_dirs(request: web.Request) -> web.Response:
     except _PathProbeBusy:
         return _probe_busy_response(resource=base, operation="browse_dirs", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_dirs", outcome="allowed", resources=base)
-    return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs})
+    return web.json_response({"path": base, "parent": _browse_parent(base), "dirs": dirs})
 
 
 #: Depth ceiling for the walk-up that looks for a repository root. A project
@@ -5613,7 +6158,7 @@ async def api_browse_files(request: web.Request) -> web.Response:
     except _PathProbeBusy:
         return _probe_busy_response(resource=base, operation="browse_files", caller=caller)
     _sel().log_api_access(caller=caller, operation="browse_files", outcome="allowed", resources=base)
-    return web.json_response({"path": base, "parent": os.path.dirname(base), "dirs": dirs, "files": files})
+    return web.json_response({"path": base, "parent": _browse_parent(base), "dirs": dirs, "files": files})
 
 
 async def api_dashboard_config(request: web.Request) -> web.Response:
@@ -6552,6 +7097,7 @@ _GIT_PANEL_STDOUT_CAP = 8 * 1024 * 1024
 def _run_git_bounded(
     args: list[str], cwd: str, env: dict, timeout: float,
     cap: int = _GIT_PANEL_STDOUT_CAP,
+    decode_errors: str = "replace",
 ) -> tuple[int, str, bool]:
     """Run git capturing at most ``cap`` bytes of stdout.
 
@@ -6559,6 +7105,11 @@ def _run_git_bounded(
     outlives ``timeout`` or overflows ``cap`` it is killed and reported as
     truncated with a nonzero returncode -- callers already treat nonzero as
     "no data", which is the safe degraded answer for a pathological repo.
+
+    ``decode_errors`` is ``"replace"`` for display-bound output. A caller
+    whose output names a filesystem path fed to an ``os`` call passes
+    ``"surrogateescape"`` so non-UTF-8 path bytes round-trip through
+    ``os.fsencode`` (see :func:`kiro_crew.subprocess_utf8.utf8_path_stdout`).
     """
     # OS-sandbox + credential-scrubbed env chokepoint (worktree.py's _run_git
     # pattern): the repository content is agent-influenced, and git filter
@@ -6613,7 +7164,7 @@ def _run_git_bounded(
             rc = -9
         if timed_out or overflow:
             rc = rc or -9
-        return rc, bytes(buf).decode("utf-8", "replace"), timed_out or overflow
+        return rc, bytes(buf).decode("utf-8", decode_errors), timed_out or overflow
     finally:
         if cleanup:
             with contextlib.suppress(OSError):
@@ -6666,6 +7217,33 @@ _GIT_FILTER_KEY_RE = re.compile(
 )
 
 
+def _worktree_probe_failure_is_empty_scope(
+    git_cmd: list[str], base: str, env: dict
+) -> bool:
+    """True when a failed ``--worktree`` probe hit the empty scope git creates lazily.
+
+    Called only AFTER ``git config --worktree ...`` exited non-zero — never to
+    gate whether that probe runs. Resolves ``$GIT_DIR`` through this handler's
+    own bounded runner and feeds it to
+    :func:`kiro_crew.git_worktree_scope.worktree_probe_failure_is_empty_scope`,
+    the one shared classification all four filter-driver guards use. See that
+    module's docstring for why the probe-first order is the contract.
+    """
+    # surrogateescape, not the display default: this answer is handed to the
+    # classifier's ``os.lstat``, so a non-UTF-8 byte in the real path must
+    # survive as a PEP 383 surrogate ``os.fsencode`` restores byte-exactly --
+    # a U+FFFD from ``"replace"`` would miss an existing ``config.worktree``
+    # and clear a scope git still reads.
+    gitdir_rc, gitdir_out, _ = _run_git_bounded(
+        [*git_cmd, "rev-parse", "--absolute-git-dir"],
+        cwd=base, env=env, timeout=5,
+        decode_errors="surrogateescape",
+    )
+    return worktree_probe_failure_is_empty_scope(
+        gitdir_out if gitdir_rc == 0 else "", base
+    )
+
+
 def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bool:
     """True when repo-supplied config names a content-filter driver (or the
     probe cannot prove it does not).
@@ -6673,17 +7251,28 @@ def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bo
     Mirrors ``worktree.py::_checkout_filter``: drivers can only come from a
     config file the repository supplies — ``--local`` (``.git/config``) and,
     when ``extensions.worktreeConfig`` is on, ``--worktree``
-    (``$GIT_DIR/config.worktree``). ``--includes`` is mandatory: a specific-scope
+    (``$GIT_DIR/config.worktree``). The worktree scope is PROBED FIRST and a
+    failure classified AFTERWARDS: git creates ``config.worktree`` lazily, so
+    a probe that failed because the file is genuinely absent is the empty
+    scope, not an unreadable one — while an existence pre-check would drop
+    the scope on a stale fact and never look at a file git goes on to read.
+    ``--includes`` is mandatory: a specific-scope
     query defaults include-following OFF, so a driver reached through
     ``include.path`` would be invisible to the probe yet still execute.
     Global/system config is deliberately not probed (the user's own machine
-    setup, e.g. ``git lfs install``, is not repository-supplied). A probe that
-    fails refuses: an unreadable scope cannot be proven filter-free. The probe
-    itself is safe — ``git config`` reads files and never runs drivers.
+    setup, e.g. ``git lfs install``, is not repository-supplied). Any other
+    probe failure refuses: an unreadable scope cannot be proven filter-free.
+    The probe itself is safe — ``git config`` reads files and never runs
+    drivers.
     """
     scopes = ["--local"]
+    # --local is load-bearing: git takes the extension from the REPO config
+    # only, while a merged read lets a worktree-scoped
+    # extensions.worktreeConfig=false win the chain and hide the very scope it
+    # lives in. --bool folds every git-true spelling (yes/on/1/valueless).
     ext_rc, ext_out, _ = _run_git_bounded(
-        [*git_cmd, "config", "--bool", "--get", "extensions.worktreeConfig"],
+        [*git_cmd, "config", "--local", "--includes", "--bool", "--get",
+         "extensions.worktreeConfig"],
         cwd=base, env=env, timeout=5,
     )
     if ext_rc == 0 and ext_out.strip() == "true":
@@ -6694,6 +7283,10 @@ def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bo
             cwd=base, env=env, timeout=5,
         )
         if rc != 0:
+            if scope == "--worktree" and _worktree_probe_failure_is_empty_scope(
+                git_cmd, base, env
+            ):
+                continue
             return True
         for key in out.splitlines():
             if _GIT_FILTER_KEY_RE.match(key.strip()):
@@ -6975,9 +7568,10 @@ async def api_project_git_status(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
-# Cap on entries returned by api_project_tree. The dashboard tree virtualizes
-# rendering, so the cap bounds response size and walk time, not the UI.
+# Cap on FILES returned by api_project_tree. Directory rows are returned
+# separately and uncapped so manual navigation never loses a subtree.
 _PROJECT_TREE_MAX_ENTRIES = 10_000
+
 
 # Directories never worth listing in a workspace tree. Applied only on the
 # non-git fallback walk — git listings already honor .gitignore.
@@ -7005,14 +7599,67 @@ _PROJECT_TREE_SKIP_DIRS = frozenset(
 )
 
 
+def _project_tree_directories(paths: list[str]) -> list[str]:
+    """Return every POSIX parent directory named by *paths*."""
+    directories: set[str] = set()
+    for path in paths:
+        parent = posixpath.dirname(path)
+        while parent:
+            directories.add(parent)
+            parent = posixpath.dirname(parent)
+    return sorted(directories)
+
+
+def _project_tree_file_quotas(file_counts: dict[str, int], limit: int) -> dict[str, int]:
+    """Split *limit* round-robin across directories that directly own files."""
+    quotas = {directory: 0 for directory in file_counts}
+    active = sorted(directory for directory, count in file_counts.items() if count > 0)
+    remaining = min(max(limit, 0), sum(file_counts.values()))
+    while active and remaining:
+        next_active: list[str] = []
+        for directory in active:
+            if remaining == 0:
+                break
+            quotas[directory] += 1
+            remaining -= 1
+            if quotas[directory] < file_counts[directory]:
+                next_active.append(directory)
+        active = next_active
+    return quotas
+
+
+def _project_tree_sample_files(paths: list[str], limit: int) -> tuple[list[str], list[str]]:
+    """Cap files fairly by direct parent and report parents that lost files."""
+    file_counts: dict[str, int] = {}
+    for path in paths:
+        parent = posixpath.dirname(path)
+        file_counts[parent] = file_counts.get(parent, 0) + 1
+    quotas = _project_tree_file_quotas(file_counts, limit)
+    selected_counts = {directory: 0 for directory in file_counts}
+    selected: list[str] = []
+    for path in paths:
+        parent = posixpath.dirname(path)
+        if selected_counts[parent] >= quotas[parent]:
+            continue
+        selected.append(path)
+        selected_counts[parent] += 1
+    truncated_directories = sorted(
+        directory
+        for directory, count in file_counts.items()
+        if selected_counts[directory] < count
+    )
+    return selected, truncated_directories
+
+
 async def api_project_tree(request: web.Request) -> web.Response:
     """GET /api/project/tree?path=... - workspace file listing for a project dir.
 
     Returns project-relative POSIX file paths for rendering a workspace tree.
     Inside a git repository the listing is ``git ls-files --cached --others
     --exclude-standard`` scoped to the project dir (tracked + untracked,
-    .gitignore honored); outside one it is a bounded directory walk. Path must
-    match a known project directory (same allow-list as api_project_git).
+    .gitignore honored); outside one it walks the complete directory skeleton
+    while capping returned files. Path must match a known project directory
+    (same allow-list as api_project_git).
     """
     state: DashboardState = request.app["state"]
     caller = request.get("user", "dashboard")
@@ -7050,7 +7697,15 @@ async def api_project_tree(request: web.Request) -> web.Response:
         caller=caller, operation="project_tree", outcome="allowed", resources=base
     )
     if not await asyncio.to_thread(os.path.isdir, base):
-        return web.json_response({"root": redact(base), "paths": [], "repo": False})
+        return web.json_response(
+            {
+                "root": redact(base),
+                "paths": [],
+                "directories": [],
+                "repo": False,
+                "truncatedDirectories": [],
+            }
+        )
 
     def _run() -> dict:
         # git listing first: honors .gitignore, includes tracked-but-deleted
@@ -7077,50 +7732,60 @@ async def api_project_tree(request: web.Request) -> web.Response:
                 timeout=15,
             )
             if ls_rc == 0:
-                # SORT BEFORE THE CAP. `ls-files --cached --others` is not one
-                # sorted stream: git emits every untracked entry as a complete
-                # block and only then the tracked ones (its own emission order
-                # -- unchanged if the flags are written the other way round, and
-                # git-ls-files(1) documents no order at all). A prefix cut of
-                # that therefore never reaches the tracked block once untracked
-                # alone fill the cap, and the whole source tree loses its rows:
-                # the dashboard infers a directory row only from the file paths
-                # present, so those folders go absent rather than collapsed.
-                # Sorting spends the budget by path instead of by whichever
-                # block git happened to emit first. It does NOT make the two
-                # branches emit the same order: the fallback walk below sorts
-                # within each level but is depth-first overall, so it yields a
-                # root `z.txt` before `a/x` where sorted() orders them the other
-                # way. What the branches share is narrower and is the actual
-                # warrant for sorting here -- this handler establishes its own
-                # path order rather than passing through a source's arbitrary
-                # emission order.
+                # Git emits tracked and untracked files in separate blocks and
+                # documents no combined order. Sort once, then distribute the
+                # file budget round-robin across direct parent directories so a
+                # large subtree cannot consume every file row.
                 listed = sorted(p for p in ls_out.split("\0") if p)
-                truncated = len(listed) > _PROJECT_TREE_MAX_ENTRIES
+                selected_paths, truncated_directories = _project_tree_sample_files(
+                    listed, _PROJECT_TREE_MAX_ENTRIES
+                )
                 return {
                     "root": base,
-                    "paths": listed[:_PROJECT_TREE_MAX_ENTRIES],
+                    "paths": selected_paths,
+                    "directories": _project_tree_directories(listed),
                     "repo": True,
-                    "truncated": truncated,
+                    "truncated": bool(truncated_directories),
+                    "truncatedDirectories": truncated_directories,
                 }
 
-        # Fallback: bounded filesystem walk (non-repo project dirs).
-        paths: list[str] = []
-        truncated = False
+        # Fallback: walk twice so the first pass can compute fair per-directory
+        # quotas without retaining every filename in memory. The complete walk
+        # is required to return the directory skeleton past the file cap.
+        directories: list[str] = []
+        file_counts: dict[str, int] = {}
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(
                 d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
             )
             rel_dir = os.path.relpath(dirpath, base)
-            prefix = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
-            for name in sorted(filenames):
+            directory = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+            if directory:
+                directories.append(directory)
+            file_counts[directory] = len(filenames)
+
+        quotas = _project_tree_file_quotas(file_counts, _PROJECT_TREE_MAX_ENTRIES)
+        truncated_directories = sorted(
+            directory for directory, count in file_counts.items() if quotas[directory] < count
+        )
+        paths: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
+            )
+            rel_dir = os.path.relpath(dirpath, base)
+            directory = "" if rel_dir == "." else rel_dir.replace(os.sep, "/")
+            prefix = "" if not directory else directory + "/"
+            for name in sorted(filenames)[: quotas.get(directory, 0)]:
                 paths.append(prefix + name)
-                if len(paths) >= _PROJECT_TREE_MAX_ENTRIES:
-                    truncated = True
-                    break
-            if truncated:
-                break
-        return {"root": base, "paths": paths, "repo": False, "truncated": truncated}
+        return {
+            "root": base,
+            "paths": paths,
+            "directories": directories,
+            "repo": False,
+            "truncated": bool(truncated_directories),
+            "truncatedDirectories": truncated_directories,
+        }
 
     result = await asyncio.to_thread(_run)
     # Egress redaction, same rationale as api_project_git_status: listed names
@@ -7142,9 +7807,10 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # "Duplicate path" on adjacent identical entries. dict.fromkeys keeps first
     # occurrence. This does not affect "truncated": the cap is applied to the
     # raw listing above.
-    result["paths"] = list(
-        dict.fromkeys(redact_path_segments(p, redact) for p in result["paths"])
-    )
+    for key in ("paths", "directories", "truncatedDirectories"):
+        result[key] = list(
+            dict.fromkeys(redact_path_segments(p, redact) for p in result[key])
+        )
     return web.json_response(result)
 
 

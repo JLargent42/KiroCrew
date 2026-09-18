@@ -305,6 +305,29 @@ def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
 
 
+def test_ssh_auth_sock_forward_is_not_an_agent_config_field() -> None:
+    """The SSH_AUTH_SOCK forward enable is NOT read from config.json.
+
+    Keeping the socket grants USE of the operator's ssh-agent keys for the
+    session -- an authorization, not a preference -- so its consent lives on the
+    keystone (``ssh_auth_sock_consent.json``, agent-nonwritable, sealed read-only
+    in the sandbox), the same placement as ``computer_use.json``. An
+    agent-writable enable in config.json would let a prompt-injected shell flip
+    its own forwarding on. This asserts the field is absent so it cannot silently
+    return: an agent-readable enable is the exact hole this design closes.
+    """
+    import dataclasses
+
+    from kiro_crew.config.sections import AgentConfig
+
+    field_names = {f.name for f in dataclasses.fields(AgentConfig)}
+    assert "sandbox_forward_ssh_auth_sock" not in field_names
+    # A config.json that names the old key is ignored, not honoured: the loader
+    # builds AgentConfig field-by-field and never reads it.
+    cfg = _load_from_dict({"agent": {"sandbox_forward_ssh_auth_sock": True}})
+    assert not hasattr(cfg.agent, "sandbox_forward_ssh_auth_sock")
+
+
 def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
     """The Stop-hook nudge cap is built field-by-field in load(), so an
     operator's value must hydrate and survive a to_dict() -> load() round-trip.
@@ -593,6 +616,31 @@ class TestFallbackModelLoad:
     def test_round_trips_through_to_dict(self) -> None:
         loaded = _load_from_dict({"agent": {"fallback_model": "claude-opus-5"}})
         assert loaded.to_dict()["agent"]["fallback_model"] == "claude-opus-5"
+
+
+class TestRefusalFallbackModelLoad:
+    """agent.refusal_fallback_model flows through the explicit load() kwargs."""
+
+    def test_load_coerces_registry_alias(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": "opus-4.8-1m"}})
+        assert loaded.agent.refusal_fallback_model == "claude-opus-4.8"
+
+    def test_load_default_is_disabled(self) -> None:
+        # DEFAULT PIN: a config without the key loads "" — the refusal retry
+        # is OFF and a refusal surfaces exactly as before the feature.
+        assert _load_from_dict({}).agent.refusal_fallback_model == ""
+
+    def test_load_auto_defers_to_recommendation(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": "auto"}})
+        assert loaded.agent.refusal_fallback_model == "auto"
+
+    def test_load_malformed_value_never_crashes(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": {"not": "a string"}}})
+        assert loaded.agent.refusal_fallback_model == ""
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": "claude-opus-5"}})
+        assert loaded.to_dict()["agent"]["refusal_fallback_model"] == "claude-opus-5"
 
 
 class TestMalformedConfigValuesNeverCrashLoad:
@@ -6470,6 +6518,10 @@ _DISPATCH_EXEMPT = {
     "resolved_alias",
     # Request metadata the caller checks separately, not dispatch identity.
     "requested_resolved",
+    # Namespace provenance controls later resolution, not identical current targets.
+    "selection_kind",
+    # Protects automatic publication after resolution, not dispatch identity.
+    "selection_revision",
     # Derived from memory_store_name plus global config shared by both sides.
     "effective_memory_config",
 }
@@ -6490,6 +6542,8 @@ def _dispatch_field_mutations() -> dict[str, object]:
         "model": "drift-pin-other-model",
         "resolved_alias": "drift-pin-other-alias",
         "requested_resolved": False,
+        "selection_kind": "template",
+        "selection_revision": "observed-selection-revision",
         "effective_memory_config": {"embedding_provider": "drift-pin-other"},
     }
 
