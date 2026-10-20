@@ -49,6 +49,22 @@ def _step(jobs, job, prefix):
     return next(s for s in jobs[job]["steps"] if s.get("name", "").startswith(prefix))
 
 
+# A nested ``--collect-only`` of the TARGETS takes about 2 s on an idle host and 8 to 13 s
+# on a host running the full suite at 8 workers. The 60 s cap is the ratchet on how slow
+# one collection may get on a steady POSIX runner. A GitHub-hosted Windows runner's cold
+# child-interpreter startup under load can push a single collection past 60 s without
+# anything in the routing under test regressing, so the cap measures runner speed, not the
+# contract. The Windows backend shard runs each test under ``--timeout=180`` with
+# ``--max-worker-restart=0``: a child that outlives this cap must still trip ITS OWN
+# ``subprocess.TimeoutExpired`` and fail one named test, before pytest-timeout reaches the
+# per-test budget and kills the whole xdist worker (which would drop the shard's pending
+# tests). So the Windows cap is HALF the shard budget -- comfortably above the 8-13 s a
+# loaded collection takes, and strictly below the worker deadline -- derived from the
+# budget rather than copied so it tracks a future ``--timeout`` change.
+_WINDOWS_SHARD_TIMEOUT = 180
+_COLLECT_TIMEOUT = (_WINDOWS_SHARD_TIMEOUT // 2) if os.name == "nt" else 60
+
+
 def _run(argv, cwd, env=None, **kwargs):
     return subprocess.run(
         argv,
@@ -57,7 +73,7 @@ def _run(argv, cwd, env=None, **kwargs):
         capture_output=True,
         text=True,
         encoding="utf-8",
-        timeout=60,
+        timeout=_COLLECT_TIMEOUT,
         **kwargs,
     )
 
@@ -179,8 +195,9 @@ def test_a_nested_collection_reads_only_the_named_files(tmp_path):
 # Run sequentially, that put up to 360 s of inner budget inside the 120 s ``--timeout``
 # every test gets, so pytest-timeout fired on the sum. The six are independent (each
 # is its own interpreter), so they run CONCURRENTLY -- wall time is the slowest one, not
-# the sum -- and each keeps ``_run``'s 60 s cap: that cap is the ratchet on how slow a
-# single collection may get, and concurrency is what fixes the budget, not a looser cap.
+# the sum -- and each keeps ``_run``'s per-collection cap (``_COLLECT_TIMEOUT``): that cap
+# is the ratchet on how slow a single collection may get on POSIX, and concurrency is what
+# fixes the budget, not a looser cap.
 # Each child also reads only the TARGETS (``_collect_argv``), not the ~4,600 siblings
 # pytest otherwise walks, which took about 40% of a child's time.
 
