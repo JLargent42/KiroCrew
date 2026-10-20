@@ -99,7 +99,7 @@ export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, 
   return { listMessages, renderers }
 }
 
-export function ChatPaneAboveRows({ slotKey, activeSlot, messages, paneMessages, crewmate, crewmateLive, running, slotDetailFailed, refetchSlotDetail, hideEmptyHint, crewmateQuietUnproven, onOpenCrewWorkLog, warmHasMore, pagesPane, onOpenFull }: {
+export function ChatPaneAboveRows({ slotKey, activeSlot, messages, paneMessages, crewmate, crewmateLive, running, slotDetailFailed, refetchSlotDetail, hideEmptyHint, crewmateQuietUnproven, crewmateQuietWindow, onOpenCrewWorkLog, warmHasMore, pagesPane, onOpenFull }: {
   slotKey: string
   activeSlot: string | null
   messages: Messages
@@ -111,6 +111,7 @@ export function ChatPaneAboveRows({ slotKey, activeSlot, messages, paneMessages,
   refetchSlotDetail: () => unknown
   hideEmptyHint?: boolean
   crewmateQuietUnproven: boolean
+  crewmateQuietWindow?: number
   onOpenCrewWorkLog?: () => void
   warmHasMore?: boolean
   pagesPane: boolean
@@ -134,18 +135,25 @@ export function ChatPaneAboveRows({ slotKey, activeSlot, messages, paneMessages,
           has not spoken yet) filters to an empty chat. That is not a
           fresh thread, so it must not read as one: say who has not
           spoken and where the work went, instead of "type a message
-          to start" beside a summary that counts its wakes. Said only
-          once the read is the WHOLE history (`crewmateQuietUnproven`
-          in ChatPane.tsx): a bounded window with no speech in it is not proof.
+          to start" beside a summary that counts its wakes. Said as a
+          claim about the whole history only once the read reaches its start
+          (`crewmateQuietUnproven` in ChatPane.tsx): a bounded window with no
+          speech in it is not proof. When the widest bounded page still holds
+          none, the hint says what was checked instead (`crewmateQuietWindow`
+          rows), so the pane is not left blank with only the earlier-rows bar.
           Nor while the crewmate is at work (`crewmateLive`, the same
           liveness the status line and footer read): its current step
           is on screen, so "hasn't said anything" would sit under a
           line that shows it busy. */}
-      {messages.length === 0 && !(crewmate ? crewmateLive : running) && !slotDetailFailed && !hideEmptyHint && !crewmateQuietUnproven && (
-        <div className="text-center text-muted text-[13px] px-4 py-8" data-testid={crewmate && paneMessages.length > 0 ? 'crewmate-quiet-hint' : undefined}>
+      {messages.length === 0 && !(crewmate ? crewmateLive : running) && !slotDetailFailed && !hideEmptyHint && (!crewmateQuietUnproven || crewmateQuietWindow !== undefined) && (
+        <div className="text-center text-muted text-[13px] px-4 py-8" data-testid={crewmate && paneMessages.length > 0 ? 'crewmate-quiet-hint' : undefined} data-scope={crewmateQuietUnproven ? 'recent' : undefined}>
           {crewmate && paneMessages.length > 0 ? (
             <>
-              <div>{i18nT('components.chatPane.crewmate_quiet', { name: crewmate.label || crewmate.name })}</div>
+              <div>
+                {crewmateQuietUnproven
+                  ? i18nT('components.chatPane.crewmate_quiet_recent', { name: crewmate.label || crewmate.name, rows: crewmateQuietWindow })
+                  : i18nT('components.chatPane.crewmate_quiet', { name: crewmate.label || crewmate.name })}
+              </div>
               {/* Where the work went: Profile > Sessions. A link when the host
                   can open that tab — the words read as a destination,
                   so they must be one. */}

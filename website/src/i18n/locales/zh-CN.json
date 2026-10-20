@@ -6304,6 +6304,7 @@
       "close_pane": "关闭窗格",
       "crewmate_quiet": "{{name}} 还没有对你说过什么。",
       "crewmate_quiet_where": "查看它正在带领的会话。",
+      "crewmate_quiet_recent": "{{name}} 在最近的 {{rows}} 条记录中没有对你说过什么。",
       "earlier_messages_load_failed": "无法加载更早的消息。滚动到对话顶部即可重试。",
       "earlier_messages_open_session": "更早的消息 — 打开完整会话（关闭分屏）",
       "earlier_messages_unavailable": "更早的消息在此会话的历史记录中不再可用。",

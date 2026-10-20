@@ -38,7 +38,7 @@ import { selectionCapabilitiesFailed } from '../lib/effort'
 import { isUnpinnedModel } from '../lib/jevRoute'
 import { useQueuedMessageActions } from '../hooks/useQueuedMessageActions'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, loadOlderMessages, loadOlderSlotMessages, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, SLOT_DETAIL_MAX_LIMIT, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, loadOlderMessages, loadOlderSlotMessages, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { appendFollowUpOption, removeFollowUpOption, selectSingleFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
@@ -440,12 +440,16 @@ export default function ChatPane({
   // A crewmate's chat that filters a BOUNDED window down to no speech has
   // proved nothing: the last thing it said may sit just behind the window,
   // under fifty newer patrol rows. The never-spoken hint is a claim about the
-  // whole history, so that read is upgraded to the whole transcript first
-  // (same latch as the streaming upgrade) and the hint waits for it. An
-  // unbounded read that is still empty is the real never-spoken case.
+  // whole history, so that read is widened ONCE to the handler's largest page
+  // and the hint waits for it. A widened page that reaches the transcript's
+  // start and is still empty is the real never-spoken case. One that does not
+  // reach it leaves the hint unsaid and the pane's earlier-rows bar to page
+  // further. The read stays bounded on purpose: a patroller's history is the
+  // longest kind there is, and reading all of it on open stalled the gateway
+  // and froze the renderer until a restart.
   const crewmateQuietUnproven = !!crewmate && warmHasMore === true && paneMessages.length > 0 && messages.length === 0
   if (!limitLatched.current && crewmateQuietUnproven) {
-    limitRef.current = undefined
+    limitRef.current = SLOT_DETAIL_MAX_LIMIT
     limitLatched.current = true
   }
   const hydrateLimit = limitRef.current
@@ -457,6 +461,11 @@ export default function ChatPane({
   useEffect(() => {
     if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, queue: slotDetail.queue, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running, nextBefore: slotDetail.next_before }))
   }, [slotDetail, slotKey, dispatch, hydrateLimit])
+  // The widened page has landed and still holds no speech: the hint can say
+  // how many rows it checked, which is all a bounded read can honestly claim.
+  const crewmateQuietWindow = crewmateQuietUnproven && hydrateLimit === SLOT_DETAIL_MAX_LIMIT && slotDetail
+    ? paneMessages.length
+    : undefined
 
   // Scroll follow (auto-pin, release, jump pill) is owned by the virtualizer
   // inside ChatMessageList — growth on EARLIER rows (a tool result updating, a
@@ -747,7 +756,7 @@ export default function ChatPane({
                 ? { hasMore: true, loading: paneLoadingOlder, failed: paneOlderFailed, onLoad: loadOlderPane, handOff: false }
                 : undefined,
             aboveRows: (
-              <ChatPaneAboveRows slotKey={slotKey} activeSlot={activeSlot} messages={messages} paneMessages={paneMessages} crewmate={crewmate} crewmateLive={crewmateLive} running={running} slotDetailFailed={slotDetailFailed} refetchSlotDetail={refetchSlotDetail} hideEmptyHint={hideEmptyHint} crewmateQuietUnproven={crewmateQuietUnproven} onOpenCrewWorkLog={onOpenCrewWorkLog} warmHasMore={warmHasMore} pagesPane={pagesPane} onOpenFull={onOpenFull} />
+              <ChatPaneAboveRows slotKey={slotKey} activeSlot={activeSlot} messages={messages} paneMessages={paneMessages} crewmate={crewmate} crewmateLive={crewmateLive} running={running} slotDetailFailed={slotDetailFailed} refetchSlotDetail={refetchSlotDetail} hideEmptyHint={hideEmptyHint} crewmateQuietUnproven={crewmateQuietUnproven} crewmateQuietWindow={crewmateQuietWindow} onOpenCrewWorkLog={onOpenCrewWorkLog} warmHasMore={warmHasMore} pagesPane={pagesPane} onOpenFull={onOpenFull} />
             ),
             belowRows: (
               /* The working indicator. Inside the scroll container, after the

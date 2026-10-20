@@ -53,6 +53,7 @@ Object.defineProperty(window, 'matchMedia', {
 
 import ChatPane from '../components/ChatPane'
 import { api } from '../api/client'
+import { SLOT_DETAIL_MAX_LIMIT } from '../store/chatSlice'
 
 const SLOT = 'member-radar'
 const radar = { name: 'Radar' }
@@ -251,32 +252,67 @@ describe("a crewmate's chat", () => {
     expect(view.getByTestId('crewmate-live-activity').querySelector('[role="status"]')).toHaveAttribute('title', long)
   })
 
-  it('a BOUNDED window with no speech in it is not proof: the pane reads the whole history first', async () => {
-    // Older speech behind fifty newer machinery rows: the bounded first read
-    // (has_more) shows none of it. The pane must not say "hasn't said anything"
-    // off that window — it upgrades to the unbounded read and draws the speech.
+  it('a BOUNDED window with no speech in it is not proof: the pane widens to the largest page first', async () => {
+    // Older speech behind fifty newer machinery rows: the first read (has_more)
+    // shows none of it. The pane must not say "hasn't said anything" off that
+    // window — it re-reads at the handler's largest page and draws the speech.
     const SPEECH = { role: 'assistant', content: 'Found the cause: the label was renamed.', cls: '', ts: '2026-09-21T09:00:00Z' }
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockImplementation((_key: string, limit?: number) =>
-      Promise.resolve(limit === undefined
+      Promise.resolve(limit === SLOT_DETAIL_MAX_LIMIT
         ? { messages: [SPEECH, ...MACHINERY], running: false, has_more: false, total: MACHINERY.length + 1 }
         : { messages: MACHINERY, running: false, has_more: true, total: MACHINERY.length + 1 }))
     const view = renderPane()
     await waitFor(() => expect(view.getByText(/Found the cause/)).toBeInTheDocument())
     expect(view.queryByTestId('crewmate-quiet-hint')).toBeNull()
     const limits = (api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1])
-    expect(limits).toContain(undefined)
+    expect(limits).toContain(SLOT_DETAIL_MAX_LIMIT)
+    expect(limits).not.toContain(undefined)
   })
 
-  it('…and says who has not spoken only once the WHOLE history is machinery', async () => {
+  it('…and says who has not spoken only once the widened page reaches the start and is all machinery', async () => {
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockImplementation((_key: string, limit?: number) =>
-      Promise.resolve(limit === undefined
-        ? { messages: MACHINERY, running: false, has_more: false, total: MACHINERY.length }
-        : { messages: MACHINERY, running: false, has_more: true, total: MACHINERY.length + 40 }))
+      Promise.resolve(limit === SLOT_DETAIL_MAX_LIMIT
+        ? { messages: [...MACHINERY, ...MACHINERY], running: false, has_more: false, total: MACHINERY.length * 2 }
+        : { messages: MACHINERY, running: false, has_more: true, total: MACHINERY.length * 2 }))
     const view = renderPane()
     const hint = await view.findByTestId('crewmate-quiet-hint')
     expect(hint).toHaveTextContent("Radar hasn't said anything to you yet.")
     const limits = (api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1])
-    expect(limits[limits.length - 1]).toBeUndefined()
+    expect(limits[limits.length - 1]).toBe(SLOT_DETAIL_MAX_LIMIT)
+  })
+
+  it('a widened page that still does not reach the start never reads the whole transcript and says what it checked', async () => {
+    // A patroller with more machinery than the largest page: the whole-history
+    // hint stays unsaid (no proof), a scoped one says what was checked, and the
+    // pane never falls back to an unbounded read, which on a long history
+    // stalls the gateway and freezes the renderer.
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockImplementation((_key: string, limit?: number) =>
+      Promise.resolve(limit === SLOT_DETAIL_MAX_LIMIT
+        ? { messages: [...MACHINERY, ...MACHINERY], running: false, has_more: true, next_before: 900, total: 1000 }
+        : { messages: MACHINERY, running: false, has_more: true, next_before: 997, total: 1000 }))
+    const store = makeStore()
+    const view = render(
+      <Provider store={store}>
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <ThemeProvider>
+            <MemoryRouter>
+              <ChatPane slotKey={SLOT} crewmate={radar} />
+            </MemoryRouter>
+          </ThemeProvider>
+        </QueryClientProvider>
+      </Provider>,
+    )
+    // The widened page landed: the pane now holds it, still marked bounded.
+    await waitFor(() => expect(store.getState().chat.slotPaneBounded?.[SLOT]).toBe(MACHINERY.length * 2))
+    expect(store.getState().chat.slotPaneHasMore?.[SLOT]).toBe(true)
+    // Not the whole-history claim: the hint says what the bounded read checked,
+    // so the pane is not left blank under its earlier-rows bar.
+    const hint = await view.findByTestId('crewmate-quiet-hint')
+    expect(hint.dataset.scope).toBe('recent')
+    expect(hint).toHaveTextContent(`Radar hasn't said anything to you in its latest ${MACHINERY.length * 2} entries.`)
+    expect(hint).not.toHaveTextContent('yet.')
+    const limits = (api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[1])
+    expect(limits.every((l) => l !== undefined)).toBe(true)
   })
 
   it('a complete first read (no more behind it) is proof enough — no second read', async () => {

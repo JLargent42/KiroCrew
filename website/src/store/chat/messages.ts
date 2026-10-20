@@ -362,12 +362,13 @@ export const messageReducers = {
    *  hydrate fetch resolves. A dedicated `slotHydrated` flag makes it fire
    *  exactly once, so a racing frame can't make us silently drop history.
    *
-   *  One exception to "exactly once": a pane that mounts idle fetches a BOUNDED
-   *  page, and the slot can start a turn before that page lands. The pane then
-   *  refetches unbounded, and a flat one-shot would discard the wider result and
-   *  strand the pane on 50 rows. So a bounded page may be superseded once by an
-   *  unbounded one. The reverse is refused, and a superseded slot cannot upgrade
-   *  again, so this cannot loop.
+   *  One exception to "exactly once": a pane's first page is BOUNDED, and the
+   *  pane may need a wider one (a crewmate chat whose first page holds no
+   *  speech re-reads at the handler's largest page). So a bounded page may be
+   *  superseded by a strictly WIDER page, bounded or not. A narrower or equal
+   *  page is refused, a bounded page is capped at the handler's largest page,
+   *  and a slot holding an unbounded page cannot be superseded again, so this
+   *  cannot loop.
    *  No-op for the active slot (its mirror is already live). */
   hydrateSlotMessages(state: ChatState, action: PayloadAction<{ slot: string; messages: ChatMessage[]; queue?: unknown; hasMore?: boolean; bounded?: boolean; total?: number; running?: boolean; nextBefore?: number }>) {
     const { slot, messages, queue, hasMore, bounded, total, running, nextBefore } = action.payload
@@ -380,14 +381,14 @@ export const messageReducers = {
       // Keep the rows the bounded page never fetched: it was written as
       // [page, ...priorRows], so everything past its length is a live tail.
       const boundedLen = state.slotPaneBounded?.[k]
-      if (bounded || boundedLen === undefined) return
+      if (boundedLen === undefined || (bounded && messages.length <= boundedLen)) return
       const prior = state.slotMessages[k] ?? []
       // The wider page is a fresh server snapshot, so it can already carry rows
       // that tail holds -- a just-sent row persists before its send is acked.
       const tail = tailNotInPage(prior.slice(boundedLen), messages)
       // Reasoning is broadcast-only so the wider page never carries it back.
       // Scoped to the REPLACED region: `tail` already keeps the live tail's own.
-      writeSlotPage(state, slot, mergePreservedThinking(prior.slice(0, boundedLen), [...messages, ...tail], messages), hasMore, undefined, nextBefore)
+      writeSlotPage(state, slot, mergePreservedThinking(prior.slice(0, boundedLen), [...messages, ...tail], messages), hasMore, bounded ? messages.length : undefined, nextBefore)
       retainServerTotal(state, slot, total, running)
       return
     }

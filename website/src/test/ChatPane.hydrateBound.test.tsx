@@ -301,6 +301,25 @@ describe('a bounded pane page is superseded once by the unbounded refetch', () =
     store.dispatch(hydrateSlotMessages({ slot, messages: [row('y-9')], hasMore: true, bounded: true }))
     expect(store.getState().chat.slotMessages[slot].map((m) => m.meta?.mid)).toEqual(afterUpgrade)
   })
+
+  it('lets a strictly WIDER bounded page supersede a bounded one, and refuses an equal or narrower one', () => {
+    const store = reducerStore()
+    const slot = 'pane-widen'
+    store.dispatch(hydrateSlotMessages({ slot, messages: [row('b-1')], hasMore: true, bounded: true, nextBefore: 9 }))
+    store.dispatch(appendSlotMessage({ slot, message: row('live-1') as never }))
+    // The wider page is still bounded: it keeps the live tail, re-records its
+    // own length and keeps its cursor so the pane can page further back.
+    store.dispatch(hydrateSlotMessages({ slot, messages: [row('a-0'), row('b-1')], hasMore: true, bounded: true, nextBefore: 8 }))
+    const chat = () => store.getState().chat
+    expect(chat().slotMessages[slot].map((m) => m.meta?.mid)).toEqual(['a-0', 'b-1', 'live-1'])
+    expect(chat().slotPaneBounded[slot]).toBe(2)
+    expect(chat().slotPaneHasMore[slot]).toBe(true)
+    expect(chat().slotPaneNextBefore?.[slot]).toBe(8)
+    // Equal width and narrower pages do not win.
+    store.dispatch(hydrateSlotMessages({ slot, messages: [row('x-8'), row('x-9')], hasMore: true, bounded: true, nextBefore: 8 }))
+    store.dispatch(hydrateSlotMessages({ slot, messages: [row('y-9')], hasMore: true, bounded: true, nextBefore: 9 }))
+    expect(chat().slotMessages[slot].map((m) => m.meta?.mid)).toEqual(['a-0', 'b-1', 'live-1'])
+  })
 })
 
 describe('a pruned slot leaves no marker behind to suppress a later hydrate', () => {
