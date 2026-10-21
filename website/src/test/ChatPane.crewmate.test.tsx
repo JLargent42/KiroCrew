@@ -303,7 +303,13 @@ describe("a crewmate's chat", () => {
       </Provider>,
     )
     // The widened page landed: the pane now holds it, still marked bounded.
-    await waitFor(() => expect(store.getState().chat.slotPaneBounded?.[SLOT]).toBe(MACHINERY.length * 2))
+    // Waits on a four-step chain — initial bounded query, its hydration effect,
+    // the widened SLOT_DETAIL_MAX_LIMIT query, then the second hydrate — so give
+    // it an explicit deadline rather than the default waitFor timeout.
+    await waitFor(
+      () => expect(store.getState().chat.slotPaneBounded?.[SLOT]).toBe(MACHINERY.length * 2),
+      { timeout: 5000 },
+    )
     expect(store.getState().chat.slotPaneHasMore?.[SLOT]).toBe(true)
     // Not the whole-history claim: the hint says what the bounded read checked,
     // so the pane is not left blank under its earlier-rows bar.
